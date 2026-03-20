@@ -1,0 +1,11 @@
+# Basic cookbook fixture for integration tests
+# Uses mock model with minimal configuration
+models:
+  - name: "mock-model"
+    description: "Mock model for testing"
+    profiles:
+      - id: "default"
+        model_path: "./models/mock.gguf"
+        idle_timeout_seconds: 5
+        max_instances: 1
+        llama_server_args: ""

@@ -1,0 +1,47 @@
+# Rust build artifacts
+/target
+
+# llama.cpp repo and models
+/llama.cpp
+/models
+
+# Configuration files (use .example versions)
+config.yaml
+cookbook.yaml
+secrets.yaml
+
+# Metrics and logs
+node-metrics.json
+*.log
+/logs/
+
+# TLS certificates
+/tls
+
+# Noise Protocol secrets (auto-generated)
+.llama-mesh/
+
+# Test artifacts
+tests/*.sh
+tests/config_*.yaml
+tests/cookbook_*.yaml
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+
+# Claude Code (local config, not for public repo)
+CLAUDE.md
+.claude/

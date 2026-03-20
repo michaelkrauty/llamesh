@@ -1,0 +1,40 @@
+# Config template for integration tests
+# Placeholders:
+#   {{NODE_ID}} - Node identifier
+#   {{LISTEN_ADDR}} - Listen address (e.g., 127.0.0.1:9190)
+#   {{PORT_START}} - Starting port for llama-server instances
+#   {{PORT_END}} - Ending port for llama-server instances
+#   {{MOCK_BINARY}} - Path to mock_llama_server binary
+#   {{DEFAULT_MODEL}} - Default model name (e.g., mock-model:default)
+
+node_id: "{{NODE_ID}}"
+listen_addr: "{{LISTEN_ADDR}}"
+max_vram_mb: 1024
+max_sysmem_mb: 1024
+default_model: "{{DEFAULT_MODEL}}"
+model_defaults:
+  max_concurrent_requests_per_instance: 2
+  max_queue_size_per_model: 10
+  max_instances_per_model: 2
+  max_wait_in_queue_ms: 5000
+llama_cpp_ports:
+  ranges:
+    - start: {{PORT_START}}
+      end: {{PORT_END}}
+llama_cpp:
+  repo_url: ""
+  repo_path: "."
+  build_path: "."
+  binary_path: "{{MOCK_BINARY}}"
+  branch: "master"
+  build_args: []
+  build_command_args: []
+  auto_update_interval_seconds: 0
+  enabled: false
+cluster:
+  enabled: false
+  peers: []
+  gossip_interval_seconds: 5
+http:
+  request_body_limit_bytes: 1048576
+  idle_timeout_seconds: 60

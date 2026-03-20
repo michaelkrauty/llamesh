@@ -1,0 +1,32 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.0.0] - 2026-03-19
+
+Initial public release.
+
+### Added
+
+- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models` endpoints
+- **Automatic instance management** — on-demand `llama-server` spawn, health monitoring, and idle eviction
+- **Multi-node mesh clustering** — zero-config LAN discovery via mDNS or explicit WAN peer configuration
+- **Noise Protocol encryption** — authenticated, encrypted inter-node communication
+- **Model profiles** — multiple profiles per model with different `llama-server` args (e.g. `fast` vs `quality`)
+- **Resource guardrails** — VRAM and system memory tracking to prevent OOM
+- **Hot-reload cookbook** — add or modify models without restarting the proxy
+- **Auto-build llama.cpp** — clones, builds, smoke tests, and atomically swaps binaries
+- **Hugging Face integration** — automatic model downloads via `hf_repo`/`hf_file`
+- **SSE streaming** — streaming with backpressure, forwarded verbatim from llama-server
+- **Circuit breaker** — automatic peer failure detection and recovery
+- **Slot-aware routing** — routes requests to the instance with the most available slots
+- **Request queueing** — queues requests when all slots are busy, with configurable timeouts
+- **TLS/mTLS support** — optional TLS termination and mutual TLS for clients
+- **API key authentication** — configurable API key validation for client requests
+- **Prometheus metrics** — `/metrics` endpoint plus JSON snapshots at `/metrics/json`
+- **Health probes** — `/healthz` and `/readyz` for load balancer and orchestrator integration
+- **Log analysis tooling** — scripts for error triage, request tracing, instance lifecycle, and cluster health
+- **Systemd deployment** — install script and service template
