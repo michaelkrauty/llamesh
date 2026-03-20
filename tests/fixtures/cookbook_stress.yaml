@@ -1,0 +1,12 @@
+# Stress test cookbook fixture
+# Higher max_instances and concurrency settings for load testing
+models:
+  - name: "stress-model"
+    profiles:
+      - id: "default"
+        model_path: "./models/stress.gguf"
+        idle_timeout_seconds: 60
+        max_instances: 4
+        estimated_vram_mb: 100
+        estimated_sysmem_mb: 50
+        llama_server_args: "--slots 8"

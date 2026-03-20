@@ -1,0 +1,249 @@
+# =============================================================================
+# llamesh Configuration
+# =============================================================================
+# This file configures a single node in the mesh proxy cluster.
+# Copy to config.yaml and customize for your environment.
+
+# -----------------------------------------------------------------------------
+# Node Identity
+# -----------------------------------------------------------------------------
+
+# Unique identifier for this node in the cluster (required)
+node_id: "node-a"
+
+# Address and port to listen on (required)
+# Use "0.0.0.0:8080" to listen on all interfaces
+listen_addr: "0.0.0.0:8080"
+
+# Public URL other nodes/clients use to reach this node (optional)
+# If not set, peers will use the address they connected from
+public_url: "https://node-a.example.com"
+
+# -----------------------------------------------------------------------------
+# Resource Limits
+# -----------------------------------------------------------------------------
+
+# Maximum VRAM (GPU memory) in MB this node can use (required)
+# Set to your GPU's available VRAM minus some headroom
+max_vram_mb: 16000  # 16GB
+
+# Maximum system memory in MB this node can use (required)
+# Set to available RAM minus OS/other app needs
+max_sysmem_mb: 64000  # 64GB
+
+# Maximum number of llama-server instances this node can run (default: 100)
+max_instances_per_node: 100
+
+# -----------------------------------------------------------------------------
+# Model Routing
+# -----------------------------------------------------------------------------
+
+# Default model to use when client doesn't specify one (required)
+# Format: "model-name" or "model-name:profile"
+default_model: "gpt-oss-20b"
+
+# Default limits applied to all models unless overridden in cookbook (required)
+model_defaults:
+  # Max concurrent requests per llama-server instance
+  max_concurrent_requests_per_instance: 8
+  # Max requests waiting in queue per model
+  max_queue_size_per_model: 64
+  # Max instances of same model that can run simultaneously
+  max_instances_per_model: 4
+  # Max time (ms) request waits in queue before timeout (default: 60000)
+  max_wait_in_queue_ms: 60000
+  # Max request duration in ms, 0 = unlimited (default: 0)
+  max_request_duration_ms: 0
+
+# -----------------------------------------------------------------------------
+# llama-server Port Allocation
+# -----------------------------------------------------------------------------
+
+# Constrain which ports llama-server instances can bind to (optional)
+# If omitted, uses OS-assigned ephemeral ports
+llama_cpp_ports:
+  # Explicit list of allowed ports
+  ports: [8200, 8201, 8300]
+  # Port ranges (inclusive)
+  ranges:
+    - start: 8200
+      end: 8299
+
+# -----------------------------------------------------------------------------
+# llama.cpp Build Management
+# -----------------------------------------------------------------------------
+
+llama_cpp:
+  # Git repository URL
+  repo_url: "https://github.com/ggml-org/llama.cpp.git"
+
+  # Local paths (defaults shown)
+  repo_path: "./llama.cpp"
+  build_path: "./llama.cpp/build"
+  binary_path: "./llama.cpp/build/bin/llama-server"
+
+  # Branch, tag, or commit to build
+  # Use release tags (e.g., "b6115") for stability, "master" for latest
+  branch: "master"
+
+  # CMake build arguments (default: CUDA enabled)
+  build_args:
+    - "-DGGML_CUDA=ON"
+    - "-DGGML_CUDA_FA_ALL_QUANTS=ON"
+    # Other options:
+    # - "-DGGML_METAL=ON"       # macOS Metal
+    # - "-DGGML_VULKAN=ON"      # Vulkan
+    # - "-DGGML_HIPBLAS=ON"     # AMD ROCm
+    # - "-DGGML_SYCL=ON"        # Intel oneAPI
+
+  # Additional args passed to build command (e.g., make/ninja)
+  build_command_args: ["-j"]  # Parallel build
+
+  # Auto-update interval in seconds, 0 = disabled (required)
+  auto_update_interval_seconds: 86400  # Daily
+
+  # Enable/disable build management (default: true)
+  # Set to false if managing llama.cpp builds externally
+  enabled: true
+
+  # Number of old builds to keep (default: 3)
+  keep_builds: 3
+
+# -----------------------------------------------------------------------------
+# Cluster Configuration
+# -----------------------------------------------------------------------------
+
+cluster:
+  # Enable cluster mode to mesh multiple nodes (required)
+  enabled: true
+
+  # Gossip interval - how often nodes exchange state (required)
+  gossip_interval_seconds: 5
+
+  # Max concurrent outbound gossip connections (default: 16)
+  max_concurrent_gossip: 16
+
+  # Peer discovery configuration
+  discovery:
+    # Enable mDNS for zero-config LAN discovery (default: true)
+    # Note: mDNS uses UDP multicast on port 5353. If firewalled, use explicit peers below.
+    mdns: true
+    # mDNS service name (default: "_llama-mesh._tcp.local")
+    service_name: "_llama-mesh._tcp.local"
+
+  # Explicit peer addresses for WAN or cross-subnet connections
+  # Additive with mDNS - both methods contribute peers
+  # Uses same port as listen_addr (single-port protocol multiplexing)
+  peers:
+    - "node-b.example.com:8080"
+    - "node-c.example.com:8080"
+
+  # Noise Protocol encryption for inter-node traffic
+  noise:
+    # Enable Noise Protocol (default: true)
+    enabled: true
+
+    # Trust-On-First-Use: auto-accept new peer keys (default: true)
+    # Set to false for enterprise deployments with pinned keys
+    tofu: true
+
+    # Directory for secrets (default: ~/.llama-mesh/)
+    # Contains: cluster_token, node.key, known_peers
+    config_dir: "~/.llama-mesh/"
+
+    # Override paths for specific files (optional)
+    # private_key_path: "/path/to/node.key"
+    # known_peers_path: "/path/to/known_peers"
+    # previous_key_path: "/path/to/old-node.key"  # For key rotation
+
+    # Enterprise: only accept connections from these public keys
+    # Format: "ed25519:<base64-encoded-key>"
+    # If non-empty, TOFU is effectively disabled
+    allowed_keys: []
+      # - "ed25519:xAbC123...="
+      # - "ed25519:yDeF456...="
+
+    # Session cache TTL in seconds (default: 3600)
+    session_ttl_seconds: 3600
+
+  # Circuit breaker for peer connections
+  # Prevents cascading failures by temporarily blocking requests to unhealthy peers
+  circuit_breaker:
+    # Enable circuit breaker (default: true)
+    enabled: true
+    # Number of consecutive failures before opening circuit (default: 5)
+    failure_threshold: 5
+    # Number of successes in half-open state to close circuit (default: 2)
+    success_threshold: 2
+    # Base backoff duration in ms when circuit opens (default: 5000)
+    open_duration_base_ms: 5000
+    # Max backoff duration in ms with exponential backoff (default: 60000)
+    open_duration_max_ms: 60000
+
+# -----------------------------------------------------------------------------
+# HTTP Server Settings
+# -----------------------------------------------------------------------------
+
+http:
+  # Max request body size in bytes (required)
+  request_body_limit_bytes: 1048576  # 1MB
+
+  # Idle connection timeout in seconds (required)
+  idle_timeout_seconds: 120
+
+# -----------------------------------------------------------------------------
+# Shutdown Behavior
+# -----------------------------------------------------------------------------
+
+# Grace period for in-flight requests during shutdown (default: 30)
+shutdown_grace_period_seconds: 30
+
+# Max hops for request forwarding to prevent loops (default: 10)
+max_hops: 10
+
+# Path for metrics JSON snapshot (default: "./node-metrics.json")
+metrics_path: "./node-metrics.json"
+
+# -----------------------------------------------------------------------------
+# File Logging (optional)
+# -----------------------------------------------------------------------------
+
+# Enable file logging with daily rotation and gzip compression.
+# Logs are written to both console (always) and file (when enabled).
+# logging:
+#   enabled: true              # Enable file logging (default: false)
+#   directory: "./logs"        # Log directory (default: "./logs")
+#   filename: "proxy.log"      # Log filename (default: "proxy.log")
+#   max_keep_files: 7          # Rotated files to keep (default: 7)
+#   compression: true          # Gzip compress rotated files (default: true)
+
+# -----------------------------------------------------------------------------
+# API Authentication (optional)
+# -----------------------------------------------------------------------------
+
+auth:
+  enabled: true
+  # Header name for API key (case-insensitive matching)
+  required_header: "x-api-key"
+  # List of valid API keys
+  allowed_keys:
+    - "my-secret-key-1"
+    - "my-secret-key-2"
+
+# -----------------------------------------------------------------------------
+# TLS Configuration (optional)
+# -----------------------------------------------------------------------------
+
+# TLS for public API (client → proxy)
+server_tls:
+  enabled: false
+  cert_path: "./tls/server.crt"
+  key_path: "./tls/server.key"
+
+# DEPRECATED: mTLS for inter-node traffic
+# Use cluster.noise instead (Noise Protocol)
+# cluster_tls:
+#   enabled: false
+#   ca_cert_path: "./tls/ca.crt"
+#   client_cert_path: "./tls/node-a.crt"
+#   client_key_path: "./tls/node-a.key"
