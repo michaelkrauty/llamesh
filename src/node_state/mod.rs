@@ -1817,7 +1817,7 @@ impl NodeState {
     }
 
     /// Returns true if the local node can serve requests
-    /// (not draining, binary exists, and not currently building)
+    /// (not draining and binary exists)
     pub fn can_serve_locally(&self) -> bool {
         !self.draining.load(Ordering::Relaxed) && self.build_manager.can_serve()
     }
@@ -1839,7 +1839,7 @@ impl NodeState {
         let requested_key = format!("{}:{}", model_name, requested_profile);
 
         // Add self only if we can serve requests locally
-        // This excludes us when: draining, binary missing, or build in progress
+        // This excludes us when: draining or binary missing
         if self.can_serve_locally() {
             let self_peer = self.get_self_peer_state().await;
             if peer_supports_profile(&self_peer, model_name, &requested_profile) {
@@ -1875,7 +1875,7 @@ impl NodeState {
             if peer.max_instances == 0 {
                 continue;
             }
-            // Skip peers that aren't ready (building, draining, etc.)
+            // Skip peers that aren't ready (draining, etc.)
             if !peer.ready {
                 continue;
             }

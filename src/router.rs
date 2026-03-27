@@ -408,7 +408,7 @@ pub async fn route_request(
             }
 
             // No node available - check if model exists in local cookbook
-            // If it does, wait for capacity (local node might be building/draining)
+            // If it does, wait for capacity (local node might be draining)
             // If it doesn't, the model truly doesn't exist anywhere → 404
             if state.resolve_model(&model_name).await.is_none() {
                 // Model doesn't exist in local cookbook and no peer supports it

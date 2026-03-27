@@ -41,7 +41,7 @@ pub struct PeerState {
     #[serde(default)]
     pub max_sysmem: u64,
     pub total_queue_length: usize,
-    /// Whether this node can serve requests locally (not building, not draining, binary exists)
+    /// Whether this node can serve requests locally (not draining, binary exists)
     #[serde(default = "default_ready")]
     pub ready: bool,
     /// Currently loaded models (model:profile format) - for routing preference

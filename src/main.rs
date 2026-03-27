@@ -228,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initial build - runs in background so server can start immediately
-    // While building, requests will be forwarded to available peers (via can_serve_locally() check)
+    // If a binary already exists, requests are served using it until the build completes
     {
         let bm = node_state.build_manager.clone();
         let lock = node_state.rebuild_lock.clone();
