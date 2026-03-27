@@ -1053,7 +1053,7 @@ Every `gossip_interval_seconds`, nodes exchange metadata including:
 * `node_id`, `version`, supported models.
 * `loaded_models`: Which models are currently loaded and running.
 * `model_stats`: Per-model metrics including tokens per second, queue length, and learned VRAM/sysmem usage.
-* `ready` flag: Whether the node is ready to serve (false when building or draining).
+* `ready` flag: Whether the node is ready to serve (false when draining or binary is unavailable).
 * `known_peers`: List of known peers for transitive discovery (peers learn about peers-of-peers).
 * Current capacity and resource usage.
 
