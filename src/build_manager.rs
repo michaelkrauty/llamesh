@@ -117,10 +117,11 @@ impl BuildManager {
         *cache = None;
     }
 
-    /// Returns true if the node can serve requests locally
-    /// (binary exists and no build is in progress that might affect it)
+    /// Returns true if the node can serve requests locally (binary exists).
+    /// Builds happen in isolated per-commit directories and the existing binary
+    /// symlink remains valid throughout, so building does not affect serving.
     pub fn can_serve(&self) -> bool {
-        self.is_binary_available() && !self.is_building()
+        self.is_binary_available()
     }
 
     /// Returns a snapshot of the current build status.
@@ -807,6 +808,38 @@ fi
         assert!(!status.is_building);
         assert!(status.last_build_error.is_none());
         assert!(status.last_build_at.is_none());
+    }
+
+    #[test]
+    fn test_can_serve_true_while_building() {
+        let tmp = std::env::temp_dir().join("llamesh-test-can-serve-building");
+        std::fs::write(&tmp, "fake").unwrap();
+
+        let config = crate::config::LlamaCppConfig {
+            repo_url: "".into(),
+            repo_path: "".into(),
+            build_path: "".into(),
+            binary_path: tmp.to_string_lossy().to_string(),
+            branch: "".into(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: false,
+            keep_builds: 3,
+        };
+        let bm = BuildManager::new(config);
+
+        // Binary exists and not building → can serve
+        assert!(bm.can_serve());
+
+        // Binary exists and building → should STILL serve
+        bm.building.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            bm.can_serve(),
+            "Node must continue serving during builds when binary exists"
+        );
+
+        std::fs::remove_file(&tmp).unwrap();
     }
 
     #[test]
