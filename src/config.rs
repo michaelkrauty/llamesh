@@ -171,6 +171,11 @@ pub struct ModelDefaults {
     /// Maximum request duration (ms). 0 = unlimited (no timeout).
     #[serde(default = "default_max_request_duration_ms")]
     pub max_request_duration_ms: u64,
+    /// Minimum time (seconds) an instance must serve before it can be drained
+    /// for a competing model. After tenure expires, the instance yields to
+    /// queued competitors on its next idle transition. 0 = drain immediately.
+    #[serde(default = "default_min_eviction_tenure_secs")]
+    pub min_eviction_tenure_secs: u64,
 }
 
 fn default_max_wait_in_queue_ms() -> u64 {
@@ -179,6 +184,10 @@ fn default_max_wait_in_queue_ms() -> u64 {
 
 fn default_max_request_duration_ms() -> u64 {
     0
+}
+
+fn default_min_eviction_tenure_secs() -> u64 {
+    15
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -525,6 +534,9 @@ pub struct Profile {
     /// Override the global max_queue_size_per_model for this profile.
     #[serde(default)]
     pub max_queue_size: Option<usize>,
+    /// Override the global min_eviction_tenure_secs for this profile.
+    #[serde(default)]
+    pub min_eviction_tenure_secs: Option<u64>,
 }
 
 impl Profile {
@@ -537,6 +549,10 @@ impl Profile {
 
     pub fn effective_max_queue_size(&self, defaults: &ModelDefaults) -> usize {
         self.max_queue_size.unwrap_or(defaults.max_queue_size_per_model)
+    }
+
+    pub fn effective_min_eviction_tenure_secs(&self, defaults: &ModelDefaults) -> u64 {
+        self.min_eviction_tenure_secs.unwrap_or(defaults.min_eviction_tenure_secs)
     }
 
     /// Returns the effective startup timeout in seconds.
@@ -675,6 +691,7 @@ mod tests {
             max_instances_per_model: 5,
             max_wait_in_queue_ms: 60_000,
             max_request_duration_ms: 300_000,
+            min_eviction_tenure_secs: 15,
         }
     }
 
@@ -693,6 +710,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         }
     }
 
@@ -877,6 +895,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
         assert!(profile.validate("test_model").is_err());
     }
@@ -897,6 +916,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
         assert!(profile.validate("test_model").is_err());
     }
@@ -917,6 +937,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
         assert!(profile.validate("test_model").is_ok());
     }
@@ -937,6 +958,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
         assert!(profile.validate("test_model").is_ok());
     }

@@ -41,9 +41,15 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
     // Use tokio::time::interval so the first tick fires immediately (no initial sleep),
     // then subsequent ticks wait `gossip_interval_seconds`.
     let mut interval = tokio::time::interval(period);
+    let gossip_trigger = state.gossip_trigger.clone();
 
     loop {
-        interval.tick().await;
+        // Wait for either the periodic interval or an instant gossip trigger
+        // (fired when significant state changes occur: instance ready/stopped, drain, etc.)
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = gossip_trigger.notified() => {}
+        }
         let my_state = state.get_self_peer_state().await;
 
         // Collect all targets: seeds + mDNS-discovered + known peers
@@ -443,6 +449,7 @@ mod tests {
                 max_instances_per_model: 1,
                 max_wait_in_queue_ms: 500,
                 max_request_duration_ms: 300_000,
+                min_eviction_tenure_secs: 15,
             },
             llama_cpp_ports: None,
             llama_cpp: LlamaCppConfig {

@@ -90,6 +90,7 @@ mod tests {
                 max_instances_per_model: 1,
                 max_wait_in_queue_ms: 500,
                 max_request_duration_ms: 300_000,
+                min_eviction_tenure_secs: 15,
             },
             llama_cpp_ports: None,
             llama_cpp: LlamaCppConfig {
