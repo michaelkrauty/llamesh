@@ -123,6 +123,14 @@ pub struct NodeState {
     /// Notified when cluster capacity changes (instance idle, terminated, peer update).
     /// Used by route_or_wait() to efficiently wait for capacity.
     pub capacity_notify: Arc<Notify>,
+    /// Model:profile keys that failed to spawn due to InsufficientResources
+    /// and need eviction of existing instances to proceed. Used by the drain
+    /// scheduler to decide when to drain an incumbent model.
+    pub needs_eviction: Arc<RwLock<HashSet<String>>>,
+    /// Signalled to trigger an immediate gossip round to peers (e.g., after
+    /// an instance stops, starts, or is drained). Complements the periodic
+    /// gossip interval for latency-sensitive state changes.
+    pub gossip_trigger: Arc<Notify>,
 }
 
 use crate::security;
@@ -221,6 +229,8 @@ impl NodeState {
             discovery,
             circuit_breaker,
             capacity_notify: Arc::new(Notify::new()),
+            needs_eviction: Arc::new(RwLock::new(HashSet::new())),
+            gossip_trigger: Arc::new(Notify::new()),
         })
     }
 
@@ -254,6 +264,9 @@ impl NodeState {
         // A config change (e.g. reduced context length) may lower VRAM estimates
         // enough to unblock previously-stuck spawns.
         self.notify_all_queues().await;
+
+        // Trigger instant gossip so peers learn about model changes immediately
+        self.gossip_trigger.notify_one();
 
         Ok(())
     }
@@ -511,6 +524,9 @@ impl NodeState {
 
         self.update_peak_memory(&inst.model_name, &inst.profile_id)
             .await;
+
+        // Trigger instant gossip so peers learn about freed capacity immediately
+        self.gossip_trigger.notify_one();
     }
 
     // Helper to identify victims for eviction. Needs to be called under lock if we want to be sure.
@@ -1159,6 +1175,11 @@ impl NodeState {
                             info!(event = "queue_enqueue", model = %model_name, queue_length = queue_len, spawn_error = spawn_error_reason);
                         }
 
+                        // Track that this model needs eviction to spawn (outside queues lock)
+                        if matches!(e, NodeError::InsufficientResources | NodeError::MaxInstancesNode) {
+                            self.needs_eviction.write().await.insert(key.clone());
+                        }
+
                         // Wait for queue notification with optional timeout
                         let wait_result = match queue_timeout {
                             Some(timeout) => {
@@ -1599,6 +1620,7 @@ impl NodeState {
 
             let inst_clone = inst_arc.clone();
             let startup_timeout = profile.effective_startup_timeout_seconds();
+            let eviction_tenure_secs = profile.effective_min_eviction_tenure_secs(&self.config.model_defaults);
             let api_key = final_args
                 .iter()
                 .position(|arg| arg == "--api-key")
@@ -1612,6 +1634,9 @@ impl NodeState {
             let http_client = self.http_client.clone();
             let metrics = self.metrics.clone();
             let memory_sampler = self.memory_sampler.clone();
+            let needs_eviction = self.needs_eviction.clone();
+            let gossip_trigger = self.gossip_trigger.clone();
+            let model_key = format!("{}:{}", model_name, profile.id);
             let args_hash_clone = args_hash.clone();
             let is_cold = is_cold_start;
             tokio::spawn(async move {
@@ -1627,6 +1652,18 @@ impl NodeState {
                     // Parse model params from startup log now that instance is ready
                     inst.parse_and_store_startup_params();
                     inst.clear_startup_log();
+
+                    // Set eviction tenure — instance cannot be drained by competitors until this expires
+                    {
+                        let mut evictable = inst.evictable_after.lock();
+                        *evictable = Some(std::time::Instant::now() + std::time::Duration::from_secs(eviction_tenure_secs));
+                    }
+
+                    // Clear needs_eviction — this model no longer needs eviction to spawn
+                    needs_eviction.write().await.remove(&model_key);
+
+                    // Trigger instant gossip so peers learn about new model availability
+                    gossip_trigger.notify_one();
 
                     if is_cold {
                         // Cold start: sample memory after ready and store learned value
@@ -2045,6 +2082,65 @@ impl NodeState {
 
         // Wake any cluster-aware waiters (route_or_wait callers)
         self.capacity_notify.notify_waiters();
+    }
+
+    // ── Drain Scheduling ─────────────────────────────────────────────────
+
+    /// Check if any queued model needs eviction of this instance's resources.
+    /// Returns true if there's a model:profile in `needs_eviction` that belongs
+    /// to a different model AND still has a non-empty queue.
+    pub async fn has_queued_competitors_needing_eviction(&self, inst_model: &str) -> bool {
+        let needs = self.needs_eviction.read().await;
+        if needs.is_empty() {
+            return false;
+        }
+        let queues = self.queues.read().await;
+        needs.iter().any(|key| {
+            let model = key.split(':').next().unwrap_or("");
+            model != inst_model && queues.get(key).map(|q| !q.is_empty()).unwrap_or(false)
+        })
+    }
+
+    /// Check if the given model has pending requests (in queue or pending tokens).
+    pub async fn has_pending_for_model(&self, model: &str, profile: &str) -> bool {
+        let key = format!("{}:{}", model, profile);
+        let queues = self.queues.read().await;
+        let has_queue = queues.get(&key).map(|q| !q.is_empty()).unwrap_or(false);
+        if has_queue {
+            return true;
+        }
+        drop(queues);
+        let pending = self.pending_tokens.read().await;
+        pending.get(&key).map(|s| !s.is_empty()).unwrap_or(false)
+    }
+
+    /// Cancel drains that are no longer needed (competitors were handled by
+    /// peers or timed out). Notifies the drained model's queue so its
+    /// pending requests can resume being dispatched.
+    pub async fn maybe_cancel_drains(&self) {
+        let instances = self.instances.read().await;
+        for inst_lock in instances.values() {
+            let inst = inst_lock.read().await;
+            if inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                if !self.has_queued_competitors_needing_eviction(&inst.model_name).await {
+                    inst.draining.store(false, std::sync::atomic::Ordering::Relaxed);
+                    info!(
+                        event = "drain_cancelled",
+                        model = %inst.model_name,
+                        profile = %inst.profile_id,
+                        instance_id = %inst.id,
+                        "Drain cancelled — no more competitors needing eviction"
+                    );
+                    drop(inst);
+                    // Wake the model's own queue so pending requests can be dispatched
+                    let model_name = inst_lock.read().await.model_name.clone();
+                    let profile_id = inst_lock.read().await.profile_id.clone();
+                    drop(instances);
+                    self.notify_queue(&model_name, &profile_id).await;
+                    return; // Released instances lock, must restart iteration
+                }
+            }
+        }
     }
 
     pub async fn run_background_tasks(self: Arc<Self>) {
@@ -2481,6 +2577,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         }
     }
 
@@ -2491,6 +2588,7 @@ mod tests {
             max_instances_per_model: 1,
             max_wait_in_queue_ms: 500,
             max_request_duration_ms: 300_000,
+            min_eviction_tenure_secs: 15,
         }
     }
 

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-03-31
+
+### Added
+
+- **Drain scheduling for GPU time-sharing.** When a request arrives for a model
+  that needs VRAM held by another model, the incumbent is now drained (stops
+  accepting new requests) and evicted once its in-flight requests complete.
+  Previously, the incumbent held the GPU indefinitely as long as it had any
+  demand, causing starvation for competing models.
+
+  - New `min_eviction_tenure_secs` config option (default: 15) controls the
+    minimum time a model must serve before it can be forcibly drained by a
+    competitor. Configurable globally in `model_defaults` or per-profile.
+  - Running requests are never interrupted. The drain only prevents new
+    dispatches; in-flight requests complete naturally, however long they take.
+  - Drains are reversible: if the competing requests are handled elsewhere
+    (e.g., by a peer node or timeout), the drain is cancelled and the
+    incumbent resumes serving.
+
+- **Instant gossip.** Significant state changes (instance ready, instance
+  stopped, cookbook reload) now trigger an immediate gossip round to peers,
+  complementing the periodic gossip interval. Peers learn about capacity
+  changes within milliseconds instead of waiting for the next gossip tick.
+
 ## [1.0.2] - 2026-03-31
 
 ### Fixed

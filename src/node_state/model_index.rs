@@ -186,6 +186,7 @@ mod tests {
                             startup_timeout_seconds: None,
                             download_timeout_seconds: None,
                             max_queue_size: None,
+                            min_eviction_tenure_secs: None,
                         },
                         Profile {
                             id: "fast".to_string(),
@@ -201,6 +202,7 @@ mod tests {
                             startup_timeout_seconds: None,
                             download_timeout_seconds: None,
                             max_queue_size: None,
+                            min_eviction_tenure_secs: None,
                         },
                     ],
                 },
@@ -268,6 +270,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, model_present, hf_present) = build_pre_args(&profile);
@@ -294,6 +297,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, model_present, hf_present) = build_pre_args(&profile);
@@ -338,6 +342,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -362,6 +367,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, model_present, _) = build_pre_args(&profile);
@@ -387,6 +393,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -411,6 +418,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -436,6 +444,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -461,6 +470,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -486,6 +496,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -511,6 +522,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -535,6 +547,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -561,6 +574,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);

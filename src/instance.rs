@@ -178,6 +178,9 @@ pub struct Instance {
     pub is_cold_start: bool,
     /// Whether this instance is draining (no new requests should be assigned).
     pub draining: AtomicBool,
+    /// Earliest time this instance can be drained for a competing model.
+    /// Set to `now() + tenure` when instance reaches Ready.
+    pub evictable_after: Mutex<Option<Instant>>,
 }
 
 impl Drop for Instance {
@@ -237,6 +240,7 @@ impl Instance {
             parsed_params: Mutex::new(None),
             is_cold_start,
             draining: AtomicBool::new(false),
+            evictable_after: Mutex::new(None),
         }
     }
 

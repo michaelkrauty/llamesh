@@ -503,10 +503,49 @@ pub async fn route_request(
                                         let mut inst = instance_lock.write().await;
                                         inst.in_flight_requests =
                                             inst.in_flight_requests.saturating_sub(1);
+                                        let idle = inst.in_flight_requests == 0;
+
+                                        // ── Drain scheduling ────────────────────────────
+                                        // Check if this instance should be drained for a
+                                        // queued competitor that needs its VRAM.
+                                        if !inst.draining.load(Ordering::Relaxed) {
+                                            let dominated = state
+                                                .has_queued_competitors_needing_eviction(
+                                                    &inst.model_name,
+                                                )
+                                                .await;
+                                            if dominated {
+                                                let tenure_expired = inst
+                                                    .evictable_after
+                                                    .lock()
+                                                    .map(|t| std::time::Instant::now() >= t)
+                                                    .unwrap_or(false);
+                                                let own_queue_empty = idle
+                                                    && !state
+                                                        .has_pending_for_model(
+                                                            &inst.model_name,
+                                                            &inst.profile_id,
+                                                        )
+                                                        .await;
+
+                                                if tenure_expired || own_queue_empty {
+                                                    inst.draining.store(true, Ordering::Relaxed);
+                                                    info!(
+                                                        event = "drain_triggered",
+                                                        model = %inst.model_name,
+                                                        profile = %inst.profile_id,
+                                                        instance_id = %inst.id,
+                                                        reason = if tenure_expired { "tenure_expired" } else { "queue_empty" },
+                                                        "Instance marked draining for competing model"
+                                                    );
+                                                }
+                                            }
+                                        }
+
                                         (
                                             inst.model_name.clone(),
                                             inst.profile_id.clone(),
-                                            inst.in_flight_requests == 0,
+                                            idle,
                                         )
                                     };
                                     state.metrics.dec_current_requests();
@@ -516,6 +555,9 @@ pub async fn route_request(
                                     // If we only notify this model's queue, requests for other models
                                     // will never wake up to check if they can now evict this idle instance.
                                     if became_idle {
+                                        // Check if any drains can be cancelled (competitors may have
+                                        // been handled by peers or timed out while we were draining).
+                                        state.maybe_cancel_drains().await;
                                         state.notify_all_queues().await;
                                     } else {
                                         state.notify_queue(&model_name, &profile_id).await;
@@ -1217,6 +1259,7 @@ mod tests {
             startup_timeout_seconds: None,
             download_timeout_seconds: None,
             max_queue_size: None,
+            min_eviction_tenure_secs: None,
         }
     }
 
