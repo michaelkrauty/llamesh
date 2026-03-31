@@ -250,6 +250,11 @@ impl NodeState {
             "Cookbook reloaded successfully"
         );
 
+        // Wake all queued waiters so they re-attempt with the updated cookbook.
+        // A config change (e.g. reduced context length) may lower VRAM estimates
+        // enough to unblock previously-stuck spawns.
+        self.notify_all_queues().await;
+
         Ok(())
     }
 
