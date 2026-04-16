@@ -275,7 +275,11 @@ pub async fn route_request(
                 );
 
                 state.metrics.inc_requests();
-                let start_time = std::time::Instant::now();
+                // RequestGuard ensures current_requests is decremented if this
+                // handler is cancelled before we can install the body-level
+                // cleanup below. Without it, a client disconnect during
+                // `client_req.send().await` would leak the gauge monotonically.
+                let guard = RequestGuard::new(state.clone());
 
                 let base = peer.address.trim_end_matches('/');
                 let url = format!("{}{}", base, path_and_query);
@@ -327,13 +331,32 @@ pub async fn route_request(
                 match client_req.send().await {
                     Ok(resp) => {
                         state.circuit_breaker.record_success(&peer.node_id).await;
-                        state.metrics.dec_current_requests();
-                        let _duration = start_time.elapsed().as_millis() as u64;
 
                         let status = resp.status();
                         let headers = resp.headers().clone();
-                        let body_stream = resp.bytes_stream();
-                        let body = Body::from_stream(body_stream);
+
+                        // Defer the dec_current_requests decrement until the
+                        // response body finishes streaming to the client (or is
+                        // dropped on client disconnect). CleanupStream::Drop
+                        // spawns this future on end-of-stream or on drop,
+                        // closing the cancellation window between headers
+                        // arriving and the body fully flushing.
+                        let cleanup_fut: BoxFuture<'static, ()> = {
+                            let state = state.clone();
+                            Box::pin(async move {
+                                state.metrics.dec_current_requests();
+                            })
+                        };
+
+                        // Hand off responsibility for dec from `guard` to
+                        // `cleanup_fut` now that we're committed to returning
+                        // the streaming response.
+                        guard.complete();
+
+                        let tokens_counter = Arc::new(AtomicU64::new(0));
+                        let wrapped =
+                            CleanupStream::new(resp.bytes_stream(), cleanup_fut, tokens_counter);
+                        let body = Body::from_stream(wrapped);
 
                         let mut response = Response::builder().status(status);
                         for (name, value) in headers.iter() {
@@ -348,7 +371,7 @@ pub async fn route_request(
                     }
                     Err(e) => {
                         state.circuit_breaker.record_failure(&peer.node_id).await;
-                        state.metrics.dec_current_requests();
+                        // guard Drop handles dec_current_requests on return.
                         state.metrics.inc_errors();
                         error!(peer = %peer.node_id, error = %e, "Failed to forward to peer");
                         return Err(AppError::new(

@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instance would then never satisfy `in_flight_requests == 0` and would
   refuse to idle-evict, holding VRAM and sysmem indefinitely under any
   workload that experiences cancellations.
+- `current_requests` no longer leaks in the forward-to-peer path when the
+  local node has no entry for the requested model. The `inc_requests()` call
+  at the top of the path had no matching `RequestGuard`, so a cancellation
+  between there and the success-path `dec_current_requests()` leaked the
+  gauge monotonically. A `RequestGuard` now covers the path; on cancellation
+  its `Drop` decrements. On the success path, the decrement is deferred via
+  `CleanupStream` until the response body fully streams to the client (or is
+  dropped on client disconnect), closing a second window where headers had
+  arrived but the body was still in flight.
 
 ## [1.1.0] - 2026-03-31
 
