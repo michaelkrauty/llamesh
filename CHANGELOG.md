@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Cookbook hot-reload now drains instances that no longer match the cookbook.
+  Previously, disabling a model (or removing a profile, or changing its
+  `llama_server_args`) left the running `llama-server` process alive
+  indefinitely, continuing to hold VRAM/sysmem even though the local node no
+  longer advertised the model. Reload now marks such instances `draining`
+  (graceful: in-flight requests finish, no new dispatches) and the standard
+  eviction path terminates them as soon as they go idle. Emits a new
+  `instance_orphaned_by_reload` event with `reason` field
+  (`model_or_profile_missing_or_disabled` | `args_changed`). As
+  defense-in-depth, the idle-eviction loop now also drains immediately when
+  a profile no longer resolves or its args_hash has drifted, replacing the
+  previous 600-second fallback timeout.
+
 ## [1.1.1] - 2026-04-16
 
 ### Fixed
