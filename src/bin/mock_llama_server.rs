@@ -1,5 +1,7 @@
 use axum::{
+    body::{Body, Bytes},
     extract::{Request, State},
+    http::StatusCode,
     middleware::Next,
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
@@ -339,8 +341,15 @@ async fn chat_completions(
 
         Sse::new(stream).into_response()
     } else {
-        let ms = rand::rng().random_range(500..2000);
-        sleep(Duration::from_millis(ms)).await;
+        // Deterministic short path when slow-body is engaged, so tests can
+        // predict when headers reach the client and time their cancellation.
+        let slow_body_ms = std::env::var("MOCK_SLOW_BODY_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        if slow_body_ms.is_none() {
+            let ms = rand::rng().random_range(500..2000);
+            sleep(Duration::from_millis(ms)).await;
+        }
 
         let response = serde_json::json!({
             "id": "chatcmpl-mock",
@@ -361,6 +370,49 @@ async fn chat_completions(
             if let Some(slot) = slots.iter_mut().find(|s| s.id == slot_id) {
                 slot.state = 0;
             }
+        }
+
+        // Test hook: `MOCK_SLOW_BODY_MS=<n>` streams the non-streaming JSON body
+        // as two halves with an `n`-millisecond pause between them. Lets tests
+        // trigger a client cancel landing inside `resp.bytes().await` on the
+        // proxy, rather than during `send().await`.
+        if let Some(delay_ms) = slow_body_ms {
+            let body_bytes = serde_json::to_vec(&response).expect("serialize mock response");
+            let total_len = body_bytes.len();
+            let mid = total_len / 2;
+            let (head, tail) = body_bytes.split_at(mid);
+            let first = Bytes::copy_from_slice(head);
+            let second = Bytes::copy_from_slice(tail);
+            let stream = stream::unfold(
+                (0u8, first, second, delay_ms),
+                |(step, first, second, delay_ms)| async move {
+                    match step {
+                        0 => Some((
+                            Ok::<Bytes, Infallible>(first.clone()),
+                            (1, first, second, delay_ms),
+                        )),
+                        1 => {
+                            sleep(Duration::from_millis(delay_ms)).await;
+                            Some((
+                                Ok::<Bytes, Infallible>(second.clone()),
+                                (2, first, second, delay_ms),
+                            ))
+                        }
+                        _ => None,
+                    }
+                },
+            );
+            // Set Content-Length explicitly so downstream consumers (the proxy
+            // or the test client) know the body ends at a specific byte count.
+            // Otherwise hyper uses chunked transfer for Body::from_stream, and
+            // the proxy's subsequent re-wrap into `Body::from(bytes)` produces
+            // a header/body mismatch.
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .header("content-length", total_len.to_string())
+                .body(Body::from_stream(stream))
+                .expect("build slow-body response");
         }
 
         Json(response).into_response()
