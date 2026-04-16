@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `in_flight_requests` no longer leaks when a non-streaming request is
+  cancelled mid body-read (e.g. client disconnect, client timeout). The
+  cleanup future passed into `handle_non_streaming_response` is now wrapped
+  in an `AutoCleanup` guard whose `Drop` spawns it unconditionally, mirroring
+  the semantics `CleanupStream` already provides for streaming responses.
+  Previously, cancellation during `resp.bytes().await` dropped the cleanup
+  future unrun, leaving the instance's counter stuck above zero — the
+  instance would then never satisfy `in_flight_requests == 0` and would
+  refuse to idle-evict, holding VRAM and sysmem indefinitely under any
+  workload that experiences cancellations.
+
 ## [1.1.0] - 2026-03-31
 
 ### Added

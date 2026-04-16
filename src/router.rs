@@ -894,6 +894,14 @@ async fn handle_non_streaming_response(
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
 ) -> Response<Body> {
+    // `AutoCleanup` guarantees `cleanup` runs exactly once — either when this
+    // function returns normally, or if the enclosing task is cancelled while
+    // awaiting the body (e.g. client disconnect mid-read). Without this
+    // guard, the cleanup future would be dropped unrun on cancellation,
+    // leaking in_flight_requests on the instance and current_requests on the
+    // node.
+    let _cleanup_guard = AutoCleanup::new(cleanup);
+
     let status = resp.status();
     let headers = resp.headers().clone();
 
@@ -902,7 +910,6 @@ async fn handle_non_streaming_response(
         Ok(b) => b,
         Err(e) => {
             error!("Failed to read upstream response body: {}", e);
-            tokio::spawn(cleanup);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("Failed to read upstream response"))
@@ -928,12 +935,49 @@ async fn handle_non_streaming_response(
         info!("Failed to parse response as JSON");
     }
 
-    tokio::spawn(cleanup);
-
     let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
+}
+
+/// Wraps a cleanup `BoxFuture` so it is guaranteed to be spawned exactly once,
+/// even if the owning task is cancelled before it reaches its normal spawn
+/// site. Mirrors the Drop-based cleanup semantics of `CleanupStream`, but for
+/// non-streaming bodies where the cleanup would otherwise only run after a
+/// body-read `await` that a cancellation can interrupt.
+struct AutoCleanup {
+    cleanup: Option<BoxFuture<'static, ()>>,
+}
+
+impl AutoCleanup {
+    fn new(cleanup: BoxFuture<'static, ()>) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+}
+
+impl Drop for AutoCleanup {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(cleanup);
+                }
+                Err(_) => {
+                    // Runtime is shutting down — cleanup cannot execute.
+                    // Same architectural limitation as CleanupStream's Drop.
+                    let count = SKIPPED_STREAM_CLEANUPS.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!(
+                        skipped_cleanups = count,
+                        "Response cleanup skipped: tokio runtime unavailable during drop. \
+                         Request counters may be inaccurate during shutdown."
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn build_streaming_response(
@@ -1455,5 +1499,51 @@ mod tests {
             EndpointKind::from_path("/v1/embed"),
             EndpointKind::Other
         ));
+    }
+
+    use std::sync::atomic::AtomicBool;
+
+    #[tokio::test]
+    async fn auto_cleanup_runs_on_normal_drop() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_clone = ran.clone();
+        {
+            let _guard = AutoCleanup::new(Box::pin(async move {
+                ran_clone.store(true, Ordering::SeqCst);
+            }));
+            // scope ends here → guard drops → cleanup spawned on current runtime
+        }
+        // Yield long enough for the spawned cleanup task to run
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "cleanup should run when AutoCleanup drops inside a running runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_cleanup_runs_when_host_task_is_aborted() {
+        // Simulates cancellation: a task that holds an AutoCleanup is aborted
+        // mid-await. The cleanup must still spawn via Drop.
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_clone = ran.clone();
+
+        let handle = tokio::spawn(async move {
+            let _guard = AutoCleanup::new(Box::pin(async move {
+                ran_clone.store(true, Ordering::SeqCst);
+            }));
+            // Park forever so abort cancels mid-await — modelling a client
+            // disconnecting while `resp.bytes().await` is still pending.
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        handle.abort();
+        // Give the cleanup task a chance to schedule and run
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "cleanup should run via Drop even when the owning task is aborted"
+        );
     }
 }
