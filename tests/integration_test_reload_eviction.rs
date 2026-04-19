@@ -176,11 +176,20 @@ async fn spawn_instance_for(client: &reqwest::Client, model: &str) {
     );
 }
 
-async fn write_cookbook(path: &std::path::Path, content: &str) {
-    // Write in place. A rename-over would break the inotify watcher on Linux:
-    // the watch is set on the inode, and renaming a new file over the target
-    // replaces the inode without firing events on the new one.
+/// In-place overwrite. Preserves the inode; triggers `IN_MODIFY`.
+async fn write_cookbook_inplace(path: &std::path::Path, content: &str) {
     tokio::fs::write(path, content).await.unwrap();
+}
+
+/// Rename-based write. Writes a sibling temp file, then atomically renames
+/// it over `path`. This is the pattern used by `sed -i`, `vim` with its
+/// default `:set writebackup`, and most IDEs' save-atomic. The inode of the
+/// file at `path` changes — which used to silently break the watcher when
+/// it was bound to the file inode rather than the parent directory.
+async fn write_cookbook_rename(path: &std::path::Path, content: &str) {
+    let tmp = path.with_extension("yaml.tmp");
+    tokio::fs::write(&tmp, content).await.unwrap();
+    tokio::fs::rename(&tmp, path).await.unwrap();
 }
 
 #[tokio::test]
@@ -248,16 +257,21 @@ async fn reload_drains_orphaned_instances() {
         loaded
     );
 
-    write_cookbook(&cookbook_path, COOKBOOK_DISABLED).await;
+    // Case 1 uses an in-place write (the OpenAI-text-editor path).
+    write_cookbook_inplace(&cookbook_path, COOKBOOK_DISABLED).await;
 
     assert!(
         wait_for_unload(&client, "mock-model:default", Duration::from_secs(30)).await,
         "mock-model:default should have been drained within 30s after disable"
     );
 
-    // ── Case 2: changing llama_server_args drains the stale instance ────────
-    write_cookbook(&cookbook_path, COOKBOOK_ENABLED).await;
-    // /v1/models exposes default-profile models under the bare model name.
+    // ── Case 2: args_hash change via atomic rename-over drains the stale
+    //     instance. The rename-over path is how `sed -i` and most editors
+    //     save files, and historically it broke the watcher after the first
+    //     rename (inotify's watch was bound to the replaced inode). The fix
+    //     watches the parent directory and filters by filename, so it keeps
+    //     receiving events after any number of rename-over edits. ──────────
+    write_cookbook_rename(&cookbook_path, COOKBOOK_ENABLED).await;
     assert!(
         wait_for_model_listed(&client, "mock-model", Duration::from_secs(10)).await,
         "cookbook re-enable should make mock-model listed within 10s"
@@ -265,11 +279,12 @@ async fn reload_drains_orphaned_instances() {
 
     spawn_instance_for(&client, "mock-model:default").await;
 
-    write_cookbook(&cookbook_path, COOKBOOK_ARGS_CHANGED).await;
+    write_cookbook_rename(&cookbook_path, COOKBOOK_ARGS_CHANGED).await;
 
     assert!(
         wait_for_unload(&client, "mock-model:default", Duration::from_secs(30)).await,
-        "mock-model:default should have been drained within 30s after args_hash change"
+        "mock-model:default should have been drained within 30s after args_hash change \
+         (regression guard: rename-over must not silence the watcher)"
     );
 
     // ── Teardown ────────────────────────────────────────────────────────────

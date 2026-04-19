@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   defense-in-depth, the idle-eviction loop now also drains immediately when
   a profile no longer resolves or its args_hash has drifted, replacing the
   previous 600-second fallback timeout.
+- Cookbook watcher now survives rename-based edits. `sed -i`, most editors'
+  save-atomic, and IDE autosave all replace the file via `rename(tmp,
+  cookbook.yaml)`, which silently invalidated the inotify watch because the
+  watch was bound to the original file's inode. A single rename-based save
+  would fire one final event, then the watcher stopped receiving anything —
+  subsequent cookbook changes required a restart. The watcher now watches
+  the parent directory and filters events by the cookbook's filename, so
+  both in-place and rename-based writes keep firing reload events
+  indefinitely.
 
 ## [1.1.1] - 2026-04-16
 
