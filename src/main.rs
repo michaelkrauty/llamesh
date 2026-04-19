@@ -141,11 +141,47 @@ async fn main() -> anyhow::Result<()> {
         let watcher_state = node_state.clone();
         let watcher_span = span.clone();
 
+        // Resolve the directory that contains the cookbook. We watch the
+        // directory — not the file — so edits that replace the inode (atomic
+        // rename used by `sed -i`, most editors' save-atomic, IDE autosave)
+        // keep producing events. A single-file watch breaks after any such
+        // edit because inotify's watch is bound to the original inode and is
+        // silently lost when that inode is unlinked.
+        let canonical_cookbook_path = match std::fs::canonicalize(&cookbook_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "Failed to canonicalize cookbook path {}: {}",
+                    cookbook_path.display(),
+                    e
+                );
+                return Err(e.into());
+            }
+        };
+        let cookbook_dir = canonical_cookbook_path
+            .parent()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cookbook path has no parent directory: {}",
+                    canonical_cookbook_path.display()
+                )
+            })?
+            .to_path_buf();
+        let cookbook_filename = canonical_cookbook_path
+            .file_name()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cookbook path has no file name: {}",
+                    canonical_cookbook_path.display()
+                )
+            })?
+            .to_os_string();
+
         // Create a channel for filesystem events
         let (tx, mut rx) = tokio::sync::mpsc::channel::<notify::Result<notify::Event>>(16);
 
         // Spawn the watcher in a blocking thread since notify uses std channels
-        let cookbook_path_for_watcher = cookbook_path.clone();
+        let watched_dir = cookbook_dir.clone();
         let rt = tokio::runtime::Handle::current();
         std::thread::spawn(move || {
             let rt = rt.clone();
@@ -164,8 +200,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
 
-            if let Err(e) = watcher.watch(&cookbook_path_for_watcher, RecursiveMode::NonRecursive) {
-                eprintln!("Failed to watch cookbook file: {}", e);
+            if let Err(e) = watcher.watch(&watched_dir, RecursiveMode::NonRecursive) {
+                eprintln!("Failed to watch cookbook directory: {}", e);
                 return;
             }
 
@@ -179,38 +215,62 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(
             async move {
                 info!(
-                    path = %cookbook_path.display(),
+                    path = %canonical_cookbook_path.display(),
+                    watched_dir = %cookbook_dir.display(),
                     "Started cookbook file watcher"
                 );
 
                 while let Some(event_result) = rx.recv().await {
                     match event_result {
                         Ok(event) => {
-                            // Only react to modify/create events
-                            if matches!(
+                            // Only react to events that touch the cookbook file.
+                            // notify emits absolute paths when watching an
+                            // absolute directory path, so filename comparison
+                            // against `cookbook_filename` is sufficient.
+                            let touches_cookbook = event
+                                .paths
+                                .iter()
+                                .any(|p| p.file_name() == Some(&cookbook_filename));
+                            if !touches_cookbook {
+                                continue;
+                            }
+
+                            // Ignore metadata-only changes (chmod, touch) —
+                            // the file's contents weren't rewritten, so the
+                            // reload would be a no-op at best and a thrash at
+                            // worst (many editors emit a burst of events).
+                            let kind_is_reloadable = matches!(
                                 event.kind,
-                                notify::EventKind::Modify(_) | notify::EventKind::Create(_)
-                            ) {
-                                info!(
-                                    event = "cookbook_change_detected",
-                                    paths = ?event.paths,
-                                    "Cookbook file changed, reloading"
-                                );
+                                notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+                                    | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                                    | notify::EventKind::Modify(notify::event::ModifyKind::Any)
+                                    | notify::EventKind::Create(_)
+                                    | notify::EventKind::Remove(_)
+                            );
+                            if !kind_is_reloadable {
+                                continue;
+                            }
 
-                                // Small debounce delay to handle rapid successive events
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            info!(
+                                event = "cookbook_change_detected",
+                                paths = ?event.paths,
+                                kind = ?event.kind,
+                                "Cookbook file changed, reloading"
+                            );
 
-                                match watcher_state.reload_cookbook(&cookbook_path).await {
-                                    Ok(()) => {
-                                        // Successfully reloaded - the reload_cookbook method logs this
-                                    }
-                                    Err(e) => {
-                                        error!(
-                                            event = "cookbook_reload_failed",
-                                            error = %e,
-                                            "Failed to reload cookbook"
-                                        );
-                                    }
+                            // Small debounce delay to handle rapid successive events
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                            match watcher_state.reload_cookbook(&cookbook_path).await {
+                                Ok(()) => {
+                                    // Successfully reloaded - the reload_cookbook method logs this
+                                }
+                                Err(e) => {
+                                    error!(
+                                        event = "cookbook_reload_failed",
+                                        error = %e,
+                                        "Failed to reload cookbook"
+                                    );
                                 }
                             }
                         }

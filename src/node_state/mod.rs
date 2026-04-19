@@ -260,6 +260,20 @@ impl NodeState {
             "Cookbook reloaded successfully"
         );
 
+        // Reconcile running instances against the new cookbook. Instances whose
+        // model/profile is no longer enabled, or whose args_hash no longer
+        // matches the cookbook, are marked draining so the eviction loop
+        // terminates them gracefully once their in-flight requests complete.
+        let orphaned = self.reconcile_instances_with_cookbook().await;
+        if orphaned > 0 {
+            // Run an eviction pass immediately so already-idle orphans are
+            // stopped now rather than waiting up to 10s for the next periodic
+            // tick.
+            if let Err(e) = self.check_idle_instances().await {
+                error!("Post-reload eviction pass failed: {}", e);
+            }
+        }
+
         // Wake all queued waiters so they re-attempt with the updated cookbook.
         // A config change (e.g. reduced context length) may lower VRAM estimates
         // enough to unblock previously-stuck spawns.
@@ -269,6 +283,71 @@ impl NodeState {
         self.gossip_trigger.notify_one();
 
         Ok(())
+    }
+
+    /// Find running instances whose `(model, profile, args_hash)` no longer
+    /// matches the current cookbook and mark them as `draining`. The regular
+    /// eviction loop terminates them once their in-flight requests finish.
+    ///
+    /// Returns the number of instances newly marked draining.
+    async fn reconcile_instances_with_cookbook(&self) -> usize {
+        use crate::node_state::model_index::build_pre_args;
+
+        let instances = self.instances.read().await;
+        let mut newly_drained = 0usize;
+
+        for inst_lock in instances.values() {
+            // Snapshot the instance's identity while holding only the inner read lock.
+            let (model_name, profile_id, inst_args_hash, inst_id, already_draining) = {
+                let inst = inst_lock.read().await;
+                (
+                    inst.model_name.clone(),
+                    inst.profile_id.clone(),
+                    inst.args_hash.clone(),
+                    inst.id.clone(),
+                    inst.draining.load(Ordering::Relaxed),
+                )
+            };
+
+            if already_draining {
+                continue;
+            }
+
+            let reason = match self
+                .resolve_model(&format!("{}:{}", model_name, profile_id))
+                .await
+            {
+                // Whole model missing, model disabled, or profile removed: model_index
+                // only contains enabled models/profiles, so None covers all three.
+                None => Some("model_or_profile_missing_or_disabled"),
+                Some((_, new_profile)) => {
+                    let (pre_args, _, _) = build_pre_args(&new_profile);
+                    let new_hash = compute_args_hash(&pre_args);
+                    if new_hash != inst_args_hash {
+                        Some("args_changed")
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            if let Some(reason) = reason {
+                let inst = inst_lock.read().await;
+                inst.draining.store(true, Ordering::Relaxed);
+                drop(inst);
+                info!(
+                    event = "instance_orphaned_by_reload",
+                    instance_id = %inst_id,
+                    model = %model_name,
+                    profile = %profile_id,
+                    reason = reason,
+                    "Instance marked draining: no longer matches cookbook"
+                );
+                newly_drained += 1;
+            }
+        }
+
+        newly_drained
     }
 
     pub async fn get_available_port(&self) -> Result<u16, NodeError> {
@@ -2223,16 +2302,31 @@ impl NodeState {
             }
 
             if inst.in_flight_requests == 0 {
-                // Determine timeout from profile
-                let mut timeout_secs = 600; // Default fallback
-                if let Some((_, profile)) = self
+                // Defense-in-depth against orphaned instances: if the profile
+                // no longer resolves in the cookbook, or its args_hash has
+                // drifted from the current cookbook, drain immediately rather
+                // than waiting for an idle_timeout that was tied to the old
+                // profile. The normal reconcile path in `reload_cookbook` also
+                // marks these as `draining`; this branch catches any race or
+                // instances spawned by paths that bypass reload reconciliation.
+                let should_evict_now = match self
                     .resolve_model(&format!("{}:{}", inst.model_name, inst.profile_id))
                     .await
                 {
-                    timeout_secs = profile.idle_timeout_seconds;
-                }
+                    None => true,
+                    Some((_, profile)) => {
+                        use crate::node_state::model_index::build_pre_args;
+                        let (pre_args, _, _) = build_pre_args(&profile);
+                        let new_hash = compute_args_hash(&pre_args);
+                        if new_hash != inst.args_hash {
+                            true
+                        } else {
+                            inst.last_activity.elapsed().as_secs() > profile.idle_timeout_seconds
+                        }
+                    }
+                };
 
-                if inst.last_activity.elapsed().as_secs() > timeout_secs {
+                if should_evict_now {
                     to_evict.push((id.clone(), inst_lock.clone(), EvictionReason::Idle));
                 }
             }
