@@ -53,7 +53,7 @@ pub enum NodeError {
     Other(#[from] anyhow::Error),
 }
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// NodeState holds all runtime state for a mesh proxy node.
 ///
@@ -131,9 +131,38 @@ pub struct NodeState {
     /// an instance stops, starts, or is drained). Complements the periodic
     /// gossip interval for latency-sensitive state changes.
     pub gossip_trigger: Arc<Notify>,
+    /// Per-peer count of requests this node has forwarded and that haven't
+    /// completed yet. Updated instantly on route decisions and completions so
+    /// routing does not have to wait for the next gossip tick to see that a
+    /// peer just received work. Bridges the up-to-`gossip_interval` staleness
+    /// of `peer.current_requests` during bursts.
+    pub peer_pending_forwards: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
 }
 
 use crate::security;
+
+/// Drop-guard that decrements a per-peer pending-forward counter. Ensures the
+/// counter is always released on cancellation, error, or normal completion.
+pub struct PeerForwardGuard {
+    counter: Arc<AtomicUsize>,
+    released: bool,
+}
+
+impl PeerForwardGuard {
+    /// Explicitly release the guard without waiting for Drop. Idempotent.
+    pub fn release(&mut self) {
+        if !self.released {
+            self.counter.fetch_sub(1, Ordering::Relaxed);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for PeerForwardGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 impl NodeState {
     pub async fn new(
@@ -231,6 +260,7 @@ impl NodeState {
             capacity_notify: Arc::new(Notify::new()),
             needs_eviction: Arc::new(RwLock::new(HashSet::new())),
             gossip_trigger: Arc::new(Notify::new()),
+            peer_pending_forwards: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -1943,6 +1973,30 @@ impl NodeState {
         !self.draining.load(Ordering::Relaxed) && self.build_manager.can_serve()
     }
 
+    /// Record that this node has just decided to forward a request to `peer_id`.
+    /// The returned guard decrements the counter on drop, so callers can rely
+    /// on scope-based cleanup even on cancellation or error paths.
+    pub async fn track_peer_forward(&self, peer_id: &str) -> PeerForwardGuard {
+        let counter = {
+            let map = self.peer_pending_forwards.read().await;
+            map.get(peer_id).cloned()
+        };
+        let counter = match counter {
+            Some(c) => c,
+            None => {
+                let mut map = self.peer_pending_forwards.write().await;
+                map.entry(peer_id.to_string())
+                    .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+                    .clone()
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        PeerForwardGuard {
+            counter,
+            released: false,
+        }
+    }
+
     /// Select the best node to handle a request.
     ///
     /// If `prefer_local` is true (e.g., the request was already forwarded from another peer),
@@ -2018,11 +2072,31 @@ impl NodeState {
         // Get local learned memory estimate for this model (used when peer doesn't have stats)
         let local_memory_estimate = self.get_memory_estimate_for_key(&requested_key).await;
 
+        // Snapshot the local pending-forwards map once. This reflects routing
+        // decisions made *since* the last gossip tick, which would otherwise
+        // be invisible until the next gossip cycle (up to
+        // `gossip_interval_seconds`). Using this closes the staleness window
+        // that caused bursty load to pile onto one peer.
+        let pending_snapshot: HashMap<String, usize> = {
+            let map = self.peer_pending_forwards.read().await;
+            map.iter()
+                .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
+                .collect()
+        };
+        let total_pending: usize = pending_snapshot.values().sum();
+        let self_node_id = self.config.node_id.as_str();
+
         // Intelligent Routing Formula:
         // Score = load_score + cold_start_cost - performance_bonus
         //
         // load_score: Penalizes busy nodes
-        //   = (queue_length × 50) + (in_flight_requests × 50)
+        //   = (queue_length × 50) + (effective_current_requests × 50)
+        //
+        // effective_current_requests adjusts the gossip-based count for staleness:
+        //   - For peers: peer.current_requests + pending_forwards_from_self_to_peer
+        //   - For self:  current_requests - sum(pending_forwards_to_peers)
+        //                (subtract out requests we're forwarding — those don't
+        //                 use our GPU, they just keep our edge counter busy)
         //
         // cold_start_cost: Penalizes nodes that need to start/evict instances
         //   - Model loaded: 0
@@ -2037,7 +2111,22 @@ impl NodeState {
         let mut scored: Vec<(PeerState, f64)> = candidates
             .into_iter()
             .map(|c| {
-                let score = calculate_node_score(&c, &requested_key, local_memory_estimate);
+                let is_self = c.node_id == self_node_id;
+                let effective_current = if is_self {
+                    c.current_requests.saturating_sub(total_pending as u64)
+                } else {
+                    let pending = pending_snapshot
+                        .get(&c.node_id)
+                        .copied()
+                        .unwrap_or(0) as u64;
+                    c.current_requests.saturating_add(pending)
+                };
+                let score = calculate_node_score(
+                    &c,
+                    &requested_key,
+                    local_memory_estimate,
+                    effective_current,
+                );
                 (c, score)
             })
             .collect();
@@ -2450,13 +2539,20 @@ fn peer_supports_profile(peer: &PeerState, model_name: &str, profile_id: &str) -
 ///   score = load_score + cold_start_cost - performance_bonus
 ///
 /// Where:
-/// - load_score = (queue_length × 50) + (in_flight_requests × 50)
+/// - load_score = (queue_length × 50) + (effective_current_requests × 50)
 /// - cold_start_cost depends on whether model is loaded and memory availability
 /// - performance_bonus = min(tps, 200) × 5 + (remaining_slots × 50)
+///
+/// `effective_current_requests` is the caller-adjusted in-flight count. For
+/// peers, it's `peer.current_requests + local_pending_forwards_to_peer` so
+/// bursts get reflected instantly instead of waiting for gossip. For self,
+/// it's `current_requests - sum_of_local_pending_forwards` so forwarded
+/// requests (which don't use local GPU) don't inflate self's load score.
 fn calculate_node_score(
     peer: &PeerState,
     model_key: &str,
     local_memory_estimate: (u64, u64),
+    effective_current_requests: u64,
 ) -> f64 {
     let stats = peer.model_stats.get(model_key);
 
@@ -2474,7 +2570,8 @@ fn calculate_node_score(
     // Calculate base load score (penalizes busy nodes)
     // Per-request penalty increased from 10 to 50 so that 1 busy instance
     // on a warm node makes cold-starting on an idle node more attractive.
-    let load_score = (peer.total_queue_length as f64 * 50.0) + (peer.current_requests as f64 * 50.0);
+    let load_score = (peer.total_queue_length as f64 * 50.0)
+        + (effective_current_requests as f64 * 50.0);
 
     // Calculate cold start cost
     let cold_start_cost = if model_loaded {
@@ -3308,8 +3405,18 @@ mod tests {
         };
 
         let local_mem = (8000, 16000);
-        let loaded_score = calculate_node_score(&loaded_idle_peer, model_key, local_mem);
-        let unloaded_score = calculate_node_score(&unloaded_peer, model_key, local_mem);
+        let loaded_score = calculate_node_score(
+            &loaded_idle_peer,
+            model_key,
+            local_mem,
+            loaded_idle_peer.current_requests,
+        );
+        let unloaded_score = calculate_node_score(
+            &unloaded_peer,
+            model_key,
+            local_mem,
+            unloaded_peer.current_requests,
+        );
 
         // IDLE loaded node should still win (TPS bonus + no cold start)
         assert!(
@@ -3375,8 +3482,18 @@ mod tests {
         };
 
         let local_mem = (8000, 16000);
-        let loaded_score = calculate_node_score(&loaded_busy_peer, model_key, local_mem);
-        let unloaded_score = calculate_node_score(&unloaded_peer, model_key, local_mem);
+        let loaded_score = calculate_node_score(
+            &loaded_busy_peer,
+            model_key,
+            local_mem,
+            loaded_busy_peer.current_requests,
+        );
+        let unloaded_score = calculate_node_score(
+            &unloaded_peer,
+            model_key,
+            local_mem,
+            unloaded_peer.current_requests,
+        );
 
         // Busy loaded node should LOSE to idle unloaded node
         // Cold-starting on idle node is better than queuing behind busy instance
@@ -3433,8 +3550,18 @@ mod tests {
             loaded_models: vec!["gpt:fast".into()],
         };
 
-        let idle_score = calculate_node_score(&idle_peer, model_key, local_mem);
-        let busy_score = calculate_node_score(&busy_peer, model_key, local_mem);
+        let idle_score = calculate_node_score(
+            &idle_peer,
+            model_key,
+            local_mem,
+            idle_peer.current_requests,
+        );
+        let busy_score = calculate_node_score(
+            &busy_peer,
+            model_key,
+            local_mem,
+            busy_peer.current_requests,
+        );
 
         // Idle should score better (lower)
         assert!(
@@ -3494,8 +3621,18 @@ mod tests {
             },
         );
 
-        let slow_score = calculate_node_score(&slow_peer, model_key, local_mem);
-        let fast_score = calculate_node_score(&fast_peer, model_key, local_mem);
+        let slow_score = calculate_node_score(
+            &slow_peer,
+            model_key,
+            local_mem,
+            slow_peer.current_requests,
+        );
+        let fast_score = calculate_node_score(
+            &fast_peer,
+            model_key,
+            local_mem,
+            fast_peer.current_requests,
+        );
 
         // Fast should score better (lower)
         assert!(
@@ -3503,6 +3640,101 @@ mod tests {
             "Fast node ({}) should score better than slow ({})",
             fast_score,
             slow_score
+        );
+    }
+
+    #[test]
+    fn test_node_score_effective_current_adjusts_for_pending_forwards() {
+        // Models the fix: a peer that *gossip* reports as idle but to which
+        // we've already forwarded 5 requests since the last gossip tick
+        // should score as "5 in-flight" for routing purposes.
+        let model_key = "gpt:fast";
+        let local_mem = (8000, 16000);
+
+        let peer = PeerState {
+            node_id: "peer".into(),
+            address: "http://peer".into(),
+            version: "0.1.0".into(),
+            last_seen: 0,
+            supported_models: vec!["gpt:fast".into()],
+            active_instances: 1,
+            max_instances: 8,
+            current_requests: 0, // stale gossip value — peer *looks* idle
+            available_vram: 8000,
+            available_sysmem: 32000,
+            max_vram: 16000,
+            max_sysmem: 64000,
+            total_queue_length: 0,
+            model_stats: {
+                let mut m = HashMap::new();
+                m.insert(
+                    "gpt:fast".into(),
+                    PeerModelStats {
+                        tps: 50.0,
+                        queue_len: 0,
+                        vram_mb: 8000,
+                        sysmem_mb: 16000,
+                        instance_count: 1,
+                    },
+                );
+                m
+            },
+            ready: true,
+            loaded_models: vec!["gpt:fast".into()],
+        };
+
+        // Score as if gossip were the only truth: peer looks empty.
+        let naive_score = calculate_node_score(&peer, model_key, local_mem, 0);
+        // Score with 5 pending local forwards layered on top.
+        let effective_score = calculate_node_score(&peer, model_key, local_mem, 5);
+
+        // 5 extra requests × 50 = +250 to load_score. Effective score must
+        // be strictly higher so routing will diversify to other candidates.
+        assert!(
+            effective_score > naive_score,
+            "pending-forward adjustment must raise score: naive={} effective={}",
+            naive_score,
+            effective_score
+        );
+        assert!(
+            (effective_score - naive_score - 250.0).abs() < 1e-6,
+            "5 pending forwards should add exactly 250 (= 5×50) to load_score, got delta {}",
+            effective_score - naive_score
+        );
+    }
+
+    #[test]
+    fn test_peer_forward_guard_releases_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            counter.fetch_add(1, Ordering::Relaxed);
+            let _g = PeerForwardGuard {
+                counter: counter.clone(),
+                released: false,
+            };
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "Drop must decrement the counter"
+        );
+    }
+
+    #[test]
+    fn test_peer_forward_guard_release_is_idempotent() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let mut g = PeerForwardGuard {
+            counter: counter.clone(),
+            released: false,
+        };
+        g.release();
+        g.release();
+        g.release();
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "Repeated release() calls must not underflow"
         );
     }
 }
