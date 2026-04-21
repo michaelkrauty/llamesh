@@ -280,6 +280,9 @@ pub async fn route_request(
                 // cleanup below. Without it, a client disconnect during
                 // `client_req.send().await` would leak the gauge monotonically.
                 let guard = RequestGuard::new(state.clone());
+                // Track this forward locally so concurrent routing decisions
+                // see the peer's load before its next gossip tick.
+                let peer_forward_guard = state.track_peer_forward(&peer.node_id).await;
 
                 let base = peer.address.trim_end_matches('/');
                 let url = format!("{}{}", base, path_and_query);
@@ -343,8 +346,10 @@ pub async fn route_request(
                         // arriving and the body fully flushing.
                         let cleanup_fut: BoxFuture<'static, ()> = {
                             let state = state.clone();
+                            let mut peer_forward_guard = peer_forward_guard;
                             Box::pin(async move {
                                 state.metrics.dec_current_requests();
+                                peer_forward_guard.release();
                             })
                         };
 
@@ -637,6 +642,8 @@ pub async fn route_request(
                                 "Local spawn failures exhausted, falling back to peer"
                             );
 
+                            let peer_forward_guard =
+                                state.track_peer_forward(&peer.node_id).await;
                             let base = peer.address.trim_end_matches('/');
                             let url = format!("{}{}", base, path_and_query);
 
@@ -691,8 +698,10 @@ pub async fn route_request(
                                     let cleanup_fut: BoxFuture<'static, ()> = {
                                         let state = state.clone();
                                         let hash_metrics = hash_metrics.clone();
+                                        let mut peer_forward_guard = peer_forward_guard;
                                         Box::pin(async move {
                                             state.metrics.dec_current_requests();
+                                            peer_forward_guard.release();
                                             let duration = start_time.elapsed().as_millis() as u64;
                                             hash_metrics
                                                 .total_latency_ms
@@ -714,6 +723,8 @@ pub async fn route_request(
                                     });
                                 }
                                 Err(peer_err) => {
+                                    // peer_forward_guard drops on fall-through,
+                                    // releasing the counter.
                                     state.circuit_breaker.record_failure(&peer.node_id).await;
                                     warn!(
                                         peer = %peer.node_id,
@@ -767,6 +778,11 @@ pub async fn route_request(
         } else {
             // Remote routing
             info!("Forwarding remotely to peer {}", best_node.node_id);
+            // Track this forward locally so subsequent routing decisions reflect
+            // it instantly rather than waiting up to `gossip_interval_seconds`
+            // for the peer's next gossip tick. Guard is released in the cleanup
+            // future (success) or on function return (error).
+            let peer_forward_guard = state.track_peer_forward(&best_node.node_id).await;
             let base = best_node.address.trim_end_matches('/');
             let url = format!("{}{}", base, path_and_query);
 
@@ -829,8 +845,12 @@ pub async fn route_request(
                     let cleanup_fut: BoxFuture<'static, ()> = {
                         let state = state.clone();
                         let hash_metrics = hash_metrics.clone();
+                        // Move the peer-forward guard into the cleanup future so
+                        // it's decremented exactly when the response completes.
+                        let mut peer_forward_guard = peer_forward_guard;
                         Box::pin(async move {
                             state.metrics.dec_current_requests();
+                            peer_forward_guard.release();
                             let duration = start_time.elapsed().as_millis() as u64;
                             hash_metrics
                                 .total_latency_ms
@@ -852,6 +872,7 @@ pub async fn route_request(
                     })
                 }
                 Err(e) => {
+                    // peer_forward_guard drops here, releasing the counter.
                     // Record failure for circuit breaker
                     state
                         .circuit_breaker

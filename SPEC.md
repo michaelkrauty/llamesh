@@ -801,7 +801,7 @@ If `cluster.enabled == true`:
 ```
 score = load_score + cold_start_cost - performance_bonus
 
-load_score = (queue_length * 50) + (in_flight_requests * 50)
+load_score = (queue_length * 50) + (effective_current_requests * 50)
 
 cold_start_cost:
   Model already loaded:               0
@@ -811,6 +811,10 @@ cold_start_cost:
 
 performance_bonus = min(tps, 200) * 5 + min(remaining_slots, 4) * 50
 ```
+
+`effective_current_requests` adjusts the gossip-based in-flight count to close the staleness window between gossip ticks:
+  * For peers: `peer.current_requests + pending_forwards_to_peer`, where `pending_forwards_to_peer` is the number of requests this node has forwarded to that peer that have not yet completed. This makes bursts visible to the scorer immediately instead of after the next gossip tick.
+  * For self: `self.current_requests - sum(pending_forwards_to_all_peers)`. The edge counter includes forwarded-out requests that don't consume local GPU, so we subtract them to reflect true local processing load.
 
 Lowest score wins.
 
