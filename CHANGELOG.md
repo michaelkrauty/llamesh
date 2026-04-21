@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-04-21
+
+### Fixed
+
+- Cluster load balancing no longer oscillates between nodes on a ~gossip-period
+  cycle. Concurrent bursts for a model enabled on multiple nodes were all
+  piling onto a single node until gossip caught up, then all piling onto the
+  other — leaving one GPU idle while the other was saturated. Root cause: the
+  routing score in `select_best_node` consumed `peer.current_requests` from
+  the last gossip snapshot (stale by up to `gossip_interval_seconds`), so
+  every decision inside a burst saw the same "idle peer" view and committed
+  en masse to the same node. Additionally, `self.current_requests` is an
+  edge counter that includes requests this node has forwarded away (which
+  don't use local GPU), causing self to look busier than it really is.
+
+  Fix: added a local per-peer `pending_forwards` counter that increments
+  instantly when a request is forwarded and decrements when it completes (via
+  `PeerForwardGuard`'s `Drop` so cancellation/error paths are covered). The
+  scoring function now consumes an `effective_current_requests` that is
+  `peer.current_requests + pending_forwards_to_peer` for peers, and
+  `self.current_requests - total_pending_forwards` for self. Bursts now
+  diversify across nodes within a single dispatch, and self is scored by
+  actual local processing rather than edge traffic.
+
 ## [1.1.2] - 2026-04-19
 
 ### Fixed
