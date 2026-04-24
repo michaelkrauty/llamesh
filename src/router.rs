@@ -92,6 +92,9 @@ pub async fn list_models(State(state): State<Arc<NodeState>>) -> impl IntoRespon
             continue;
         }
         for profile in &model.profiles {
+            if !profile.enabled {
+                continue;
+            }
             let is_default = profile.id == "default";
             // Use bare model name for default profile, otherwise model:profile
             let id = if is_default {
@@ -1336,6 +1339,7 @@ mod tests {
         Profile {
             id: "p".into(),
             description: None,
+            enabled: true,
             model_path: Some("/tmp/model.gguf".into()),
             hf_repo: None,
             hf_file: None,

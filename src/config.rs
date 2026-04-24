@@ -476,12 +476,12 @@ impl Cookbook {
 pub struct Model {
     pub name: String,
     pub description: Option<String>,
-    #[serde(default = "default_model_enabled")]
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
     pub profiles: Vec<Profile>,
 }
 
-fn default_model_enabled() -> bool {
+fn default_enabled() -> bool {
     true
 }
 
@@ -501,6 +501,8 @@ fn default_protocol_detect_timeout_ms() -> u64 {
 pub struct Profile {
     pub id: String,
     pub description: Option<String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// Path to a local model file. Either `model_path` or `hf_repo` must be specified.
     #[serde(default)]
     pub model_path: Option<String>,
@@ -709,6 +711,7 @@ mod tests {
         Profile {
             id: "p".into(),
             description: None,
+            enabled: true,
             model_path: Some("/tmp/model.gguf".into()),
             hf_repo: None,
             hf_file: None,
@@ -896,6 +899,7 @@ mod tests {
         let profile = Profile {
             id: "test".into(),
             description: None,
+            enabled: true,
             model_path: None,
             hf_repo: None,
             hf_file: None,
@@ -919,6 +923,7 @@ mod tests {
         let profile = Profile {
             id: "test".into(),
             description: None,
+            enabled: true,
             model_path: Some("/path/to/model.gguf".into()),
             hf_repo: Some("org/model-GGUF".into()),
             hf_file: None,
@@ -942,6 +947,7 @@ mod tests {
         let profile = Profile {
             id: "test".into(),
             description: None,
+            enabled: true,
             model_path: None,
             hf_repo: None,
             hf_file: None,
@@ -965,6 +971,7 @@ mod tests {
         let profile = Profile {
             id: "test".into(),
             description: None,
+            enabled: true,
             model_path: None,
             hf_repo: None,
             hf_file: None,
@@ -1180,6 +1187,37 @@ models:
             let cookbook = parse_cookbook(yaml).unwrap();
             let profile = &cookbook.models[0].profiles[0];
             assert_eq!(profile.max_queue_size, None);
+        }
+
+        #[test]
+        fn profile_enabled_defaults_to_true() {
+            let yaml = r#"
+models:
+  - name: test
+    profiles:
+      - id: default
+        model_path: /tmp/model.gguf
+        idle_timeout_seconds: 10
+        llama_server_args: ""
+"#;
+            let cookbook = parse_cookbook(yaml).unwrap();
+            assert!(cookbook.models[0].profiles[0].enabled);
+        }
+
+        #[test]
+        fn parses_profile_enabled_false() {
+            let yaml = r#"
+models:
+  - name: test
+    profiles:
+      - id: default
+        enabled: false
+        model_path: /tmp/model.gguf
+        idle_timeout_seconds: 10
+        llama_server_args: ""
+"#;
+            let cookbook = parse_cookbook(yaml).unwrap();
+            assert!(!cookbook.models[0].profiles[0].enabled);
         }
     }
 }

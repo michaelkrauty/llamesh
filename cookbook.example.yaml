@@ -2,7 +2,7 @@
 # llamesh Cookbook (Model Definitions)
 # =============================================================================
 # Models are requested via: POST /v1/chat/completions { "model": "name:profile" }
-# If profile omitted, first enabled profile is used.
+# If profile is omitted, the "default" profile is used.
 #
 # llama_server_args is a shell-style string. Quote args with spaces:
 #   llama_server_args: "-c 4096 --api-key 'secret key'"
@@ -13,6 +13,7 @@
 #     llama_server_args: ""
 #
 # Profile defaults:
+#   enabled: true                    # set false to hide/disable one profile
 #   idle_timeout_seconds: 300        # 5 minutes
 #   startup_timeout_seconds: 60      # 60s local, 3600s for HF downloads
 #   max_instances: (from model_defaults)
@@ -47,11 +48,18 @@ models:
         llama_server_args: "--alias gpt-oss-20b-fast -c 32768 -b 2048 -fa on --kv-unified"
 
       - id: "quality"
+        enabled: true                 # default: true
         description: "Larger context, more careful settings"
         model_path: "./models/gpt-oss-20b-q6_K.gguf"
         idle_timeout_seconds: 900
         max_instances: 2
         llama_server_args: "--alias gpt-oss-20b-quality -c 131072 -b 1024 -fa on --kv-unified"
+
+      # Keep alternate profiles in the cookbook without advertising or serving them.
+      # - id: "experimental"
+      #   enabled: false
+      #   model_path: "./models/gpt-oss-20b-q4_K_M.gguf"
+      #   llama_server_args: "--alias gpt-oss-20b-experimental -c 65536"
 
   # ---------------------------------------------------------------------------
   # Vision-language model

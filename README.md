@@ -127,6 +127,23 @@ Request a specific profile with `model:profile` syntax:
 
 Define profiles in the cookbook to trade off speed vs quality, context size, quantization, etc. — each profile maps to a distinct set of `llama-server` args.
 
+Profiles default to enabled. Set `enabled: false` on a profile to keep it in
+the cookbook without listing, routing, prewarming, or advertising that profile:
+
+```yaml
+models:
+  - name: "my-model"
+    enabled: true
+    profiles:
+      - id: "default"
+        model_path: "./models/my-model.gguf"
+        llama_server_args: "-c 32768 -fa on"
+      - id: "experimental"
+        enabled: false
+        model_path: "./models/my-model.gguf"
+        llama_server_args: "-c 65536 -fa on"
+```
+
 ## Hugging Face Models
 
 Download models automatically instead of managing files manually:
