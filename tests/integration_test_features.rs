@@ -26,7 +26,7 @@ async fn test_embeddings_and_rerank() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9200"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "embedding-model:default"
 model_defaults:

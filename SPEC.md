@@ -247,6 +247,11 @@ server_tls:
 #   client_key_path: "./tls/node-a.key"
 ```
 
+When NVIDIA NVML is available, `max_vram_mb` is enforced against device-wide
+used VRAM, not only memory attributed to `llama-server` children. GPU memory
+used by other processes is treated as non-evictable external usage and reduces
+the node's spawn capacity.
+
 #### Environment Variable Overrides
 
 All config fields can be overridden via environment variables using the `LLAMESH_` prefix:
@@ -327,6 +332,8 @@ models:
         max_wait_in_queue_ms: 45000
         max_request_duration_ms: 0         # optional, default 0 (unlimited)
         max_queue_size: 128                # optional, overrides global max_queue_size_per_model
+        estimated_vram_mb: 12000           # optional, used until runtime memory is learned
+        estimated_sysmem_mb: 8192          # optional, used until runtime memory is learned
         llama_server_args: "--alias gpt-oss-20b-fast -c 32768 -b 2048 -fa on --kv-unified"
 
       - id: "quality"
@@ -413,6 +420,16 @@ Per node, metrics snapshots are stored as JSON files at the path specified by `m
   "is_building": false,
   "last_build_error": null,
   "last_build_at": "2025-11-20T19:00:00Z",
+  "node_resources": {
+    "llamesh_vram_mb": 20480,
+    "llamesh_sysmem_mb": 8192,
+    "external_vram_mb": 4096,
+    "effective_vram_mb": 24576,
+    "effective_sysmem_mb": 8192,
+    "device_vram_used_mb": 24576,
+    "device_vram_total_mb": 81920,
+    "gpu_telemetry_available": true
+  },
   "hashes": {
     "<sha256-of-launch-args>": {
       "display_names": ["model-name:profile"],
@@ -788,7 +805,7 @@ If `cluster.enabled == true`:
 
 * Pull latest cluster snapshot (gossip data):
 
-  * For each node: models supported, resource usage, tokens/sec, queue lengths, loaded models, ready state, etc.
+  * For each node: models supported, resource usage (including external VRAM when device telemetry is available), tokens/sec, queue lengths, loaded models, ready state, etc.
 * Filter candidate nodes:
 
   * Node supports requested `(model, profile)`.
@@ -954,9 +971,18 @@ If the request is proxied cross-node:
 
 Before starting a new instance, the node must verify resources:
 
-1. Compute current aggregated VRAM and sysmem usage of running instances (in MB) using live samples or learned values.
-2. Estimate additional usage for the new instance using learned memory values (keyed by llama-server launch args hash).
-3. If starting instance would exceed `max_vram_mb` or `max_sysmem_mb`:
+1. Compute VRAM/sysmem attributed to running llamesh-managed instances using live process samples or learned values.
+2. Sample device-wide GPU memory when telemetry is available.
+3. Compute non-evictable external VRAM:
+
+   ```text
+   external_vram = device_used_vram - llamesh_tracked_vram, saturating at 0
+   effective_vram = llamesh_tracked_vram + external_vram
+   ```
+
+   If device telemetry is unavailable, `external_vram` is 0 and the node falls back to llamesh-tracked memory only.
+4. Estimate additional usage for the new instance using learned memory values (keyed by llama-server launch args hash), falling back to optional cookbook estimates.
+5. If starting instance would exceed `max_vram_mb` or `max_sysmem_mb`:
 
    * Try to free space by:
 
@@ -966,11 +992,22 @@ Before starting a new instance, the node must verify resources:
 
      * Either queue request and wait for capacity (bounded by timeout), or immediately return `no_capacity` error depending on configuration.
 
+External VRAM is never counted as evictable capacity. Eviction simulation only
+subtracts memory attributed to llamesh-managed instances.
+
+### Cookbook Estimates
+
+Profiles may define optional `estimated_vram_mb` and `estimated_sysmem_mb`
+values. These are cold-start admission hints only. Once runtime sampling has
+observed a profile's launch-args hash, learned peak memory replaces the static
+estimate for future scheduling.
+
 ### Learned Memory
 
 Memory usage is automatically learned at runtime:
 
 * **VRAM**: Sampled via NVIDIA NVML (if available)
+* **Device VRAM**: Device-wide NVML memory telemetry is sampled to account for non-llamesh GPU consumers.
 * **System memory**: Sampled via `/proc/[pid]/status` (VmRSS)
 * **Continuous sampling**: Memory is sampled every 10 seconds throughout the instance lifetime, not just during cold-start.
 * **Peak tracking**: Uses atomic `fetch_max` so values can only grow over the instance lifetime, capturing the true peak usage.

@@ -15,9 +15,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 mod common;
-use common::{
-    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, wait_for_ready,
-};
+use common::{cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, wait_for_ready};
 
 const LISTEN_ADDR: &str = "127.0.0.1:9220";
 const BASE_URL: &str = "http://127.0.0.1:9220";
@@ -28,7 +26,7 @@ fn config_yaml(mock_script: &Path) -> String {
         r#"
 node_id: "{NODE_ID}"
 listen_addr: "{LISTEN_ADDR}"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
 model_defaults:
@@ -77,7 +75,11 @@ models:
 /// Mock-server wrapper that sets `MOCK_SLOW_BODY_MS=...`, making every
 /// non-streaming response send headers immediately but stall halfway through
 /// the body by the configured delay.
-async fn setup_slow_body_mock_script(root: &Path, suffix: &str, body_delay_ms: u64) -> std::path::PathBuf {
+async fn setup_slow_body_mock_script(
+    root: &Path,
+    suffix: &str,
+    body_delay_ms: u64,
+) -> std::path::PathBuf {
     let mock_script = root.join(format!("tests/mock_server_{}.sh", suffix));
     let mut mock_bin = root.join("target/release/mock_llama_server");
     if !mock_bin.exists() {
@@ -104,7 +106,9 @@ wait $PID
         .unwrap()
         .permissions();
     perms.set_mode(0o755);
-    tokio::fs::set_permissions(&mock_script, perms).await.unwrap();
+    tokio::fs::set_permissions(&mock_script, perms)
+        .await
+        .unwrap();
     mock_script
 }
 
@@ -189,7 +193,11 @@ async fn cancelled_request_does_not_leak_in_flight_counter() {
         .send()
         .await
         .expect("warmup request failed");
-    assert_eq!(resp.status(), StatusCode::OK, "warmup request should succeed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "warmup request should succeed"
+    );
     // Drain the body so the request completes cleanly.
     let _ = resp.bytes().await.unwrap();
 
@@ -210,7 +218,7 @@ async fn cancelled_request_does_not_leak_in_flight_counter() {
         .json(&body)
         .send()
         .await
-        .and_then(|r| Ok(r.error_for_status()))
+        .map(|r| r.error_for_status())
         .err();
     // The send or body read must have errored out; we don't care whether the
     // error surfaced as `Elapsed` or a body-read failure.

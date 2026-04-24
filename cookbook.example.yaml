@@ -17,6 +17,8 @@
 #   startup_timeout_seconds: 60      # 60s local, 3600s for HF downloads
 #   max_instances: (from model_defaults)
 #   max_queue_size: (from model_defaults.max_queue_size_per_model)
+#   estimated_vram_mb: unset         # optional cold-start admission hint
+#   estimated_sysmem_mb: unset       # optional cold-start admission hint
 #
 # NOTE: The proxy parses context_size, batch size, etc. from llama-server's
 # startup log. Use llama_server_args to configure -c, -b, -n if needed.
@@ -39,6 +41,9 @@ models:
         max_queue_size: 128          # optional, per-profile queue limit
         max_wait_in_queue_ms: 45000  # optional, overrides model_defaults
         max_request_duration_ms: 0   # 0=unlimited
+        # Optional static estimates used until llamesh learns measured peaks.
+        # estimated_vram_mb: 12000
+        # estimated_sysmem_mb: 8192
         llama_server_args: "--alias gpt-oss-20b-fast -c 32768 -b 2048 -fa on --kv-unified"
 
       - id: "quality"

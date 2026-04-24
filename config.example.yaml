@@ -23,8 +23,10 @@ public_url: "https://node-a.example.com"
 # Resource Limits
 # -----------------------------------------------------------------------------
 
-# Maximum VRAM (GPU memory) in MB this node can use (required)
-# Set to your GPU's available VRAM minus some headroom
+# Maximum VRAM (GPU memory) in MB this node can use (required).
+# Set to your intended llamesh budget. When NVIDIA NVML is available,
+# device-wide VRAM used by other processes is counted against this budget
+# automatically, so external GPU workloads reduce spawn capacity.
 max_vram_mb: 16000  # 16GB
 
 # Maximum system memory in MB this node can use (required)

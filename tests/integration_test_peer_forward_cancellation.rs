@@ -41,7 +41,7 @@ fn config_node(
 node_id: "{node_id}"
 listen_addr: "{listen}"
 public_url: "http://{listen}"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "peer-model:default"
 model_defaults:
@@ -184,7 +184,9 @@ async fn cancelled_peer_forward_does_not_leak_current_requests() {
     )
     .await
     .unwrap();
-    tokio::fs::write(&cookbook_a_path, COOKBOOK_A).await.unwrap();
+    tokio::fs::write(&cookbook_a_path, COOKBOOK_A)
+        .await
+        .unwrap();
     tokio::fs::write(
         &config_b_path,
         config_node(
@@ -198,7 +200,9 @@ async fn cancelled_peer_forward_does_not_leak_current_requests() {
     )
     .await
     .unwrap();
-    tokio::fs::write(&cookbook_b_path, COOKBOOK_B).await.unwrap();
+    tokio::fs::write(&cookbook_b_path, COOKBOOK_B)
+        .await
+        .unwrap();
 
     let mut proxy_a = tokio::process::Command::new(&proxy_bin)
         .arg("--config")
@@ -227,8 +231,13 @@ async fn cancelled_peer_forward_does_not_leak_current_requests() {
 
     // Wait for gossip to propagate A's identity to B.
     assert!(
-        wait_for_peer_discovery(&client, NODE_B_URL, "node-a-cancel", Duration::from_secs(15))
-            .await,
+        wait_for_peer_discovery(
+            &client,
+            NODE_B_URL,
+            "node-a-cancel",
+            Duration::from_secs(15)
+        )
+        .await,
         "node B should discover node A within 15s"
     );
 

@@ -122,7 +122,7 @@ mod tests {
     async fn test_get_available_port_ephemeral() {
         let pool = PortPool::new(None);
         let port = pool.get_available_port().await.unwrap();
-        assert!(port >= 10000 && port < 20000);
+        assert!((10000..20000).contains(&port));
         assert!(pool.is_reserved(port).await);
     }
 
@@ -158,7 +158,7 @@ mod tests {
         let pool = PortPool::new(Some(config));
 
         let port = pool.get_available_port().await.unwrap();
-        assert!(port >= 31000 && port <= 31005);
+        assert!((31000..=31005).contains(&port));
     }
 
     #[tokio::test]

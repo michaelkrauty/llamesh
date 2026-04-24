@@ -144,7 +144,6 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 }
             });
         }
-
     }
 }
 
@@ -406,6 +405,12 @@ pub async fn process_gossip_message(
                     current_requests: 0,
                     available_vram: 0,
                     available_sysmem: 0,
+                    llamesh_vram_mb: 0,
+                    llamesh_sysmem_mb: 0,
+                    external_vram_mb: 0,
+                    device_vram_used_mb: 0,
+                    device_vram_total_mb: 0,
+                    gpu_telemetry_available: false,
                     max_vram: 0,
                     max_sysmem: 0,
                     total_queue_length: 0,
@@ -510,6 +515,12 @@ mod tests {
             current_requests: 0,
             available_vram: 1,
             available_sysmem: 1,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -586,6 +597,12 @@ mod tests {
                     current_requests: 0,
                     available_vram: 1000,
                     available_sysmem: 1000,
+                    llamesh_vram_mb: 0,
+                    llamesh_sysmem_mb: 0,
+                    external_vram_mb: 0,
+                    device_vram_used_mb: 0,
+                    device_vram_total_mb: 0,
+                    gpu_telemetry_available: false,
                     max_vram: 16000,
                     max_sysmem: 64000,
                     total_queue_length: 0,
@@ -608,6 +625,12 @@ mod tests {
             current_requests: 5,
             available_vram: 500,
             available_sysmem: 500,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 2,

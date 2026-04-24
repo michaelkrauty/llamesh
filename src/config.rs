@@ -520,6 +520,14 @@ pub struct Profile {
     /// llama-server arguments as a shell-style string (e.g., "-fa on --no-kv-offload")
     #[serde(deserialize_with = "deserialize_llama_server_args")]
     pub llama_server_args: Vec<String>,
+    /// Optional static VRAM estimate in MiB. Used only until runtime sampling
+    /// learns memory for this profile's launch args.
+    #[serde(default)]
+    pub estimated_vram_mb: Option<u64>,
+    /// Optional static system-memory estimate in MiB. Used only until runtime
+    /// sampling learns memory for this profile's launch args.
+    #[serde(default)]
+    pub estimated_sysmem_mb: Option<u64>,
     #[serde(default)]
     pub max_wait_in_queue_ms: Option<u64>,
     #[serde(default)]
@@ -548,11 +556,13 @@ impl Profile {
     }
 
     pub fn effective_max_queue_size(&self, defaults: &ModelDefaults) -> usize {
-        self.max_queue_size.unwrap_or(defaults.max_queue_size_per_model)
+        self.max_queue_size
+            .unwrap_or(defaults.max_queue_size_per_model)
     }
 
     pub fn effective_min_eviction_tenure_secs(&self, defaults: &ModelDefaults) -> u64 {
-        self.min_eviction_tenure_secs.unwrap_or(defaults.min_eviction_tenure_secs)
+        self.min_eviction_tenure_secs
+            .unwrap_or(defaults.min_eviction_tenure_secs)
     }
 
     /// Returns the effective startup timeout in seconds.
@@ -705,6 +715,8 @@ mod tests {
             idle_timeout_seconds: 10,
             max_instances: None,
             llama_server_args: args.iter().map(|s| s.to_string()).collect(),
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
             max_wait_in_queue_ms: None,
             max_request_duration_ms: None,
             startup_timeout_seconds: None,
@@ -890,6 +902,8 @@ mod tests {
             idle_timeout_seconds: 10,
             max_instances: None,
             llama_server_args: vec!["-c".into(), "4096".into()],
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
             max_wait_in_queue_ms: None,
             max_request_duration_ms: None,
             startup_timeout_seconds: None,
@@ -911,6 +925,8 @@ mod tests {
             idle_timeout_seconds: 10,
             max_instances: None,
             llama_server_args: vec![],
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
             max_wait_in_queue_ms: None,
             max_request_duration_ms: None,
             startup_timeout_seconds: None,
@@ -932,6 +948,8 @@ mod tests {
             idle_timeout_seconds: 10,
             max_instances: None,
             llama_server_args: vec!["-m".into(), "/path/to/model.gguf".into()],
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
             max_wait_in_queue_ms: None,
             max_request_duration_ms: None,
             startup_timeout_seconds: None,
@@ -953,6 +971,8 @@ mod tests {
             idle_timeout_seconds: 10,
             max_instances: None,
             llama_server_args: vec!["--hf-repo".into(), "org/model-GGUF".into()],
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
             max_wait_in_queue_ms: None,
             max_request_duration_ms: None,
             startup_timeout_seconds: None,

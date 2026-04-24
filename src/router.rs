@@ -1342,6 +1342,8 @@ mod tests {
             idle_timeout_seconds: 10,
             max_instances: None,
             llama_server_args: args.iter().map(|s| s.to_string()).collect(),
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
             max_wait_in_queue_ms: None,
             max_request_duration_ms: None,
             startup_timeout_seconds: None,
@@ -1405,9 +1407,18 @@ mod tests {
 
     // Compile-time validation of buffer size bounds
     const _: () = {
-        assert!(MAX_TOKEN_BUFFER_SIZE == 16 * 1024 * 1024, "Buffer should be 16MB");
-        assert!(MAX_TOKEN_BUFFER_SIZE >= 1024 * 1024, "Buffer should be at least 1MB");
-        assert!(MAX_TOKEN_BUFFER_SIZE <= 64 * 1024 * 1024, "Buffer should be at most 64MB");
+        assert!(
+            MAX_TOKEN_BUFFER_SIZE == 16 * 1024 * 1024,
+            "Buffer should be 16MB"
+        );
+        assert!(
+            MAX_TOKEN_BUFFER_SIZE >= 1024 * 1024,
+            "Buffer should be at least 1MB"
+        );
+        assert!(
+            MAX_TOKEN_BUFFER_SIZE <= 64 * 1024 * 1024,
+            "Buffer should be at most 64MB"
+        );
     };
 
     #[test]

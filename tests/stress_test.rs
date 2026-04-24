@@ -56,7 +56,7 @@ async fn test_stress_basic() {
         r#"
 node_id: "stress-node"
 listen_addr: "127.0.0.1:9096"
-max_vram_mb: 4096
+max_vram_mb: 1048576
 max_sysmem_mb: 8192
 default_model: "stress-model:default"
 model_defaults:
