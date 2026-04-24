@@ -395,6 +395,12 @@ models:
         idle_timeout_seconds: 5
         max_instances: 1
         llama_server_args: ""
+      - id: "disabled-profile"
+        enabled: false
+        model_path: "./models/mock-disabled-profile.gguf"
+        idle_timeout_seconds: 5
+        max_instances: 1
+        llama_server_args: ""
   - name: "disabled-model"
     enabled: false
     profiles:
@@ -437,9 +443,40 @@ models:
 
     // Default profiles are listed with bare model name (not "model:default")
     assert!(data.iter().any(|m| m["id"] == "enabled-model"));
+    assert!(!data
+        .iter()
+        .any(|m| m["id"] == "enabled-model:disabled-profile"));
     assert!(!data.iter().any(|m| m["id"] == "disabled-model"));
 
-    // 2. Try to invoke disabled model - should fail
+    // 2. Try to invoke disabled profile - should fail
+    let body = serde_json::json!({
+        "model": "enabled-model:disabled-profile",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": false
+    });
+    let resp = client
+        .post("http://127.0.0.1:9094/v1/chat/completions")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 3. Try to prewarm disabled profile - should fail
+    let body = serde_json::json!({
+        "model": "enabled-model:disabled-profile"
+    });
+    let resp = client
+        .post("http://127.0.0.1:9094/admin/prewarm")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 4. Try to invoke disabled model - should fail
     let body = serde_json::json!({
         "model": "disabled-model:default",
         "messages": [{"role": "user", "content": "Hello"}],

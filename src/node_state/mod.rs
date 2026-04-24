@@ -2050,6 +2050,9 @@ impl NodeState {
                 .flat_map(|model| {
                     let model_defaults = &self.config.model_defaults;
                     model.profiles.iter().filter_map(move |profile| {
+                        if !profile.enabled {
+                            return None;
+                        }
                         if profile.effective_max_instances(model_defaults) == 0 {
                             return None;
                         }
@@ -2904,6 +2907,7 @@ mod tests {
         Profile {
             id: "default".into(),
             description: None,
+            enabled: true,
             model_path: Some("/tmp/model.gguf".into()),
             hf_repo: None,
             hf_file: None,
@@ -3106,6 +3110,56 @@ mod tests {
         assert!(result.is_some());
         let picked = result.unwrap();
         assert_eq!(picked.node_id, "remote-peer");
+    }
+
+    #[tokio::test]
+    async fn self_peer_state_excludes_disabled_profiles_from_supported_models() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+
+        let default_profile = sample_profile();
+
+        let mut fast_profile = sample_profile();
+        fast_profile.id = "fast".into();
+
+        let mut disabled_profile = sample_profile();
+        disabled_profile.id = "disabled".into();
+        disabled_profile.enabled = false;
+
+        let mut zero_capacity_profile = sample_profile();
+        zero_capacity_profile.id = "zero-capacity".into();
+        zero_capacity_profile.max_instances = Some(0);
+
+        let cookbook = Cookbook {
+            models: vec![Model {
+                name: "local-model".into(),
+                description: None,
+                enabled: true,
+                profiles: vec![
+                    default_profile,
+                    fast_profile,
+                    disabled_profile,
+                    zero_capacity_profile,
+                ],
+            }],
+        };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+
+        let self_peer = state.get_self_peer_state().await;
+
+        assert!(self_peer.supported_models.contains(&"local-model".into()));
+        assert!(self_peer
+            .supported_models
+            .contains(&"local-model:fast".into()));
+        assert!(!self_peer
+            .supported_models
+            .contains(&"local-model:disabled".into()));
+        assert!(!self_peer
+            .supported_models
+            .contains(&"local-model:zero-capacity".into()));
     }
 
     #[tokio::test]

@@ -15,6 +15,9 @@ pub fn build_model_index(cookbook: &Cookbook) -> HashMap<String, (String, Profil
             continue;
         }
         for profile in &model.profiles {
+            if !profile.enabled {
+                continue;
+            }
             let key = format!(
                 "{}:{}",
                 model.name.to_lowercase(),
@@ -152,8 +155,14 @@ pub async fn get_args_hash_for_key(cookbook: &RwLock<Cookbook>, key: &str) -> Op
     };
 
     let cookbook = cookbook.read().await;
-    let model = cookbook.models.iter().find(|m| m.name == model_name)?;
-    let profile = model.profiles.iter().find(|p| p.id == profile_id)?;
+    let model = cookbook
+        .models
+        .iter()
+        .find(|m| m.enabled && m.name == model_name)?;
+    let profile = model
+        .profiles
+        .iter()
+        .find(|p| p.enabled && p.id == profile_id)?;
 
     let (pre_args, _, _) = build_pre_args(profile);
     Some(compute_args_hash(&pre_args))
@@ -175,6 +184,7 @@ mod tests {
                         Profile {
                             id: "default".to_string(),
                             description: None,
+                            enabled: true,
                             model_path: Some("/path/to/model.gguf".to_string()),
                             hf_repo: None,
                             hf_file: None,
@@ -193,6 +203,26 @@ mod tests {
                         Profile {
                             id: "fast".to_string(),
                             description: None,
+                            enabled: true,
+                            model_path: Some("/path/to/model.gguf".to_string()),
+                            hf_repo: None,
+                            hf_file: None,
+                            idle_timeout_seconds: 60,
+                            max_instances: Some(4),
+                            llama_server_args: vec![],
+                            estimated_vram_mb: None,
+                            estimated_sysmem_mb: None,
+                            max_wait_in_queue_ms: None,
+                            max_request_duration_ms: None,
+                            startup_timeout_seconds: None,
+                            download_timeout_seconds: None,
+                            max_queue_size: None,
+                            min_eviction_tenure_secs: None,
+                        },
+                        Profile {
+                            id: "disabled-profile".to_string(),
+                            description: None,
+                            enabled: false,
                             model_path: Some("/path/to/model.gguf".to_string()),
                             hf_repo: None,
                             hf_file: None,
@@ -227,6 +257,7 @@ mod tests {
 
         assert!(index.contains_key("gpt:default"));
         assert!(index.contains_key("gpt:fast"));
+        assert!(!index.contains_key("gpt:disabled-profile"));
         assert!(!index.contains_key("disabled:default"));
     }
 
@@ -256,6 +287,35 @@ mod tests {
         // Not found
         let result = model_index.resolve("nonexistent").await;
         assert!(result.is_none());
+
+        // Disabled profile
+        let result = model_index.resolve("gpt:disabled-profile").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn bare_model_requires_enabled_default_profile() {
+        let mut cookbook = sample_cookbook();
+        cookbook.models[0].profiles[0].enabled = false;
+
+        let model_index = ModelIndex::new(&cookbook);
+
+        assert!(model_index.resolve("gpt").await.is_none());
+        assert!(model_index.resolve("gpt:default").await.is_none());
+        assert!(model_index.resolve("gpt:fast").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn args_hash_requires_enabled_model_and_profile() {
+        let cookbook = RwLock::new(sample_cookbook());
+
+        assert!(get_args_hash_for_key(&cookbook, "gpt:fast").await.is_some());
+        assert!(get_args_hash_for_key(&cookbook, "gpt:disabled-profile")
+            .await
+            .is_none());
+        assert!(get_args_hash_for_key(&cookbook, "disabled:default")
+            .await
+            .is_none());
     }
 
     #[test]
@@ -263,6 +323,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/path/to/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -292,6 +353,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: None,
             hf_repo: Some("TheBloke/Llama-2-7B-GGUF".to_string()),
             hf_file: Some("llama-2-7b.Q4_K_M.gguf".to_string()),
@@ -339,6 +401,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -366,6 +429,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/default.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -394,6 +458,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -421,6 +486,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -449,6 +515,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -477,6 +544,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -505,6 +573,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -533,6 +602,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -560,6 +630,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,
@@ -589,6 +660,7 @@ mod tests {
         let profile = Profile {
             id: "test".to_string(),
             description: None,
+            enabled: true,
             model_path: Some("/model.gguf".to_string()),
             hf_repo: None,
             hf_file: None,

@@ -323,6 +323,7 @@ models:
     enabled: true                      # optional, default true
     profiles:
       - id: "fast"
+        enabled: true                       # optional, default true
         description: "Lower context, higher throughput"
         model_path: "./models/gpt-oss-20b-q4_K_M.gguf"
         idle_timeout_seconds: 600         # optional, default 300
@@ -388,11 +389,18 @@ You can also specify model source directly in `llama_server_args` using `-m`/`--
 
 `llama_server_args` is merged with proxy-managed connection settings. By default the proxy appends `--host 127.0.0.1`, an auto-chosen `--port`, `-c 0` (max context size), and `--fit off` (disable auto-optimization) for each instance; if you explicitly include `--host`, `--port`, `-c`/`--ctx-size`, or `--fit` in `llama_server_args`, those values override the defaults. The `-c 0` default tells llama-server to use the model's maximum trained context length. The `--fit off` default ensures your hand-crafted cookbook settings are not overridden by llama-server's automatic optimization feature.
 
+Model and profile `enabled` fields are independent. A profile is available only
+when both its parent model and the profile are enabled. `enabled: false` on a
+profile removes that profile from local routing, `/v1/models`, prewarm, and
+cluster advertisements while leaving sibling profiles available. If a cookbook
+reload disables a profile, existing instances for that profile are drained
+gracefully and stopped once idle.
+
 To mirror upstream `llama-server` behaviors ([docs](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)), you typically configure different profiles with appropriate flags:
 
 * **Speculative decoding**: Add an additional "draft" model/profile in the cookbook and reference it via `llama_server_args` (for example `-md /models/draft.gguf`); the proxy will manage such instances like any other.
 * **Embeddings**: Create a profile whose `llama_server_args` include `--embedding` (and optionally `--pooling`, `-ub`, etc.), matching the upstream examples. That profile will then be addressable via the OpenAI `/v1/embeddings` endpoint on the proxy; there is no node-level `--embedding` toggle.
-* **Reranking (optional / version-dependent)**: When the deployed `llama-server` version exposes reranking support, create a profile with the documented reranking flag(s) from `tools/server`; the proxy can then route dedicated reranking requests to those instances. If reranking is not available in your `llama-server` build, keep such profiles disabled; there is no node-level `--reranking` toggle.
+* **Reranking (optional / version-dependent)**: When the deployed `llama-server` version exposes reranking support, create a profile with the documented reranking flag(s) from `tools/server`; the proxy can then route dedicated reranking requests to those instances. If reranking is not available in your `llama-server` build, keep such profiles disabled with `enabled: false`; there is no node-level `--reranking` toggle.
 * **Grammar-constrained outputs**: Configure profiles whose `llama_server_args` enable grammars (e.g. `--grammar-file` or other grammar-related flags supported by your `llama-server` build). The proxy does not have a node-level grammar setting; grammar is entirely per-instance via the underlying `llama-server` CLI.
 
 **Endpoint-Type Enforcement:**

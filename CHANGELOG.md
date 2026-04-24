@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cookbook profiles now support `enabled: false` independently from their
+  parent model, allowing one profile to be hidden, unroutable, and omitted
+  from cluster advertisements while sibling profiles remain available.
 - Optional per-profile `estimated_vram_mb` and `estimated_sysmem_mb` cookbook
   fields provide cold-start admission hints until runtime memory sampling learns
   measured peaks for a launch-args hash.

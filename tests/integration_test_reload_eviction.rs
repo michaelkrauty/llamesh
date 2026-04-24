@@ -114,6 +114,57 @@ models:
         llama_server_args: ""
 "#;
 
+const COOKBOOK_PROFILES_ENABLED: &str = r#"
+models:
+  - name: "mock-model"
+    enabled: true
+    profiles:
+      - id: "default"
+        model_path: "./models/mock.gguf"
+        idle_timeout_seconds: 600
+        max_instances: 1
+        llama_server_args: ""
+      - id: "alt"
+        model_path: "./models/mock-alt.gguf"
+        idle_timeout_seconds: 600
+        max_instances: 1
+        llama_server_args: "--alias mock-alt"
+  - name: "other-model"
+    enabled: true
+    profiles:
+      - id: "default"
+        model_path: "./models/other.gguf"
+        idle_timeout_seconds: 600
+        max_instances: 1
+        llama_server_args: ""
+"#;
+
+const COOKBOOK_ALT_PROFILE_DISABLED: &str = r#"
+models:
+  - name: "mock-model"
+    enabled: true
+    profiles:
+      - id: "default"
+        model_path: "./models/mock.gguf"
+        idle_timeout_seconds: 600
+        max_instances: 1
+        llama_server_args: ""
+      - id: "alt"
+        enabled: false
+        model_path: "./models/mock-alt.gguf"
+        idle_timeout_seconds: 600
+        max_instances: 1
+        llama_server_args: "--alias mock-alt"
+  - name: "other-model"
+    enabled: true
+    profiles:
+      - id: "default"
+        model_path: "./models/other.gguf"
+        idle_timeout_seconds: 600
+        max_instances: 1
+        llama_server_args: ""
+"#;
+
 /// Poll `/cluster/nodes` until `mock-model:default` is no longer present in the
 /// local node's `loaded_models`, or the deadline elapses.
 async fn wait_for_unload(client: &reqwest::Client, model_key: &str, timeout: Duration) -> bool {
@@ -135,6 +186,28 @@ async fn wait_for_unload(client: &reqwest::Client, model_key: &str, timeout: Dur
             }
         }
         sleep(Duration::from_millis(250)).await;
+    }
+    false
+}
+
+/// Poll `/v1/models` until `model_id` is absent from the listed models, or the
+/// deadline elapses. Used to synchronize with cookbook hot-reload.
+async fn wait_for_model_unlisted(
+    client: &reqwest::Client,
+    model_id: &str,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(resp) = client.get(format!("{}/v1/models", BASE_URL)).send().await {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                let data = json["data"].as_array().cloned().unwrap_or_default();
+                if !data.iter().any(|m| m["id"].as_str() == Some(model_id)) {
+                    return true;
+                }
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
     }
     false
 }
@@ -290,6 +363,29 @@ async fn reload_drains_orphaned_instances() {
         "mock-model:default should have been drained within 30s after args_hash change \
          (regression guard: rename-over must not silence the watcher)"
     );
+
+    // ── Case 3: disabling one profile drains only that profile while sibling
+    //     profiles stay routable. ─────────────────────────────────────────────
+    write_cookbook_rename(&cookbook_path, COOKBOOK_PROFILES_ENABLED).await;
+    assert!(
+        wait_for_model_listed(&client, "mock-model:alt", Duration::from_secs(10)).await,
+        "cookbook reload should make mock-model:alt listed within 10s"
+    );
+
+    spawn_instance_for(&client, "mock-model:alt").await;
+
+    write_cookbook_inplace(&cookbook_path, COOKBOOK_ALT_PROFILE_DISABLED).await;
+
+    assert!(
+        wait_for_model_unlisted(&client, "mock-model:alt", Duration::from_secs(10)).await,
+        "disabled profile should disappear from /v1/models within 10s"
+    );
+    assert!(
+        wait_for_unload(&client, "mock-model:alt", Duration::from_secs(30)).await,
+        "mock-model:alt should have been drained within 30s after profile disable"
+    );
+
+    spawn_instance_for(&client, "mock-model:default").await;
 
     // ── Teardown ────────────────────────────────────────────────────────────
     graceful_stop(&mut proxy_process).await;
