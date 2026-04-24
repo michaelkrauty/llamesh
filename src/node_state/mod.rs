@@ -1585,13 +1585,8 @@ impl NodeState {
             }
 
             // 3. Check profile max instances
-            let mut profile_count = 0;
-            for inst_lock in instances_map.values() {
-                let inst = inst_lock.read().await;
-                if inst.model_name == model_name && inst.profile_id == profile.id {
-                    profile_count += 1;
-                }
-            }
+            let profile_count =
+                Self::count_profile_instances(&instances_map, model_name, &profile.id).await;
             let max_instances = profile.effective_max_instances(&self.config.model_defaults);
             if profile_count >= max_instances {
                 return Err(NodeError::MaxInstancesProfile);
@@ -1803,9 +1798,29 @@ impl NodeState {
                         // Spawn succeeded - NOW insert into map and update peak memory
                         let mut instances_map = self.instances.write().await;
 
-                        // Re-check capacity constraints to close race window between
-                        // dropping lock (line 1368) and re-acquiring here. Another spawn
-                        // could have completed in that window.
+                        // Re-check capacity constraints to close the race window between
+                        // dropping the lock to spawn and re-acquiring it for insertion.
+                        let current_profile_count =
+                            Self::count_profile_instances(&instances_map, model_name, &profile.id)
+                                .await;
+                        let max_profile =
+                            profile.effective_max_instances(&self.config.model_defaults);
+                        if current_profile_count >= max_profile {
+                            drop(instances_map);
+                            self.release_port(port).await;
+                            let inst = inst_arc.read().await;
+                            let _ = inst.stop().await;
+                            warn!(
+                                event = "spawn_profile_race_detected",
+                                model = %model_name,
+                                profile = %profile.id,
+                                current = current_profile_count,
+                                max = max_profile,
+                                "Killed just-spawned instance due to profile capacity race"
+                            );
+                            return Err(NodeError::MaxInstancesProfile);
+                        }
+
                         let current_count = instances_map.len();
                         let max_node = self.config.max_instances_per_node;
                         if current_count >= max_node {
@@ -1951,6 +1966,21 @@ impl NodeState {
             );
             return Ok(inst_arc.clone());
         }
+    }
+
+    async fn count_profile_instances(
+        instances_map: &HashMap<String, Arc<RwLock<Instance>>>,
+        model_name: &str,
+        profile_id: &str,
+    ) -> usize {
+        let mut count = 0;
+        for inst_lock in instances_map.values() {
+            let inst = inst_lock.read().await;
+            if inst.model_name == model_name && inst.profile_id == profile_id {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub async fn get_self_peer_state(&self) -> PeerState {
@@ -3272,6 +3302,63 @@ mod tests {
         assert!(!self_peer
             .supported_models
             .contains(&"local-model:zero-capacity".into()));
+    }
+
+    #[tokio::test]
+    async fn count_profile_instances_filters_by_model_and_profile() {
+        let mut instances = HashMap::new();
+        instances.insert(
+            "match-a".into(),
+            Arc::new(RwLock::new(Instance::new(
+                "match-a".into(),
+                "model-a".into(),
+                "default".into(),
+                "127.0.0.1".into(),
+                8100,
+                "hash".into(),
+                false,
+            ))),
+        );
+        instances.insert(
+            "match-b".into(),
+            Arc::new(RwLock::new(Instance::new(
+                "match-b".into(),
+                "model-a".into(),
+                "default".into(),
+                "127.0.0.1".into(),
+                8101,
+                "hash".into(),
+                false,
+            ))),
+        );
+        instances.insert(
+            "different-profile".into(),
+            Arc::new(RwLock::new(Instance::new(
+                "different-profile".into(),
+                "model-a".into(),
+                "fast".into(),
+                "127.0.0.1".into(),
+                8102,
+                "hash".into(),
+                false,
+            ))),
+        );
+        instances.insert(
+            "different-model".into(),
+            Arc::new(RwLock::new(Instance::new(
+                "different-model".into(),
+                "model-b".into(),
+                "default".into(),
+                "127.0.0.1".into(),
+                8103,
+                "hash".into(),
+                false,
+            ))),
+        );
+
+        let count = NodeState::count_profile_instances(&instances, "model-a", "default").await;
+
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]
