@@ -4,7 +4,8 @@ use tokio::time::sleep;
 
 mod common;
 use common::{
-    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, setup_mock_script, wait_for_ready,
+    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, llamesh_binary, setup_mock_script,
+    wait_for_ready,
 };
 
 #[tokio::test]
@@ -16,13 +17,7 @@ async fn test_standalone_proxy() {
     let mock_script = setup_mock_script(&root, "standalone").await;
     let config_path = root.join("tests/config_standalone.yaml");
     let cookbook_path = root.join("tests/cookbook_standalone.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -130,13 +125,7 @@ async fn test_cluster_proxy() {
     cleanup_by_port_range_pattern("130[12][0-9]").await;
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "cluster").await;
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_a_path = root.join("tests/config_node_a.yaml");
     let cookbook_a_path = root.join("tests/cookbook_node_a.yaml");
@@ -337,13 +326,7 @@ async fn test_disabled_model() {
     let mock_script = setup_mock_script(&root, "disabled").await;
     let config_path = root.join("tests/config_disabled.yaml");
     let cookbook_path = root.join("tests/cookbook_disabled.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -508,13 +491,7 @@ async fn test_token_counting() {
     let mock_script = setup_mock_script(&root, "tokens").await;
     let config_path = root.join("tests/config_tokens.yaml");
     let cookbook_path = root.join("tests/cookbook_tokens.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -688,13 +665,7 @@ async fn test_instance_auth() {
     let mock_script = setup_mock_script(&root, "auth").await;
     let config_path = root.join("tests/config_auth.yaml");
     let cookbook_path = root.join("tests/cookbook_auth.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -801,13 +772,7 @@ async fn test_crash_recovery() {
     let mock_script = setup_mock_script(&root, "crash").await;
     let config_path = root.join("tests/config_crash.yaml");
     let cookbook_path = root.join("tests/cookbook_crash.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -951,13 +916,7 @@ async fn test_queueing() {
     let mock_script = setup_mock_script(&root, "queue").await;
     let config_path = root.join("tests/config_queue.yaml");
     let cookbook_path = root.join("tests/cookbook_queue.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -1075,8 +1034,8 @@ models:
     assert_eq!(status1, StatusCode::OK);
     assert_eq!(status2, StatusCode::OK);
 
-    println!("Req 1 duration: {:?}", dur1);
-    println!("Req 2 duration: {:?}", dur2);
+    println!("Req 1 duration: {dur1:?}");
+    println!("Req 2 duration: {dur2:?}");
 
     // Mock server delays ~100-500ms + 500-2000ms.
     // Req 2 should be roughly 2x Req 1 duration if queued, or at least significantly longer than Req 1 if they were parallel (but they aren't parallel).
@@ -1107,13 +1066,7 @@ async fn test_hop_counter_validation() {
     let mock_script = setup_mock_script(&root, "hops").await;
     let config_path = root.join("tests/config_hops.yaml");
     let cookbook_path = root.join("tests/cookbook_hops.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"

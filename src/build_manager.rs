@@ -277,7 +277,7 @@ impl BuildManager {
                     build_base.display()
                 )
             })?;
-        let build_dir_name = format!("{}-{}", base_name, commit_hash);
+        let build_dir_name = format!("{base_name}-{commit_hash}");
         let build_dir = build_base
             .parent()
             .unwrap_or(Path::new("."))
@@ -369,7 +369,7 @@ impl BuildManager {
                 return Ok(());
             }
         };
-        let prefix = format!("{}-", base_name);
+        let prefix = format!("{base_name}-");
 
         let mut entries = tokio::fs::read_dir(parent_dir).await?;
         let mut builds = Vec::new();
@@ -422,7 +422,7 @@ impl BuildManager {
                 let new_path = if existing.is_empty() {
                     lib_dir.to_string()
                 } else {
-                    format!("{}:{}", lib_dir, existing)
+                    format!("{lib_dir}:{existing}")
                 };
                 cmd.env("LD_LIBRARY_PATH", new_path);
             }
@@ -547,7 +547,7 @@ impl BuildManager {
 async fn run_command(cmd: &mut Command) -> Result<()> {
     let status = cmd.status().await?;
     if !status.success() {
-        return Err(anyhow!("Command failed: {:?}", cmd));
+        return Err(anyhow!("Command failed: {cmd:?}"));
     }
     Ok(())
 }
@@ -666,7 +666,7 @@ fi
         }
 
         if let Err(e) = &result {
-            println!("BuildManager Error: {}", e);
+            println!("BuildManager Error: {e}");
         }
         assert!(result.is_ok());
 

@@ -39,7 +39,7 @@ impl MdnsDiscovery {
         // Input might be "_llama-mesh._tcp.local" or "_llama-mesh._tcp"
         let service_type = service_type.trim_end_matches('.');
         let service_type = service_type.trim_end_matches(".local");
-        let service_type = format!("{}.local.", service_type);
+        let service_type = format!("{service_type}.local.");
 
         // Get hostname and ensure it ends with .local. as required by mdns-sd
         let hostname = hostname::get()
@@ -48,9 +48,9 @@ impl MdnsDiscovery {
         let hostname = if hostname.ends_with(".local.") {
             hostname
         } else if hostname.ends_with(".local") {
-            format!("{}.", hostname)
+            format!("{hostname}.")
         } else {
-            format!("{}.local.", hostname)
+            format!("{hostname}.local.")
         };
 
         // Create service info
@@ -148,7 +148,7 @@ impl MdnsDiscovery {
                 Err(e) => {
                     // Timeout - check shutdown flag and continue
                     // Disconnected - break
-                    let err_str = format!("{:?}", e);
+                    let err_str = format!("{e:?}");
                     if err_str.contains("Disconnected") {
                         break;
                     }

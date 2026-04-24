@@ -20,7 +20,8 @@ use tokio::time::sleep;
 
 mod common;
 use common::{
-    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, setup_mock_script, wait_for_ready,
+    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, llamesh_binary, setup_mock_script,
+    wait_for_ready,
 };
 
 const NODE_A_ADDR: &str = "127.0.0.1:9230";
@@ -163,13 +164,7 @@ async fn cancelled_peer_forward_does_not_leak_current_requests() {
     let config_b_path = root.join("tests/config_peer_fwd_cancel_b.yaml");
     let cookbook_b_path = root.join("tests/cookbook_peer_fwd_cancel_b.yaml");
 
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     tokio::fs::write(
         &config_a_path,
@@ -273,6 +268,10 @@ async fn cancelled_peer_forward_does_not_leak_current_requests() {
         "node B's current_requests should return to 0 within 10s after cancel; \
          observed {}",
         current_requests(&client, NODE_B_URL).await
+    );
+    assert!(
+        wait_for_current_requests(&client, NODE_A_URL, 0, Duration::from_secs(10)).await,
+        "node A should finish any peer work that was already accepted before the sanity request"
     );
 
     // Sanity: a regular (non-cancelled) forward-to-peer request still completes.

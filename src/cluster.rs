@@ -3,9 +3,10 @@ use crate::node_state::PeerState;
 use crate::security::PeerIdentity;
 use axum::{
     extract::{ConnectInfo, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     Json,
 };
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -65,7 +66,7 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 let url = if addr.contains("://") {
                     addr
                 } else {
-                    format!("http://{}", addr)
+                    format!("http://{addr}")
                 };
                 targets.insert(url);
             }
@@ -100,6 +101,7 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
             debug!("Gossiping to peer {}", peer_url);
             let url = format!("{}/cluster/gossip", peer_url.trim_end_matches('/'));
             let client = client.clone();
+            let noise_context = state.noise_context.clone();
 
             let message = GossipMessage {
                 origin: my_state.clone(),
@@ -126,20 +128,82 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 .get(&peer_url)
                 .cloned()
                 .unwrap_or_else(|| peer_url.clone());
+            let expected_node_id = url_to_node_id.get(&peer_url).cloned();
             let circuit_breaker = state.circuit_breaker.clone();
 
             // Spawn each gossip request to avoid head-of-line blocking in the loop
             tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
-                match client.post(&url).json(&message).send().await {
-                    Ok(_) => {
-                        // Record success - resets failure count and closes circuit if half-open
-                        circuit_breaker.record_success(&cb_key).await;
+                if let Some(noise_context) = noise_context {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    match serde_json::to_vec(&message) {
+                        Ok(body) => {
+                            match crate::noise::transport::request(
+                                &noise_context,
+                                crate::noise::transport::OutboundNoiseRequest {
+                                    peer_base_url: &peer_url,
+                                    expected_peer_node_id: expected_node_id.as_deref(),
+                                    method: "POST",
+                                    path: "/cluster/gossip",
+                                    headers: &headers,
+                                    body: &body,
+                                    timeout_duration: Some(std::time::Duration::from_secs(10)),
+                                },
+                            )
+                            .await
+                            {
+                                Ok(resp) => {
+                                    let status = resp.head.status;
+                                    let mut body = resp.into_body_stream();
+                                    while let Some(chunk) = body.next().await {
+                                        if let Err(e) = chunk {
+                                            debug!(
+                                                "Failed to drain Noise gossip response from {}: {}",
+                                                peer_url, e
+                                            );
+                                            break;
+                                        }
+                                    }
+                                    if (200..300).contains(&status) {
+                                        circuit_breaker.record_success(&cb_key).await;
+                                    } else {
+                                        circuit_breaker.record_failure(&cb_key).await;
+                                        debug!(
+                                            "Failed to gossip to {} over Noise: HTTP {}",
+                                            peer_url, status
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    circuit_breaker.record_failure(&cb_key).await;
+                                    debug!("Failed to gossip to {} over Noise: {}", peer_url, e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            circuit_breaker.record_failure(&cb_key).await;
+                            debug!("Failed to serialize gossip for {}: {}", peer_url, e);
+                        }
                     }
-                    Err(e) => {
-                        // Record failure - circuit breaker handles escalation and logging
-                        circuit_breaker.record_failure(&cb_key).await;
-                        debug!("Failed to gossip to {}: {}", url, e);
+                } else {
+                    match client.post(&url).json(&message).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            // Record success - resets failure count and closes circuit if half-open
+                            circuit_breaker.record_success(&cb_key).await;
+                        }
+                        Ok(resp) => {
+                            circuit_breaker.record_failure(&cb_key).await;
+                            debug!("Failed to gossip to {}: HTTP {}", url, resp.status());
+                        }
+                        Err(e) => {
+                            // Record failure - circuit breaker handles escalation and logging
+                            circuit_breaker.record_failure(&cb_key).await;
+                            debug!("Failed to gossip to {}: {}", url, e);
+                        }
                     }
                 }
             });
@@ -153,6 +217,19 @@ pub async fn handle_gossip(
     maybe_socket: Option<ConnectInfo<std::net::SocketAddr>>,
     Json(msg): Json<GossipMessage>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let cluster_tls_enabled = state
+        .config
+        .cluster_tls
+        .as_ref()
+        .map(|c| c.enabled)
+        .unwrap_or(false);
+    if state.config.cluster.noise.enabled && !cluster_tls_enabled {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Noise transport required for gossip".into(),
+        ));
+    }
+
     if state
         .config
         .cluster_tls

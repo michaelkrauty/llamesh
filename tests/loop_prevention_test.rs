@@ -3,24 +3,18 @@ use common::*;
 use reqwest::StatusCode;
 
 async fn start_mock_node(suffix: &str, port_offset: u16) -> (tokio::process::Child, String) {
-    let id = format!("loop-{}", suffix);
+    let id = format!("loop-{suffix}");
     let port = 14000 + port_offset;
-    let listen = format!("127.0.0.1:{}", port);
+    let listen = format!("127.0.0.1:{port}");
 
-    cleanup_procs(&format!("config_{}.yaml", id)).await;
-    cleanup_by_port_range_pattern(&format!("150{}", port_offset)).await; // Mock server ports
+    cleanup_procs(&format!("config_{id}.yaml")).await;
+    cleanup_by_port_range_pattern(&format!("150{port_offset}")).await; // Mock server ports
 
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, &id).await;
-    let config_path = root.join(format!("tests/config_{}.yaml", id));
-    let cookbook_path = root.join(format!("tests/cookbook_{}.yaml", id));
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let config_path = root.join(format!("tests/config_{id}.yaml"));
+    let cookbook_path = root.join(format!("tests/cookbook_{id}.yaml"));
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -90,7 +84,7 @@ models:
         .spawn()
         .expect("Failed to start proxy");
 
-    let addr = format!("http://{}", listen);
+    let addr = format!("http://{listen}");
     assert!(wait_for_ready(&addr).await, "Proxy failed to become ready");
 
     (proxy_process, addr)
@@ -102,7 +96,7 @@ async fn test_loop_prevention_rejects_too_many_hops() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{}/v1/chat/completions", addr))
+        .post(format!("{addr}/v1/chat/completions"))
         .header("X-Llama-Mesh-Hops", "11")
         .json(&serde_json::json!({
             "model": "mock-model:default",
@@ -130,7 +124,7 @@ async fn test_loop_prevention_allows_few_hops() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{}/v1/chat/completions", addr))
+        .post(format!("{addr}/v1/chat/completions"))
         .header("X-Llama-Mesh-Hops", "5")
         .json(&serde_json::json!({
             "model": "mock-model:default",

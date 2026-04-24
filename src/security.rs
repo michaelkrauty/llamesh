@@ -2,9 +2,10 @@ use crate::config::{AuthConfig, ClusterTlsConfig, ServerTlsConfig};
 use anyhow::{Context, Result};
 use axum::http::HeaderMap;
 use reqwest::{Client, ClientBuilder};
+use rustls::pki_types::pem::PemObject;
 use rustls::ServerConfig;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
@@ -100,11 +101,10 @@ pub async fn load_server_config(
 }
 
 fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let file = File::open(path).with_context(|| format!("Failed to open cert file: {}", path))?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("Failed to open cert file: {path}"))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Failed to load certs: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load certs: {e}"))?;
 
     // Validate certificate expiry for the first (leaf) certificate
     if let Some(cert) = certs.first() {
@@ -120,8 +120,7 @@ fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'stati
                     validity.not_after
                 );
                 return Err(anyhow::anyhow!(
-                    "Certificate at {} is expired or not yet valid",
-                    path
+                    "Certificate at {path} is expired or not yet valid"
                 ));
             }
 
@@ -147,19 +146,8 @@ fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'stati
 }
 
 fn load_private_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let file = File::open(path).with_context(|| format!("Failed to open key file: {}", path))?;
-    let mut reader = BufReader::new(file);
-
-    for item in rustls_pemfile::read_all(&mut reader) {
-        match item? {
-            rustls_pemfile::Item::Pkcs1Key(key) => return Ok(key.into()),
-            rustls_pemfile::Item::Pkcs8Key(key) => return Ok(key.into()),
-            rustls_pemfile::Item::Sec1Key(key) => return Ok(key.into()),
-            _ => {}
-        }
-    }
-
-    Err(anyhow::anyhow!("No private key found in {}", path))
+    rustls::pki_types::PrivateKeyDer::from_pem_file(path)
+        .with_context(|| format!("Failed to load private key: {path}"))
 }
 
 pub fn build_cluster_client(config: &Option<ClusterTlsConfig>) -> Result<Client> {

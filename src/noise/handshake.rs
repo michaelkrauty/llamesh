@@ -1,4 +1,4 @@
-//! Noise Protocol XX handshake implementation (server-side only).
+//! Noise Protocol XX handshake implementation.
 //!
 //! Pattern: Noise_XX_25519_ChaChaPoly_SHA256
 //! - XX: Mutual authentication, both sides prove identity
@@ -6,9 +6,8 @@
 //! - ChaChaPoly: ChaCha20-Poly1305 AEAD
 //! - SHA256: Hash function
 //!
-//! This module provides server-side (responder) handshake for accepting
-//! incoming Noise connections. Client-side (initiator) code is only
-//! compiled for tests, as production cluster gossip uses HTTP/mTLS.
+//! This module provides both responder and initiator handshakes for
+//! encrypted inter-node traffic.
 //!
 //! Token verification:
 //! After handshake completes, both sides compute HMAC(token, handshake_hash)
@@ -58,7 +57,7 @@ impl NoiseSession {
         let len = self
             .transport
             .write_message(plaintext, &mut buffer)
-            .map_err(|e| NoiseError::Transport(format!("Encrypt failed: {}", e)))?;
+            .map_err(|e| NoiseError::Transport(format!("Encrypt failed: {e}")))?;
         buffer.truncate(len);
         Ok(buffer)
     }
@@ -69,7 +68,7 @@ impl NoiseSession {
         let len = self
             .transport
             .read_message(ciphertext, &mut buffer)
-            .map_err(|e| NoiseError::Transport(format!("Decrypt failed: {}", e)))?;
+            .map_err(|e| NoiseError::Transport(format!("Decrypt failed: {e}")))?;
         buffer.truncate(len);
         Ok(buffer)
     }
@@ -81,11 +80,24 @@ fn build_responder(keypair: &NodeKeypair) -> Result<snow::HandshakeState> {
     Builder::new(
         NOISE_PATTERN
             .parse()
-            .map_err(|e| NoiseError::Handshake(format!("Invalid noise pattern: {}", e)))?,
+            .map_err(|e| NoiseError::Handshake(format!("Invalid noise pattern: {e}")))?,
     )
     .local_private_key(&key_bytes)
     .build_responder()
-    .map_err(|e| NoiseError::Handshake(format!("Failed to build responder: {}", e)))
+    .map_err(|e| NoiseError::Handshake(format!("Failed to build responder: {e}")))
+}
+
+/// Build an initiator handshake state.
+fn build_initiator(keypair: &NodeKeypair) -> Result<snow::HandshakeState> {
+    let key_bytes = keypair.private_key_bytes();
+    Builder::new(
+        NOISE_PATTERN
+            .parse()
+            .map_err(|e| NoiseError::Handshake(format!("Invalid noise pattern: {e}")))?,
+    )
+    .local_private_key(&key_bytes)
+    .build_initiator()
+    .map_err(|e| NoiseError::Handshake(format!("Failed to build initiator: {e}")))
 }
 
 /// Compute token verification HMAC
@@ -124,19 +136,19 @@ pub async fn respond(
     let msg = recv_message(stream, &mut read_buf).await?;
     handshake
         .read_message(&msg, &mut buffer)
-        .map_err(|e| NoiseError::Handshake(format!("Read e failed: {}", e)))?;
+        .map_err(|e| NoiseError::Handshake(format!("Read e failed: {e}")))?;
 
     // -> e, ee, s, es
     let len = handshake
         .write_message(&[], &mut buffer)
-        .map_err(|e| NoiseError::Handshake(format!("Write e,ee,s,es failed: {}", e)))?;
+        .map_err(|e| NoiseError::Handshake(format!("Write e,ee,s,es failed: {e}")))?;
     send_message(stream, &buffer[..len]).await?;
 
     // <- s, se
     let msg = recv_message(stream, &mut read_buf).await?;
     handshake
         .read_message(&msg, &mut buffer)
-        .map_err(|e| NoiseError::Handshake(format!("Read s,se failed: {}", e)))?;
+        .map_err(|e| NoiseError::Handshake(format!("Read s,se failed: {e}")))?;
 
     // Handshake complete - get peer's static key
     let peer_public_key: [u8; 32] = handshake
@@ -151,14 +163,14 @@ pub async fn respond(
     // Convert to transport mode
     let mut transport = handshake
         .into_transport_mode()
-        .map_err(|e| NoiseError::Handshake(format!("Transport mode failed: {}", e)))?;
+        .map_err(|e| NoiseError::Handshake(format!("Transport mode failed: {e}")))?;
 
     // Receive peer's token verification first
     let msg = recv_message(stream, &mut read_buf).await?;
     let mut dec_buf = vec![0u8; msg.len()];
     let len = transport
         .read_message(&msg, &mut dec_buf)
-        .map_err(|e| NoiseError::Handshake(format!("Token recv failed: {}", e)))?;
+        .map_err(|e| NoiseError::Handshake(format!("Token recv failed: {e}")))?;
 
     if len < 32 {
         return Err(NoiseError::Handshake("Token message too short".into()));
@@ -183,13 +195,97 @@ pub async fn respond(
     let mut enc_buf = vec![0u8; payload.len() + 16];
     let len = transport
         .write_message(&payload, &mut enc_buf)
-        .map_err(|e| NoiseError::Handshake(format!("Token send failed: {}", e)))?;
+        .map_err(|e| NoiseError::Handshake(format!("Token send failed: {e}")))?;
     send_message(stream, &enc_buf[..len]).await?;
 
     tracing::debug!(
         peer_node_id = %peer_node_id,
-        peer_key = %format!("ed25519:{}", base64::engine::general_purpose::STANDARD.encode(peer_public_key)),
+        peer_key = %format!("noise25519:{}", base64::engine::general_purpose::STANDARD.encode(peer_public_key)),
         "Handshake complete (responder)"
+    );
+
+    Ok(NoiseSession {
+        transport,
+        peer_public_key,
+        peer_node_id: Some(peer_node_id),
+    })
+}
+
+/// Perform initiator (client) handshake.
+pub async fn initiate(
+    stream: &mut tokio::net::TcpStream,
+    keypair: &NodeKeypair,
+    cluster_token: &str,
+    our_node_id: &str,
+) -> Result<NoiseSession> {
+    let mut handshake = build_initiator(keypair)?;
+
+    let mut buffer = vec![0u8; HANDSHAKE_BUFFER_SIZE];
+    let mut read_buf = vec![0u8; HANDSHAKE_BUFFER_SIZE];
+
+    // -> e
+    let len = handshake
+        .write_message(&[], &mut buffer)
+        .map_err(|e| NoiseError::Handshake(format!("Write e failed: {e}")))?;
+    send_message(stream, &buffer[..len]).await?;
+
+    // <- e, ee, s, es
+    let msg = recv_message(stream, &mut read_buf).await?;
+    handshake
+        .read_message(&msg, &mut buffer)
+        .map_err(|e| NoiseError::Handshake(format!("Read e,ee,s,es failed: {e}")))?;
+
+    // -> s, se
+    let len = handshake
+        .write_message(&[], &mut buffer)
+        .map_err(|e| NoiseError::Handshake(format!("Write s,se failed: {e}")))?;
+    send_message(stream, &buffer[..len]).await?;
+
+    let peer_public_key: [u8; 32] = handshake
+        .get_remote_static()
+        .ok_or_else(|| NoiseError::Handshake("No remote static key".into()))?
+        .try_into()
+        .map_err(|_| NoiseError::Handshake("Invalid remote static key length".into()))?;
+
+    let handshake_hash = handshake.get_handshake_hash().to_vec();
+    let mut transport = handshake
+        .into_transport_mode()
+        .map_err(|e| NoiseError::Handshake(format!("Transport mode failed: {e}")))?;
+
+    let token_bytes = crate::noise::token::decode(cluster_token)?;
+    let our_hmac = compute_token_verification(&token_bytes, &handshake_hash);
+    let mut payload = our_hmac;
+    payload.extend_from_slice(our_node_id.as_bytes());
+
+    let mut enc_buf = vec![0u8; payload.len() + 16];
+    let len = transport
+        .write_message(&payload, &mut enc_buf)
+        .map_err(|e| NoiseError::Handshake(format!("Token send failed: {e}")))?;
+    send_message(stream, &enc_buf[..len]).await?;
+
+    let msg = recv_message(stream, &mut read_buf).await?;
+    let mut dec_buf = vec![0u8; msg.len()];
+    let len = transport
+        .read_message(&msg, &mut dec_buf)
+        .map_err(|e| NoiseError::Handshake(format!("Token recv failed: {e}")))?;
+
+    if len < 32 {
+        return Err(NoiseError::Handshake("Token response too short".into()));
+    }
+
+    let peer_hmac = &dec_buf[..32];
+    let expected_hmac = compute_token_verification(&token_bytes, &handshake_hash);
+
+    if !verify_token(&expected_hmac, peer_hmac) {
+        return Err(NoiseError::TokenVerificationFailed);
+    }
+
+    let peer_node_id = String::from_utf8_lossy(&dec_buf[32..len]).to_string();
+
+    tracing::debug!(
+        peer_node_id = %peer_node_id,
+        peer_key = %format!("noise25519:{}", base64::engine::general_purpose::STANDARD.encode(peer_public_key)),
+        "Handshake complete (initiator)"
     );
 
     Ok(NoiseSession {
@@ -235,13 +331,7 @@ mod tests {
     use super::*;
     use crate::noise::keypair::NodeKeypair;
     use crate::noise::token;
-    use snow::Builder;
     use tokio::net::TcpListener;
-
-    // =========================================================================
-    // Client-side (initiator) code - only needed for tests
-    // Production cluster gossip uses HTTP/mTLS for outbound communication.
-    // =========================================================================
 
     /// Test-only methods for NoiseSession
     #[cfg(test)]
@@ -250,7 +340,7 @@ mod tests {
         /// Get the peer's public key in display format (test-only)
         pub fn peer_public_key_display(&self) -> String {
             format!(
-                "ed25519:{}",
+                "noise25519:{}",
                 base64::engine::general_purpose::STANDARD.encode(self.peer_public_key)
             )
         }
@@ -260,113 +350,6 @@ mod tests {
             self.peer_node_id = Some(node_id);
         }
     }
-
-    /// Build an initiator handshake state (test-only)
-    fn build_initiator(keypair: &NodeKeypair) -> Result<snow::HandshakeState> {
-        let key_bytes = keypair.private_key_bytes();
-        Builder::new(
-            NOISE_PATTERN
-                .parse()
-                .map_err(|e| NoiseError::Handshake(format!("Invalid noise pattern: {}", e)))?,
-        )
-        .local_private_key(&key_bytes)
-        .build_initiator()
-        .map_err(|e| NoiseError::Handshake(format!("Failed to build initiator: {}", e)))
-    }
-
-    /// Perform initiator (client) handshake (test-only)
-    ///
-    /// This is the client-side handshake used to test the responder.
-    /// Production code only uses the responder (server) side.
-    async fn initiate(
-        stream: &mut tokio::net::TcpStream,
-        keypair: &NodeKeypair,
-        cluster_token: &str,
-        our_node_id: &str,
-    ) -> Result<NoiseSession> {
-        let mut handshake = build_initiator(keypair)?;
-
-        let mut buffer = vec![0u8; HANDSHAKE_BUFFER_SIZE];
-        let mut read_buf = vec![0u8; HANDSHAKE_BUFFER_SIZE];
-
-        // -> e
-        let len = handshake
-            .write_message(&[], &mut buffer)
-            .map_err(|e| NoiseError::Handshake(format!("Write e failed: {}", e)))?;
-        send_message(stream, &buffer[..len]).await?;
-
-        // <- e, ee, s, es
-        let msg = recv_message(stream, &mut read_buf).await?;
-        handshake
-            .read_message(&msg, &mut buffer)
-            .map_err(|e| NoiseError::Handshake(format!("Read e,ee,s,es failed: {}", e)))?;
-
-        // -> s, se
-        let len = handshake
-            .write_message(&[], &mut buffer)
-            .map_err(|e| NoiseError::Handshake(format!("Write s,se failed: {}", e)))?;
-        send_message(stream, &buffer[..len]).await?;
-
-        // Handshake complete - get peer's static key
-        let peer_public_key: [u8; 32] = handshake
-            .get_remote_static()
-            .ok_or_else(|| NoiseError::Handshake("No remote static key".into()))?
-            .try_into()
-            .map_err(|_| NoiseError::Handshake("Invalid remote static key length".into()))?;
-
-        // Get handshake hash for token verification
-        let handshake_hash = handshake.get_handshake_hash().to_vec();
-
-        // Convert to transport mode
-        let mut transport = handshake
-            .into_transport_mode()
-            .map_err(|e| NoiseError::Handshake(format!("Transport mode failed: {}", e)))?;
-
-        // Token verification: send HMAC(token, handshake_hash) + node_id
-        let token_bytes = crate::noise::token::decode(cluster_token)?;
-        let our_hmac = compute_token_verification(&token_bytes, &handshake_hash);
-
-        // Send: hmac (32 bytes) + node_id
-        let mut payload = our_hmac.clone();
-        payload.extend_from_slice(our_node_id.as_bytes());
-
-        let mut enc_buf = vec![0u8; payload.len() + 16];
-        let len = transport
-            .write_message(&payload, &mut enc_buf)
-            .map_err(|e| NoiseError::Handshake(format!("Token send failed: {}", e)))?;
-        send_message(stream, &enc_buf[..len]).await?;
-
-        // Receive peer's token verification
-        let msg = recv_message(stream, &mut read_buf).await?;
-        let mut dec_buf = vec![0u8; msg.len()];
-        let len = transport
-            .read_message(&msg, &mut dec_buf)
-            .map_err(|e| NoiseError::Handshake(format!("Token recv failed: {}", e)))?;
-
-        if len < 32 {
-            return Err(NoiseError::Handshake("Token response too short".into()));
-        }
-
-        let peer_hmac = &dec_buf[..32];
-        let expected_hmac = compute_token_verification(&token_bytes, &handshake_hash);
-
-        if !verify_token(&expected_hmac, peer_hmac) {
-            return Err(NoiseError::TokenVerificationFailed);
-        }
-
-        // Extract peer node_id
-        let peer_node_id = String::from_utf8_lossy(&dec_buf[32..len]).to_string();
-
-        Ok(NoiseSession {
-            transport,
-            peer_public_key,
-            peer_node_id: Some(peer_node_id),
-        })
-    }
-
-    // =========================================================================
-    // Tests
-    // =========================================================================
 
     #[test]
     fn test_token_verification() {
@@ -465,7 +448,7 @@ mod tests {
         assert_eq!(server_session.peer_node_id(), Some("client-node"));
 
         // Verify both sides got a 32-byte public key from the Noise session
-        // Note: These are X25519 keys used by Noise, not the Ed25519 identity keys
+        // Note: These are X25519 static keys used by Noise.
         assert_eq!(client_session.peer_public_key().len(), 32);
         assert_eq!(server_session.peer_public_key().len(), 32);
 

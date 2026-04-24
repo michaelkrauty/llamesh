@@ -15,7 +15,9 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 mod common;
-use common::{cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, wait_for_ready};
+use common::{
+    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, llamesh_binary, wait_for_ready,
+};
 
 const LISTEN_ADDR: &str = "127.0.0.1:9220";
 const BASE_URL: &str = "http://127.0.0.1:9220";
@@ -80,7 +82,7 @@ async fn setup_slow_body_mock_script(
     suffix: &str,
     body_delay_ms: u64,
 ) -> std::path::PathBuf {
-    let mock_script = root.join(format!("tests/mock_server_{}.sh", suffix));
+    let mock_script = root.join(format!("tests/mock_server_{suffix}.sh"));
     let mut mock_bin = root.join("target/release/mock_llama_server");
     if !mock_bin.exists() {
         let debug_bin = root.join("target/debug/mock_llama_server");
@@ -150,13 +152,7 @@ async fn cancelled_request_does_not_leak_in_flight_counter() {
     let mock_script = setup_slow_body_mock_script(&root, "cancellation", 5000).await;
     let config_path = root.join("tests/config_cancellation.yaml");
     let cookbook_path = root.join("tests/cookbook_cancellation.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     tokio::fs::write(&config_path, config_yaml(&mock_script))
         .await

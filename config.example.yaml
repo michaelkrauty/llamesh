@@ -159,11 +159,11 @@ cluster:
     # previous_key_path: "/path/to/old-node.key"  # For key rotation
 
     # Enterprise: only accept connections from these public keys
-    # Format: "ed25519:<base64-encoded-key>"
+    # Format: "noise25519:<base64-encoded-key>"
     # If non-empty, TOFU is effectively disabled
     allowed_keys: []
-      # - "ed25519:xAbC123...="
-      # - "ed25519:yDeF456...="
+      # - "noise25519:xAbC123...="
+      # - "noise25519:yDeF456...="
 
     # Session cache TTL in seconds (default: 3600)
     session_ttl_seconds: 3600

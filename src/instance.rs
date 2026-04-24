@@ -272,7 +272,7 @@ impl Instance {
                 let new_path = if existing.is_empty() {
                     lib_dir.to_string()
                 } else {
-                    format!("{}:{}", lib_dir, existing)
+                    format!("{lib_dir}:{existing}")
                 };
                 cmd.env("LD_LIBRARY_PATH", new_path);
             }
@@ -406,7 +406,7 @@ impl Instance {
             // a reliable indicator of readiness for serving requests.
             let mut health_req = client.get(&health_addr);
             if let Some(ref key) = api_key {
-                health_req = health_req.header("Authorization", format!("Bearer {}", key));
+                health_req = health_req.header("Authorization", format!("Bearer {key}"));
             }
 
             match health_req.send().await {

@@ -3,7 +3,7 @@
 //! File format (~/.llama-mesh/known_peers):
 //! ```text
 //! # node_id pubkey first_seen
-//! node-b ed25519:xAbC123...= 2024-01-15T10:30:00Z
+//! node-b noise25519:xAbC123...= 2024-01-15T10:30:00Z
 //! ```
 
 use super::permissions::{self, FILE_MODE};
@@ -123,11 +123,24 @@ impl KnownPeers {
         tofu_enabled: bool,
         allowed_keys: &[String],
     ) -> TrustDecision {
+        let presented = normalize_public_key(public_key);
+
+        // Explicit pinning is authoritative. A peer that was previously
+        // accepted by TOFU must still be rejected if it is not now pinned.
+        if !allowed_keys.is_empty() {
+            let allowed = allowed_keys
+                .iter()
+                .any(|key| normalize_public_key(key) == presented);
+            if !allowed {
+                return TrustDecision::Rejected;
+            }
+        }
+
         let peers = self.peers.read();
 
         // Check if peer is already known
         if let Some(known) = peers.get(node_id) {
-            if known.public_key == public_key {
+            if normalize_public_key(&known.public_key) == presented {
                 return TrustDecision::Trusted;
             } else {
                 return TrustDecision::KeyMismatch {
@@ -136,13 +149,8 @@ impl KnownPeers {
             }
         }
 
-        // Peer is new - check allowed_keys first (enterprise mode)
         if !allowed_keys.is_empty() {
-            if allowed_keys.iter().any(|k| k == public_key) {
-                return TrustDecision::TofuAccepted; // Allowed by pinning
-            } else {
-                return TrustDecision::Rejected;
-            }
+            return TrustDecision::TofuAccepted; // Allowed by pinning
         }
 
         // No allowed_keys - use TOFU
@@ -205,6 +213,14 @@ impl KnownPeers {
     }
 }
 
+fn normalize_public_key(key: &str) -> String {
+    if let Some(value) = key.strip_prefix("ed25519:") {
+        format!("noise25519:{value}")
+    } else {
+        key.to_string()
+    }
+}
+
 /// Verify a peer and handle trust decision
 pub fn verify_peer(
     known_peers: &KnownPeers,
@@ -258,49 +274,69 @@ mod tests {
     #[test]
     fn test_new_peer_tofu_enabled() {
         let (_dir, kp) = setup();
-        let decision = kp.check_peer("node-b", "ed25519:abc123", true, &[]);
+        let decision = kp.check_peer("node-b", "noise25519:abc123", true, &[]);
         assert_eq!(decision, TrustDecision::TofuAccepted);
     }
 
     #[test]
     fn test_new_peer_tofu_disabled() {
         let (_dir, kp) = setup();
-        let decision = kp.check_peer("node-b", "ed25519:abc123", false, &[]);
+        let decision = kp.check_peer("node-b", "noise25519:abc123", false, &[]);
         assert_eq!(decision, TrustDecision::Rejected);
     }
 
     #[test]
     fn test_known_peer_trusted() {
         let (_dir, kp) = setup();
-        kp.add_peer("node-b", "ed25519:abc123").unwrap();
+        kp.add_peer("node-b", "noise25519:abc123").unwrap();
 
-        let decision = kp.check_peer("node-b", "ed25519:abc123", true, &[]);
+        let decision = kp.check_peer("node-b", "noise25519:abc123", true, &[]);
         assert_eq!(decision, TrustDecision::Trusted);
     }
 
     #[test]
     fn test_key_mismatch() {
         let (_dir, kp) = setup();
-        kp.add_peer("node-b", "ed25519:abc123").unwrap();
+        kp.add_peer("node-b", "noise25519:abc123").unwrap();
 
-        let decision = kp.check_peer("node-b", "ed25519:different", true, &[]);
+        let decision = kp.check_peer("node-b", "noise25519:different", true, &[]);
         assert!(matches!(decision, TrustDecision::KeyMismatch { .. }));
     }
 
     #[test]
     fn test_allowed_keys_accepts() {
         let (_dir, kp) = setup();
-        let allowed = vec!["ed25519:abc123".to_string()];
-        let decision = kp.check_peer("node-b", "ed25519:abc123", false, &allowed);
+        let allowed = vec!["noise25519:abc123".to_string()];
+        let decision = kp.check_peer("node-b", "noise25519:abc123", false, &allowed);
         assert_eq!(decision, TrustDecision::TofuAccepted);
     }
 
     #[test]
     fn test_allowed_keys_rejects() {
         let (_dir, kp) = setup();
-        let allowed = vec!["ed25519:other".to_string()];
-        let decision = kp.check_peer("node-b", "ed25519:abc123", false, &allowed);
+        let allowed = vec!["noise25519:other".to_string()];
+        let decision = kp.check_peer("node-b", "noise25519:abc123", false, &allowed);
         assert_eq!(decision, TrustDecision::Rejected);
+    }
+
+    #[test]
+    fn test_allowed_keys_override_existing_tofu_peer() {
+        let (_dir, kp) = setup();
+        kp.add_peer("node-b", "noise25519:abc123").unwrap();
+
+        let allowed = vec!["noise25519:other".to_string()];
+        let decision = kp.check_peer("node-b", "noise25519:abc123", true, &allowed);
+        assert_eq!(decision, TrustDecision::Rejected);
+    }
+
+    #[test]
+    fn test_legacy_ed25519_prefix_matches_noise25519_key() {
+        let (_dir, kp) = setup();
+        kp.add_peer("node-b", "ed25519:abc123").unwrap();
+
+        let allowed = vec!["noise25519:abc123".to_string()];
+        let decision = kp.check_peer("node-b", "noise25519:abc123", false, &allowed);
+        assert_eq!(decision, TrustDecision::Trusted);
     }
 
     #[test]
@@ -311,14 +347,14 @@ mod tests {
         // Add peer
         {
             let kp = KnownPeers::load_or_create(&path).unwrap();
-            kp.add_peer("node-b", "ed25519:abc123").unwrap();
+            kp.add_peer("node-b", "noise25519:abc123").unwrap();
         }
 
         // Reload and verify
         {
             let kp = KnownPeers::load_or_create(&path).unwrap();
             let peer = kp.get("node-b").unwrap();
-            assert_eq!(peer.public_key, "ed25519:abc123");
+            assert_eq!(peer.public_key, "noise25519:abc123");
         }
     }
 }

@@ -2,7 +2,8 @@ use reqwest::StatusCode;
 
 mod common;
 use common::{
-    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, setup_mock_script, wait_for_ready,
+    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, llamesh_binary, setup_mock_script,
+    wait_for_ready,
 };
 
 #[tokio::test]
@@ -14,13 +15,7 @@ async fn test_embeddings_and_rerank() {
     let mock_script = setup_mock_script(&root, "features").await;
     let config_path = root.join("tests/config_features.yaml");
     let cookbook_path = root.join("tests/cookbook_features.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"

@@ -16,8 +16,7 @@ where
     }
     shlex::split(&s).ok_or_else(|| {
         de::Error::custom(format!(
-            "Invalid shell syntax in llama_server_args: '{}'. Check for unmatched quotes.",
-            s
+            "Invalid shell syntax in llama_server_args: '{s}'. Check for unmatched quotes."
         ))
     })
 }
@@ -643,7 +642,7 @@ impl Profile {
         iter.any(|arg| {
             let normalized = arg.trim().to_ascii_lowercase();
             needles.iter().any(|needle| {
-                normalized == *needle || normalized.starts_with(&format!("{}=", needle))
+                normalized == *needle || normalized.starts_with(&format!("{needle}="))
             })
         })
     }

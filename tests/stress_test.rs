@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 mod common;
 use common::{
-    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, load_cookbook_fixture,
-    setup_mock_script, wait_for_ready,
+    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, llamesh_binary,
+    load_cookbook_fixture, setup_mock_script, wait_for_ready,
 };
 
 /// Retry a request up to `max_retries` times on transient errors
@@ -44,13 +44,7 @@ async fn test_stress_basic() {
     let mock_script = setup_mock_script(&root, "stress").await;
     let config_path = root.join("tests/config_stress.yaml");
     let cookbook_path = root.join("tests/cookbook_stress.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"
@@ -163,7 +157,7 @@ http:
 
     let duration = start.elapsed();
     println!("Total time: {:.2}s", duration.as_secs_f64());
-    println!("Successful: {}/{}", success, num_requests);
+    println!("Successful: {success}/{num_requests}");
     if success > 0 {
         println!(
             "Avg Latency: {:.2}ms",
@@ -179,11 +173,7 @@ http:
     let min_success = (num_requests * 3) / 4;
     assert!(
         success >= min_success,
-        "Expected at least 75% success ({}/{}), got {}/{}",
-        min_success,
-        num_requests,
-        success,
-        num_requests
+        "Expected at least 75% success ({min_success}/{num_requests}), got {success}/{num_requests}"
     );
 
     graceful_stop(&mut proxy_process).await;

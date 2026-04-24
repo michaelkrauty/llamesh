@@ -102,7 +102,7 @@ pub struct NodeState {
     pub noise_context: Option<Arc<NoiseContext>>,
     pub metrics: Arc<Metrics>,
     pub peers: Arc<RwLock<HashMap<String, PeerState>>>,
-    pub queues: Arc<RwLock<HashMap<String, VecDeque<oneshot::Sender<u64>>>>>,
+    pub queues: Arc<RwLock<HashMap<String, VecDeque<QueueEntry>>>>,
     /// Pending tokens for waiters who have been notified but haven't acquired a slot yet.
     /// Prevents fresh requests from bypassing queued waiters during the notification-to-acquisition window.
     pub pending_tokens: Arc<RwLock<HashMap<String, HashSet<u64>>>>,
@@ -140,6 +140,11 @@ pub struct NodeState {
 }
 
 use crate::security;
+
+pub struct QueueEntry {
+    token: u64,
+    tx: oneshot::Sender<u64>,
+}
 
 /// Drop-guard that decrements a per-peer pending-forward counter. Ensures the
 /// counter is always released on cancellation, error, or normal completion.
@@ -220,9 +225,9 @@ impl NodeState {
             config.cluster.circuit_breaker.clone(),
         ));
 
-        // Initialize noise protocol if enabled (server-side only)
+        // Initialize Noise protocol if enabled for cluster communication.
         let noise_context = if config.cluster.enabled && config.cluster.noise.enabled {
-            match crate::noise::initialize(&config.cluster.noise).await {
+            match crate::noise::initialize(&config.cluster.noise, config.node_id.clone()).await {
                 Ok(ctx) => {
                     info!(
                         pubkey = %ctx.public_key_display(),
@@ -231,8 +236,8 @@ impl NodeState {
                     Some(Arc::new(ctx))
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to initialize Noise Protocol, falling back to mTLS");
-                    None
+                    error!(error = %e, "Failed to initialize Noise Protocol");
+                    return Err(e.into());
                 }
             }
         } else {
@@ -383,7 +388,7 @@ impl NodeState {
             }
 
             let reason = match self
-                .resolve_model(&format!("{}:{}", model_name, profile_id))
+                .resolve_model(&format!("{model_name}:{profile_id}"))
                 .await
             {
                 // Whole model missing, model disabled, or profile removed: model_index
@@ -501,7 +506,7 @@ impl NodeState {
 
         // Pick best candidate: prefer one with model already loaded, then lowest queue
         candidates.sort_by(|a, b| {
-            let requested_key = format!("{}:{}", base_model, profile_id).to_lowercase();
+            let requested_key = format!("{base_model}:{profile_id}").to_lowercase();
             let loaded_a = a
                 .loaded_models
                 .iter()
@@ -647,7 +652,7 @@ impl NodeState {
     // Helper to update peak memory for instances of a model (based on learned/live values)
     async fn update_peak_memory(&self, model_name: &str, profile_id: &str) {
         let instances = self.instances.read().await;
-        let display_name = format!("{}:{}", model_name, profile_id);
+        let display_name = format!("{model_name}:{profile_id}");
 
         for inst_lock in instances.values() {
             let inst = inst_lock.read().await;
@@ -1089,6 +1094,7 @@ impl NodeState {
                 // There are waiters ahead of us - join the queue instead of trying to grab slot
                 let key = format!("{}:{}", model_name, profile.id);
                 let (tx, rx) = oneshot::channel();
+                let queue_token;
 
                 {
                     // LOCK_ORDER: queues (2)
@@ -1110,7 +1116,11 @@ impl NodeState {
                         info!(event = "queue_drop", reason = "full", model = %model_name);
                         return Err(NodeError::QueueFull);
                     }
-                    queue.push_back(tx);
+                    queue_token = self.pending_token_counter.fetch_add(1, Ordering::SeqCst);
+                    queue.push_back(QueueEntry {
+                        token: queue_token,
+                        tx,
+                    });
                     // Start queue wait timer on first enqueue
                     if queue_start.is_none() {
                         queue_start = Some(std::time::Instant::now());
@@ -1130,6 +1140,9 @@ impl NodeState {
                         let elapsed = loop_start.elapsed();
                         if elapsed >= timeout {
                             info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                            self.remove_queue_entry(&key, queue_token).await;
+                            self.remove_pending_token(model_name, &profile.id, queue_token)
+                                .await;
                             return Err(NodeError::QueueTimeout);
                         }
                         let remaining = timeout - elapsed;
@@ -1137,6 +1150,9 @@ impl NodeState {
                             Ok(result) => result,
                             Err(_) => {
                                 info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                                self.remove_queue_entry(&key, queue_token).await;
+                                self.remove_pending_token(model_name, &profile.id, queue_token)
+                                    .await;
                                 return Err(NodeError::QueueTimeout);
                             }
                         }
@@ -1149,7 +1165,12 @@ impl NodeState {
                         my_token = Some(token);
                         continue; // Now retry with priority token
                     }
-                    Err(_) => return Err(NodeError::QueueError),
+                    Err(_) => {
+                        self.remove_queue_entry(&key, queue_token).await;
+                        self.remove_pending_token(model_name, &profile.id, queue_token)
+                            .await;
+                        return Err(NodeError::QueueError);
+                    }
                 }
             }
 
@@ -1332,6 +1353,7 @@ impl NodeState {
 
                         let key = format!("{}:{}", model_name, profile.id);
                         let (tx, rx) = oneshot::channel();
+                        let queue_token;
 
                         {
                             // LOCK_ORDER: queues (2)
@@ -1354,7 +1376,11 @@ impl NodeState {
                                 info!(event = "queue_drop", reason = "full", model = %model_name);
                                 return Err(NodeError::QueueFull);
                             }
-                            queue.push_back(tx);
+                            queue_token = self.pending_token_counter.fetch_add(1, Ordering::SeqCst);
+                            queue.push_back(QueueEntry {
+                                token: queue_token,
+                                tx,
+                            });
                             // Start queue wait timer on first enqueue
                             if queue_start.is_none() {
                                 queue_start = Some(std::time::Instant::now());
@@ -1382,6 +1408,9 @@ impl NodeState {
                                 let elapsed = loop_start.elapsed();
                                 if elapsed >= timeout {
                                     info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                                    self.remove_queue_entry(&key, queue_token).await;
+                                    self.remove_pending_token(model_name, &profile.id, queue_token)
+                                        .await;
                                     return Err(NodeError::QueueTimeout);
                                 }
                                 let remaining = timeout - elapsed;
@@ -1389,6 +1418,13 @@ impl NodeState {
                                     Ok(result) => result,
                                     Err(_) => {
                                         info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                                        self.remove_queue_entry(&key, queue_token).await;
+                                        self.remove_pending_token(
+                                            model_name,
+                                            &profile.id,
+                                            queue_token,
+                                        )
+                                        .await;
                                         return Err(NodeError::QueueTimeout);
                                     }
                                 }
@@ -1401,7 +1437,12 @@ impl NodeState {
                                 my_token = Some(token);
                                 continue;
                             }
-                            Err(_) => return Err(NodeError::QueueError),
+                            Err(_) => {
+                                self.remove_queue_entry(&key, queue_token).await;
+                                self.remove_pending_token(model_name, &profile.id, queue_token)
+                                    .await;
+                                return Err(NodeError::QueueError);
+                            }
                         }
                     } else {
                         // Clean up token for non-retriable errors
@@ -2035,9 +2076,9 @@ impl NodeState {
                 };
                 if addr.starts_with("0.0.0.0") {
                     let port = addr.split(':').nth(1).unwrap_or("8080");
-                    format!("{}://127.0.0.1:{}", scheme, port)
+                    format!("{scheme}://127.0.0.1:{port}")
                 } else {
-                    format!("{}://{}", scheme, addr)
+                    format!("{scheme}://{addr}")
                 }
             });
 
@@ -2144,7 +2185,7 @@ impl NodeState {
     ) -> Option<PeerState> {
         let mut candidates = Vec::new();
         let requested_profile = profile.id.clone();
-        let requested_key = format!("{}:{}", model_name, requested_profile);
+        let requested_key = format!("{model_name}:{requested_profile}");
 
         // Add self only if we can serve requests locally
         // This excludes us when: draining or binary missing
@@ -2286,7 +2327,7 @@ impl NodeState {
     /// Check if there are pending waiters (either in queue or notified-but-not-yet-acquired)
     /// for a given model:profile. Used to ensure fresh requests don't bypass queued waiters.
     async fn has_pending_waiters(&self, model_name: &str, profile_id: &str) -> bool {
-        let key = format!("{}:{}", model_name, profile_id);
+        let key = format!("{model_name}:{profile_id}");
 
         // Check queue
         {
@@ -2313,7 +2354,7 @@ impl NodeState {
 
     /// Remove a pending token after waiter successfully acquires slot or times out.
     async fn remove_pending_token(&self, model_name: &str, profile_id: &str, token: u64) {
-        let key = format!("{}:{}", model_name, profile_id);
+        let key = format!("{model_name}:{profile_id}");
         let mut pending = self.pending_tokens.write().await;
         if let Some(set) = pending.get_mut(&key) {
             if set.remove(&token) {
@@ -2322,19 +2363,40 @@ impl NodeState {
         }
     }
 
+    /// Remove a queued waiter by its preassigned token. This is used on timeout
+    /// to avoid dead queue entries consuming per-model or global queue slots.
+    async fn remove_queue_entry(&self, key: &str, token: u64) -> bool {
+        let mut queues = self.queues.write().await;
+        let mut remove_empty_queue = false;
+        let removed = if let Some(queue) = queues.get_mut(key) {
+            let before = queue.len();
+            queue.retain(|entry| entry.token != token);
+            remove_empty_queue = queue.is_empty();
+            queue.len() != before
+        } else {
+            false
+        };
+
+        if remove_empty_queue {
+            queues.remove(key);
+        }
+
+        removed
+    }
+
     /// Notify one waiter for a specific model that capacity is available.
     /// Pops waiters from the queue until one successfully receives the notification.
-    /// Dropped/closed receivers are skipped. Generates a pending token for the notified waiter.
+    /// Dropped/closed receivers are skipped. Promotes the queued token to pending
+    /// for the notified waiter.
     pub async fn notify_queue(&self, model_name: &str, profile_id: &str) {
-        let key = format!("{}:{}", model_name, profile_id);
+        let key = format!("{model_name}:{profile_id}");
         // LOCK_ORDER: queues (2) - will release before pending_tokens (3)
         let mut queues = self.queues.write().await;
         if let Some(queue) = queues.get_mut(&key) {
-            while let Some(tx) = queue.pop_front() {
-                // Generate unique token for this notification (atomic, no lock needed)
-                let token = self.pending_token_counter.fetch_add(1, Ordering::SeqCst);
+            while let Some(entry) = queue.pop_front() {
+                let token = entry.token;
 
-                if tx.send(token).is_ok() {
+                if entry.tx.send(token).is_ok() {
                     // Successfully sent - add token to pending set
                     // LOCK_ORDER: Must drop queues (2) before acquiring pending_tokens (3)
                     drop(queues);
@@ -2357,9 +2419,9 @@ impl NodeState {
         let mut tokens_to_add: Vec<(String, u64)> = Vec::new();
 
         for (key, queue) in queues.iter_mut() {
-            while let Some(tx) = queue.pop_front() {
-                let token = self.pending_token_counter.fetch_add(1, Ordering::SeqCst);
-                if tx.send(token).is_ok() {
+            while let Some(entry) = queue.pop_front() {
+                let token = entry.token;
+                if entry.tx.send(token).is_ok() {
                     tokens_to_add.push((key.clone(), token));
                     info!(event = "queue_dequeue", model_key = %key, token = token);
                     break; // Wake one waiter per model
@@ -2407,7 +2469,7 @@ impl NodeState {
 
     /// Check if the given model has pending requests (in queue or pending tokens).
     pub async fn has_pending_for_model(&self, model: &str, profile: &str) -> bool {
-        let key = format!("{}:{}", model, profile);
+        let key = format!("{model}:{profile}");
         let queues = self.queues.read().await;
         let has_queue = queues.get(&key).map(|q| !q.is_empty()).unwrap_or(false);
         if has_queue {
@@ -2669,7 +2731,7 @@ impl NodeState {
 }
 
 fn peer_supports_profile(peer: &PeerState, model_name: &str, profile_id: &str) -> bool {
-    let requested = format!("{}:{}", model_name, profile_id);
+    let requested = format!("{model_name}:{profile_id}");
     peer.supported_models.iter().any(|entry| {
         entry.eq_ignore_ascii_case(&requested)
             || (entry.eq_ignore_ascii_case(model_name) && profile_id == "default")
@@ -3110,6 +3172,56 @@ mod tests {
         assert!(result.is_some());
         let picked = result.unwrap();
         assert_eq!(picked.node_id, "remote-peer");
+    }
+
+    #[tokio::test]
+    async fn notify_queue_promotes_preassigned_queue_token() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+
+        let key = "test:default".to_string();
+        let token = 42;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut queues = state.queues.write().await;
+            queues.insert(key.clone(), VecDeque::from([QueueEntry { token, tx }]));
+        }
+
+        state.notify_queue("test", "default").await;
+
+        assert_eq!(rx.await.unwrap(), token);
+        let queues = state.queues.read().await;
+        assert!(queues.get(&key).is_some_and(|queue| queue.is_empty()));
+        drop(queues);
+
+        let pending = state.pending_tokens.read().await;
+        assert!(pending.get(&key).is_some_and(|set| set.contains(&token)));
+    }
+
+    #[tokio::test]
+    async fn remove_queue_entry_drops_empty_queue() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+
+        let key = "test:default".to_string();
+        let token = 43;
+        let (tx, _rx) = oneshot::channel();
+        {
+            let mut queues = state.queues.write().await;
+            queues.insert(key.clone(), VecDeque::from([QueueEntry { token, tx }]));
+        }
+
+        assert!(state.remove_queue_entry(&key, token).await);
+        let queues = state.queues.read().await;
+        assert!(!queues.contains_key(&key));
     }
 
     #[tokio::test]
@@ -3649,8 +3761,7 @@ mod tests {
         let cost = calculate_cold_start_cost(&peer, 4000, 8000);
         assert!(
             (cost - 30.0).abs() < 0.1,
-            "Expected 30 for cold start, got {}",
-            cost
+            "Expected 30 for cold start, got {cost}"
         );
     }
 
@@ -3685,8 +3796,7 @@ mod tests {
         let cost = calculate_cold_start_cost(&peer, 0, 0);
         assert!(
             (cost - 30.0).abs() < 0.1,
-            "Expected 30 for unknown memory, got {}",
-            cost
+            "Expected 30 for unknown memory, got {cost}"
         );
     }
 
@@ -3722,8 +3832,7 @@ mod tests {
         // Should be: 500 (base) + N * 200 (per instance)
         assert!(
             cost >= 500.0,
-            "Expected eviction penalty >= 500, got {}",
-            cost
+            "Expected eviction penalty >= 500, got {cost}"
         );
         assert!(cost < 10000.0, "Should not be cannot-fit penalty");
     }
@@ -3759,8 +3868,7 @@ mod tests {
         let cost = calculate_cold_start_cost(&peer, 32000, 0);
         assert!(
             (cost - 10000.0).abs() < 0.1,
-            "Expected 10000 for cannot-fit, got {}",
-            cost
+            "Expected 10000 for cannot-fit, got {cost}"
         );
     }
 
@@ -3847,9 +3955,7 @@ mod tests {
         // IDLE loaded node should still win (TPS bonus + no cold start)
         assert!(
             loaded_score < unloaded_score,
-            "Idle loaded node ({}) should score better than idle unloaded ({})",
-            loaded_score,
-            unloaded_score
+            "Idle loaded node ({loaded_score}) should score better than idle unloaded ({unloaded_score})"
         );
     }
 
@@ -3937,9 +4043,7 @@ mod tests {
         // Cold-starting on idle node is better than queuing behind busy instance
         assert!(
             unloaded_score < loaded_score,
-            "Idle unloaded node ({}) should score better than busy loaded ({})",
-            unloaded_score,
-            loaded_score
+            "Idle unloaded node ({unloaded_score}) should score better than busy loaded ({loaded_score})"
         );
     }
 
@@ -4008,9 +4112,7 @@ mod tests {
         // Idle should score better (lower)
         assert!(
             idle_score < busy_score,
-            "Idle node ({}) should score better than busy ({})",
-            idle_score,
-            busy_score
+            "Idle node ({idle_score}) should score better than busy ({busy_score})"
         );
     }
 
@@ -4077,9 +4179,7 @@ mod tests {
         // Fast should score better (lower)
         assert!(
             fast_score < slow_score,
-            "Fast node ({}) should score better than slow ({})",
-            fast_score,
-            slow_score
+            "Fast node ({fast_score}) should score better than slow ({slow_score})"
         );
     }
 
@@ -4138,9 +4238,7 @@ mod tests {
         // be strictly higher so routing will diversify to other candidates.
         assert!(
             effective_score > naive_score,
-            "pending-forward adjustment must raise score: naive={} effective={}",
-            naive_score,
-            effective_score
+            "pending-forward adjustment must raise score: naive={naive_score} effective={effective_score}"
         );
         assert!(
             (effective_score - naive_score - 250.0).abs() < 1e-6,
