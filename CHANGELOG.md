@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Optional per-profile `estimated_vram_mb` and `estimated_sysmem_mb` cookbook
+  fields provide cold-start admission hints until runtime memory sampling learns
+  measured peaks for a launch-args hash.
+- Node resource metrics now expose llamesh-tracked VRAM/sysmem, device-wide VRAM,
+  external VRAM, effective admission-control usage, and GPU telemetry
+  availability in Prometheus and JSON metrics.
+
+### Fixed
+
+- VRAM admission now accounts for device-wide GPU memory usage reported by NVML,
+  including memory used by processes outside llamesh. External VRAM is treated
+  as non-evictable usage, so spawn and eviction decisions no longer assume the
+  configured `max_vram_mb` budget is entirely available to llamesh-managed
+  `llama-server` instances.
+- Cluster gossip now advertises VRAM availability after external GPU consumers
+  are included, preventing peers from routing cold starts to nodes whose real
+  GPU headroom is already consumed.
+
 ## [1.1.3] - 2026-04-21
 
 ### Fixed

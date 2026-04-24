@@ -28,7 +28,7 @@ async fn test_standalone_proxy() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9190"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
 model_defaults:
@@ -149,7 +149,7 @@ async fn test_cluster_proxy() {
 node_id: "node-a"
 listen_addr: "127.0.0.1:9192"
 public_url: "http://127.0.0.1:9192"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "model-a:default"
 model_defaults:
@@ -212,7 +212,7 @@ models:
 node_id: "node-b"
 listen_addr: "127.0.0.1:9193"
 public_url: "http://127.0.0.1:9193"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "model-b:default"
 model_defaults:
@@ -349,7 +349,7 @@ async fn test_disabled_model() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9094"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "enabled-model:default"
 model_defaults:
@@ -483,7 +483,7 @@ async fn test_token_counting() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9195"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
 model_defaults:
@@ -663,7 +663,7 @@ async fn test_instance_auth() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9197"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "auth-model:default"
 model_defaults:
@@ -776,7 +776,7 @@ async fn test_crash_recovery() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9198"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "crash-model:default"
 model_defaults:
@@ -926,7 +926,7 @@ async fn test_queueing() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9199"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "queue-model:default"
 model_defaults:
@@ -1082,7 +1082,7 @@ async fn test_hop_counter_validation() {
         r#"
 node_id: "test-node-hops"
 listen_addr: "127.0.0.1:9201"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
 max_hops: 5

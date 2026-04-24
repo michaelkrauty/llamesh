@@ -10,7 +10,7 @@ Point any OpenAI-compatible client at llamesh and it handles the rest: spinning 
 - **Automatic instance management** — on-demand spawn, idle eviction, health monitoring
 - **Multi-node mesh** — zero-config LAN discovery (mDNS) or explicit WAN peers, encrypted with Noise Protocol
 - **Model profiles** — configure multiple profiles per model (e.g. `fast` vs `quality`) with different llama-server args
-- **Resource guardrails** — VRAM and system memory tracking prevents OOM
+- **Resource guardrails** — device-wide VRAM telemetry and system memory tracking prevent OOM
 - **Hot-reload cookbook** — add/modify models without restarting
 - **Auto-build llama.cpp** — clones, builds, smoke tests, and atomically swaps binaries
 - **Hugging Face integration** — download models automatically via `hf_repo`/`hf_file`
@@ -46,6 +46,9 @@ llama_cpp:
     - "-DGGML_CUDA=ON"
   enabled: true
 ```
+
+When NVIDIA NVML is available, llamesh counts device-wide VRAM usage against
+`max_vram_mb`, including GPU memory used by processes it does not manage.
 
 Create a `cookbook.yaml` with your models:
 

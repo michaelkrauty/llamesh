@@ -30,6 +30,7 @@ use tracing::{Instrument, Span};
 
 // ... [Handlers remain unchanged, skipped for brevity] ...
 async fn metrics_handler(State(state): State<Arc<NodeState>>) -> String {
+    let _ = state.calculate_resource_snapshot().await;
     metrics::render_prometheus_with_circuit_breaker(&state.metrics, Some(&state.circuit_breaker))
         .await
 }
@@ -133,6 +134,7 @@ fn spawn_force_exit_listener() {
 async fn metrics_json_handler(
     State(state): State<Arc<NodeState>>,
 ) -> Json<metrics::MetricsSnapshot> {
+    let _ = state.calculate_resource_snapshot().await;
     let version = state.build_manager.get_version().await;
     let build_status = state.build_manager.build_status();
     Json(

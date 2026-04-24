@@ -56,8 +56,12 @@ pub async fn readyz(state: axum::extract::State<Arc<NodeState>>) -> impl IntoRes
     }
     drop(cookbook);
 
-    // Report actual resource availability instead of hardcoded true
-    let can_spawn = state.build_manager.can_serve();
+    // Report coarse actual resource availability. Per-profile admission still
+    // performs the definitive check with model-specific memory estimates.
+    let (current_vram, current_sysmem) = state.calculate_current_load().await;
+    let can_spawn = state.build_manager.can_serve()
+        && current_vram < state.config.max_vram_mb
+        && current_sysmem < state.config.max_sysmem_mb;
 
     (
         StatusCode::OK,

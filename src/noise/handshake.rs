@@ -245,6 +245,7 @@ mod tests {
 
     /// Test-only methods for NoiseSession
     #[cfg(test)]
+    #[allow(dead_code)]
     impl NoiseSession {
         /// Get the peer's public key in display format (test-only)
         pub fn peer_public_key_display(&self) -> String {

@@ -26,7 +26,7 @@ async fn start_mock_node(suffix: &str, port_offset: u16) -> (tokio::process::Chi
         r#"
 node_id: "{}"
 listen_addr: "{}"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
 model_defaults:

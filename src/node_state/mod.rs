@@ -10,8 +10,8 @@ use crate::build_manager::BuildManager;
 use crate::config::{Cookbook, ModelDefaults, NodeConfig, Profile};
 use crate::discovery::Discovery;
 use crate::instance::{compute_args_hash, Instance, InstanceStatus};
-use crate::memory_sampler::MemorySampler;
-use crate::metrics::Metrics;
+use crate::memory_sampler::{GpuMemorySnapshot, MemorySampler};
+use crate::metrics::{Metrics, NodeResourceMetricsSnapshot};
 use crate::noise::NoiseContext;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -146,6 +146,45 @@ use crate::security;
 pub struct PeerForwardGuard {
     counter: Arc<AtomicUsize>,
     released: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceSnapshot {
+    pub llamesh_vram_mb: u64,
+    pub llamesh_sysmem_mb: u64,
+    pub external_vram_mb: u64,
+    pub effective_vram_mb: u64,
+    pub effective_sysmem_mb: u64,
+    pub device_vram_used_mb: u64,
+    pub device_vram_total_mb: u64,
+    pub gpu_telemetry_available: bool,
+}
+
+impl ResourceSnapshot {
+    fn from_samples(
+        llamesh_vram_mb: u64,
+        llamesh_sysmem_mb: u64,
+        device_vram: Option<GpuMemorySnapshot>,
+    ) -> Self {
+        let (device_vram_used_mb, device_vram_total_mb, gpu_telemetry_available) = match device_vram
+        {
+            Some(snapshot) => (snapshot.used_mb, snapshot.total_mb, true),
+            None => (0, 0, false),
+        };
+        let external_vram_mb = device_vram_used_mb.saturating_sub(llamesh_vram_mb);
+        let effective_vram_mb = llamesh_vram_mb + external_vram_mb;
+
+        Self {
+            llamesh_vram_mb,
+            llamesh_sysmem_mb,
+            external_vram_mb,
+            effective_vram_mb,
+            effective_sysmem_mb: llamesh_sysmem_mb,
+            device_vram_used_mb,
+            device_vram_total_mb,
+            gpu_telemetry_available,
+        }
+    }
 }
 
 impl PeerForwardGuard {
@@ -418,7 +457,12 @@ impl NodeState {
             .unwrap_or_default()
             .as_secs();
 
-        let timeout = self.config.cluster.gossip_interval_seconds.saturating_mul(3).max(15);
+        let timeout = self
+            .config
+            .cluster
+            .gossip_interval_seconds
+            .saturating_mul(3)
+            .max(15);
 
         // Parse model:profile from request
         let parts: Vec<&str> = model_name.split(':').collect();
@@ -512,8 +556,25 @@ impl NodeState {
         None
     }
 
-    pub async fn calculate_current_load(&self) -> (u64, u64) {
+    pub async fn calculate_resource_snapshot(&self) -> ResourceSnapshot {
         let instances = self.instances.read().await;
+        let snapshot = self
+            .calculate_resource_snapshot_for_instances(&instances)
+            .await;
+        drop(instances);
+        self.observe_resource_snapshot(&snapshot);
+        snapshot
+    }
+
+    pub async fn calculate_current_load(&self) -> (u64, u64) {
+        let snapshot = self.calculate_resource_snapshot().await;
+        (snapshot.effective_vram_mb, snapshot.effective_sysmem_mb)
+    }
+
+    async fn calculate_resource_snapshot_for_instances(
+        &self,
+        instances: &HashMap<String, Arc<RwLock<Instance>>>,
+    ) -> ResourceSnapshot {
         let mut vram = 0;
         let mut sysmem = 0;
 
@@ -523,7 +584,21 @@ impl NodeState {
             vram += v;
             sysmem += s;
         }
-        (vram, sysmem)
+        ResourceSnapshot::from_samples(vram, sysmem, self.memory_sampler.sample_device_vram())
+    }
+
+    fn observe_resource_snapshot(&self, snapshot: &ResourceSnapshot) {
+        self.metrics
+            .observe_node_resources(NodeResourceMetricsSnapshot {
+                llamesh_vram_mb: snapshot.llamesh_vram_mb,
+                llamesh_sysmem_mb: snapshot.llamesh_sysmem_mb,
+                external_vram_mb: snapshot.external_vram_mb,
+                effective_vram_mb: snapshot.effective_vram_mb,
+                effective_sysmem_mb: snapshot.effective_sysmem_mb,
+                device_vram_used_mb: snapshot.device_vram_used_mb,
+                device_vram_total_mb: snapshot.device_vram_total_mb,
+                gpu_telemetry_available: snapshot.gpu_telemetry_available,
+            });
     }
 
     /// Get memory estimate for an instance. Prefers live sample, falls back to learned values.
@@ -546,20 +621,24 @@ impl NodeState {
     }
 
     /// Get memory estimate for spawning a new instance with given args_hash.
-    async fn get_memory_estimate(&self, args_hash: &str) -> (u64, u64) {
+    async fn get_memory_estimate(&self, args_hash: &str, profile: &Profile) -> (u64, u64) {
         if let Some((vram, sysmem)) = self.metrics.get_learned_memory(args_hash).await {
             (vram, sysmem)
         } else {
-            // Unknown args - return 0, will learn after spawn
-            (0, 0)
+            (
+                profile.estimated_vram_mb.unwrap_or(0),
+                profile.estimated_sysmem_mb.unwrap_or(0),
+            )
         }
     }
 
     /// Get memory estimate for a model:profile key (for routing decisions).
     /// Returns (vram_mb, sysmem_mb) - (0, 0) if unknown.
     async fn get_memory_estimate_for_key(&self, key: &str) -> (u64, u64) {
-        if let Some(args_hash) = self.get_args_hash_for_key(key).await {
-            self.get_memory_estimate(&args_hash).await
+        if let Some((_, profile)) = self.resolve_model(key).await {
+            let (pre_args, _, _) = build_pre_args(&profile);
+            let args_hash = compute_args_hash(&pre_args);
+            self.get_memory_estimate(&args_hash, &profile).await
         } else {
             (0, 0)
         }
@@ -647,9 +726,6 @@ impl NodeState {
         required_vram: u64,
         required_sysmem: u64,
     ) -> Result<Vec<String>, NodeError> {
-        let mut curr_vram = 0;
-        let mut curr_sysmem = 0;
-
         struct Candidate {
             id: String,
             last_activity: std::time::Instant,
@@ -658,13 +734,16 @@ impl NodeState {
         }
 
         let mut candidates = Vec::new();
+        let resource_snapshot = self
+            .calculate_resource_snapshot_for_instances(instances_map)
+            .await;
+        self.observe_resource_snapshot(&resource_snapshot);
+        let mut curr_vram = resource_snapshot.effective_vram_mb;
+        let mut curr_sysmem = resource_snapshot.effective_sysmem_mb;
 
         for (id, inst_lock) in instances_map.iter() {
             let inst = inst_lock.read().await;
             let (inst_vram, inst_sysmem) = self.get_memory_for_instance(&inst).await;
-
-            curr_vram += inst_vram;
-            curr_sysmem += inst_sysmem;
 
             // Can only evict idle instances
             if inst.in_flight_requests == 0 {
@@ -690,8 +769,8 @@ impl NodeState {
         let mut victims = Vec::new();
 
         for candidate in candidates {
-            curr_vram -= candidate.vram;
-            curr_sysmem -= candidate.sysmem;
+            curr_vram = curr_vram.saturating_sub(candidate.vram);
+            curr_sysmem = curr_sysmem.saturating_sub(candidate.sysmem);
             victims.push(candidate.id);
 
             if curr_vram + required_vram <= max_vram && curr_sysmem + required_sysmem <= max_sysmem
@@ -706,6 +785,10 @@ impl NodeState {
             event = "insufficient_resources",
             curr_vram_mb = curr_vram,
             curr_sysmem_mb = curr_sysmem,
+            llamesh_vram_mb = resource_snapshot.llamesh_vram_mb,
+            external_vram_mb = resource_snapshot.external_vram_mb,
+            device_vram_used_mb = resource_snapshot.device_vram_used_mb,
+            gpu_telemetry_available = resource_snapshot.gpu_telemetry_available,
             required_vram_mb = required_vram,
             required_sysmem_mb = required_sysmem,
             max_vram_mb = max_vram,
@@ -1264,7 +1347,8 @@ impl NodeState {
                             }
 
                             let queue = queues.entry(key.clone()).or_insert_with(VecDeque::new);
-                            let max_queue = profile.effective_max_queue_size(&self.config.model_defaults);
+                            let max_queue =
+                                profile.effective_max_queue_size(&self.config.model_defaults);
                             // 0 = unlimited queue size
                             if max_queue > 0 && queue.len() >= max_queue {
                                 info!(event = "queue_drop", reason = "full", model = %model_name);
@@ -1285,7 +1369,10 @@ impl NodeState {
                         }
 
                         // Track that this model needs eviction to spawn (outside queues lock)
-                        if matches!(e, NodeError::InsufficientResources | NodeError::MaxInstancesNode) {
+                        if matches!(
+                            e,
+                            NodeError::InsufficientResources | NodeError::MaxInstancesNode
+                        ) {
                             self.needs_eviction.write().await.insert(key.clone());
                         }
 
@@ -1355,7 +1442,10 @@ impl NodeState {
 
             // FAIRNESS: Re-check pending waiters under lock to close TOCTOU gap.
             // Fresh requests (no priority token) must yield if notified waiters exist.
-            if reserve_slot && !has_priority_token && self.has_pending_waiters(model_name, &profile.id).await {
+            if reserve_slot
+                && !has_priority_token
+                && self.has_pending_waiters(model_name, &profile.id).await
+            {
                 return Err(NodeError::YieldToWaiters);
             }
 
@@ -1406,7 +1496,10 @@ impl NodeState {
             // 2. Check for existing available instance (pick fewest in-flight)
             // Skip instances marked as draining (e.g., after a binary swap) — they should
             // only finish their in-flight requests and then be terminated.
-            let max_concurrent = self.config.model_defaults.max_concurrent_requests_per_instance;
+            let max_concurrent = self
+                .config
+                .model_defaults
+                .max_concurrent_requests_per_instance;
             let mut best_instance: Option<Arc<tokio::sync::RwLock<Instance>>> = None;
             let mut best_in_flight = usize::MAX;
             for inst_lock in instances_map.values() {
@@ -1419,8 +1512,8 @@ impl NodeState {
                         if inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
                             continue;
                         }
-                        let has_capacity = max_concurrent == 0
-                            || inst.in_flight_requests < max_concurrent;
+                        let has_capacity =
+                            max_concurrent == 0 || inst.in_flight_requests < max_concurrent;
                         if has_capacity && inst.in_flight_requests < best_in_flight {
                             best_in_flight = inst.in_flight_requests;
                             best_instance = Some(inst_lock.clone());
@@ -1439,8 +1532,8 @@ impl NodeState {
             if let Some(inst_lock) = best_instance {
                 let mut inst = inst_lock.write().await;
                 // Re-check capacity and draining after upgrading to write lock
-                let still_has_capacity = max_concurrent == 0
-                    || inst.in_flight_requests < max_concurrent;
+                let still_has_capacity =
+                    max_concurrent == 0 || inst.in_flight_requests < max_concurrent;
                 let is_draining = inst.draining.load(std::sync::atomic::Ordering::Relaxed);
                 if still_has_capacity && inst.is_alive() && !is_draining {
                     inst.in_flight_requests += 1;
@@ -1467,7 +1560,8 @@ impl NodeState {
             // This is needed before pick_victims to know required memory
             let (pre_args, _model_arg_present, _hf_repo_arg_present) = build_pre_args(profile);
             let args_hash = compute_args_hash(&pre_args);
-            let (required_vram, required_sysmem) = self.get_memory_estimate(&args_hash).await;
+            let (required_vram, required_sysmem) =
+                self.get_memory_estimate(&args_hash, profile).await;
 
             // 4. Check Memory, Node Guardrails & Identify Victims
             let mut victims = self
@@ -1729,7 +1823,8 @@ impl NodeState {
 
             let inst_clone = inst_arc.clone();
             let startup_timeout = profile.effective_startup_timeout_seconds();
-            let eviction_tenure_secs = profile.effective_min_eviction_tenure_secs(&self.config.model_defaults);
+            let eviction_tenure_secs =
+                profile.effective_min_eviction_tenure_secs(&self.config.model_defaults);
             let api_key = final_args
                 .iter()
                 .position(|arg| arg == "--api-key")
@@ -1765,7 +1860,10 @@ impl NodeState {
                     // Set eviction tenure — instance cannot be drained by competitors until this expires
                     {
                         let mut evictable = inst.evictable_after.lock();
-                        *evictable = Some(std::time::Instant::now() + std::time::Duration::from_secs(eviction_tenure_secs));
+                        *evictable = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(eviction_tenure_secs),
+                        );
                     }
 
                     // Clear needs_eviction — this model no longer needs eviction to spawn
@@ -1815,7 +1913,7 @@ impl NodeState {
     }
 
     pub async fn get_self_peer_state(&self) -> PeerState {
-        let (curr_vram, curr_sysmem) = self.calculate_current_load().await;
+        let resources = self.calculate_resource_snapshot().await;
         let instances = self.instances.read().await;
         let active_instances = instances.len();
         let max_instances = self.config.max_instances_per_node;
@@ -1844,10 +1942,21 @@ impl NodeState {
                 let (tps, vram_mb, sysmem_mb) =
                     if let Some(args_hash) = self.get_args_hash_for_key(key).await {
                         let hash_metrics = self.metrics.get_hash_metrics(&args_hash).await;
+                        let (estimated_vram, estimated_sysmem) =
+                            self.get_memory_estimate_for_key(key).await;
+                        let has_learned_memory = self.metrics.has_memory_data(&args_hash).await;
                         (
                             hash_metrics.tokens_per_second(),
-                            hash_metrics.peak_vram_mb.load(Ordering::Relaxed),
-                            hash_metrics.peak_sysmem_mb.load(Ordering::Relaxed),
+                            if has_learned_memory {
+                                hash_metrics.peak_vram_mb.load(Ordering::Relaxed)
+                            } else {
+                                estimated_vram
+                            },
+                            if has_learned_memory {
+                                hash_metrics.peak_sysmem_mb.load(Ordering::Relaxed)
+                            } else {
+                                estimated_sysmem
+                            },
                         )
                     } else {
                         (0.0, 0, 0)
@@ -1872,10 +1981,21 @@ impl NodeState {
                 let (tps, vram_mb, sysmem_mb) =
                     if let Some(args_hash) = self.get_args_hash_for_key(key).await {
                         let hash_metrics = self.metrics.get_hash_metrics(&args_hash).await;
+                        let (estimated_vram, estimated_sysmem) =
+                            self.get_memory_estimate_for_key(key).await;
+                        let has_learned_memory = self.metrics.has_memory_data(&args_hash).await;
                         (
                             hash_metrics.tokens_per_second(),
-                            hash_metrics.peak_vram_mb.load(Ordering::Relaxed),
-                            hash_metrics.peak_sysmem_mb.load(Ordering::Relaxed),
+                            if has_learned_memory {
+                                hash_metrics.peak_vram_mb.load(Ordering::Relaxed)
+                            } else {
+                                estimated_vram
+                            },
+                            if has_learned_memory {
+                                hash_metrics.peak_sysmem_mb.load(Ordering::Relaxed)
+                            } else {
+                                estimated_sysmem
+                            },
                         )
                     } else {
                         (0.0, 0, 0)
@@ -1957,8 +2077,20 @@ impl NodeState {
             active_instances,
             max_instances,
             current_requests: self.metrics.current_requests.load(Ordering::Relaxed),
-            available_vram: self.config.max_vram_mb.saturating_sub(curr_vram),
-            available_sysmem: self.config.max_sysmem_mb.saturating_sub(curr_sysmem),
+            available_vram: self
+                .config
+                .max_vram_mb
+                .saturating_sub(resources.effective_vram_mb),
+            available_sysmem: self
+                .config
+                .max_sysmem_mb
+                .saturating_sub(resources.effective_sysmem_mb),
+            llamesh_vram_mb: resources.llamesh_vram_mb,
+            llamesh_sysmem_mb: resources.llamesh_sysmem_mb,
+            external_vram_mb: resources.external_vram_mb,
+            device_vram_used_mb: resources.device_vram_used_mb,
+            device_vram_total_mb: resources.device_vram_total_mb,
+            gpu_telemetry_available: resources.gpu_telemetry_available,
             max_vram: self.config.max_vram_mb,
             max_sysmem: self.config.max_sysmem_mb,
             total_queue_length,
@@ -2007,8 +2139,6 @@ impl NodeState {
         profile: &Profile,
         prefer_local: bool,
     ) -> Option<PeerState> {
-        let (_curr_vram, _curr_sysmem) = self.calculate_current_load().await;
-
         let mut candidates = Vec::new();
         let requested_profile = profile.id.clone();
         let requested_key = format!("{}:{}", model_name, requested_profile);
@@ -2041,7 +2171,12 @@ impl NodeState {
             .as_secs();
 
         // 3x gossip interval as timeout, minimum 15s
-        let timeout = self.config.cluster.gossip_interval_seconds.saturating_mul(3).max(15);
+        let timeout = self
+            .config
+            .cluster
+            .gossip_interval_seconds
+            .saturating_mul(3)
+            .max(15);
 
         for peer in peers.values() {
             if now.saturating_sub(peer.last_seen) > timeout {
@@ -2115,10 +2250,7 @@ impl NodeState {
                 let effective_current = if is_self {
                     c.current_requests.saturating_sub(total_pending as u64)
                 } else {
-                    let pending = pending_snapshot
-                        .get(&c.node_id)
-                        .copied()
-                        .unwrap_or(0) as u64;
+                    let pending = pending_snapshot.get(&c.node_id).copied().unwrap_or(0) as u64;
                     c.current_requests.saturating_add(pending)
                 };
                 let score = calculate_node_score(
@@ -2130,12 +2262,13 @@ impl NodeState {
                 (c, score)
             })
             .collect();
-        scored.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         if let Some((chosen, _)) = scored.first() {
-            let scores: Vec<String> = scored.iter().map(|(c, s)| format!("{}={:.0}", c.node_id, s)).collect();
+            let scores: Vec<String> = scored
+                .iter()
+                .map(|(c, s)| format!("{}={:.0}", c.node_id, s))
+                .collect();
             info!(
                 event = "route_decision",
                 chosen_node = %chosen.node_id,
@@ -2289,25 +2422,31 @@ impl NodeState {
         let instances = self.instances.read().await;
         for inst_lock in instances.values() {
             let inst = inst_lock.read().await;
-            if inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                if !self.has_queued_competitors_needing_eviction(&inst.model_name).await {
-                    inst.draining.store(false, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        event = "drain_cancelled",
-                        model = %inst.model_name,
-                        profile = %inst.profile_id,
-                        instance_id = %inst.id,
-                        "Drain cancelled — no more competitors needing eviction"
-                    );
-                    drop(inst);
-                    // Wake the model's own queue so pending requests can be dispatched
-                    let model_name = inst_lock.read().await.model_name.clone();
-                    let profile_id = inst_lock.read().await.profile_id.clone();
-                    drop(instances);
-                    self.notify_queue(&model_name, &profile_id).await;
-                    return; // Released instances lock, must restart iteration
-                }
+            if !inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
             }
+            if self
+                .has_queued_competitors_needing_eviction(&inst.model_name)
+                .await
+            {
+                continue;
+            }
+
+            inst.draining
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let model_name = inst.model_name.clone();
+            let profile_id = inst.profile_id.clone();
+            info!(
+                event = "drain_cancelled",
+                model = %model_name,
+                profile = %profile_id,
+                instance_id = %inst.id,
+                "Drain cancelled — no more competitors needing eviction"
+            );
+            drop(inst);
+            drop(instances);
+            self.notify_queue(&model_name, &profile_id).await;
+            return; // Released instances lock, must restart iteration
         }
     }
 
@@ -2318,6 +2457,7 @@ impl NodeState {
 
             // Memory sampling: update learned memory with peak values
             self.sample_all_instance_memory().await;
+            let _ = self.calculate_resource_snapshot().await;
 
             // Eviction
             if let Err(e) = self.check_idle_instances().await {
@@ -2570,8 +2710,8 @@ fn calculate_node_score(
     // Calculate base load score (penalizes busy nodes)
     // Per-request penalty increased from 10 to 50 so that 1 busy instance
     // on a warm node makes cold-starting on an idle node more attractive.
-    let load_score = (peer.total_queue_length as f64 * 50.0)
-        + (effective_current_requests as f64 * 50.0);
+    let load_score =
+        (peer.total_queue_length as f64 * 50.0) + (effective_current_requests as f64 * 50.0);
 
     // Calculate cold start cost
     let cold_start_cost = if model_loaded {
@@ -2711,6 +2851,7 @@ mod tests {
     use super::*;
     use crate::build_manager::BuildManager;
     use crate::config::{ClusterConfig, HttpConfig, LlamaCppConfig, Model, ModelDefaults};
+    use crate::memory_sampler::{GpuDeviceMemory, GpuMemorySnapshot};
 
     fn sample_peer(supported: Vec<&str>) -> PeerState {
         PeerState {
@@ -2724,6 +2865,12 @@ mod tests {
             current_requests: 0,
             available_vram: 1,
             available_sysmem: 1,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -2763,6 +2910,8 @@ mod tests {
             idle_timeout_seconds: 0,
             max_instances: Some(1),
             llama_server_args: Vec::new(),
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
             max_wait_in_queue_ms: None,
             max_request_duration_ms: None,
             startup_timeout_seconds: None,
@@ -2781,6 +2930,40 @@ mod tests {
             max_request_duration_ms: 300_000,
             min_eviction_tenure_secs: 15,
         }
+    }
+
+    fn gpu_snapshot(used_mb: u64, total_mb: u64) -> GpuMemorySnapshot {
+        GpuMemorySnapshot {
+            used_mb,
+            free_mb: total_mb.saturating_sub(used_mb),
+            total_mb,
+            devices: vec![GpuDeviceMemory {
+                index: 0,
+                used_mb,
+                free_mb: total_mb.saturating_sub(used_mb),
+                total_mb,
+            }],
+        }
+    }
+
+    #[test]
+    fn resource_snapshot_includes_external_vram() {
+        let snapshot =
+            ResourceSnapshot::from_samples(6000, 1200, Some(gpu_snapshot(10_000, 24_000)));
+
+        assert_eq!(snapshot.llamesh_vram_mb, 6000);
+        assert_eq!(snapshot.external_vram_mb, 4000);
+        assert_eq!(snapshot.effective_vram_mb, 10_000);
+        assert_eq!(snapshot.effective_sysmem_mb, 1200);
+        assert!(snapshot.gpu_telemetry_available);
+    }
+
+    #[test]
+    fn resource_snapshot_keeps_tracked_peak_when_device_sample_is_lower() {
+        let snapshot = ResourceSnapshot::from_samples(6000, 1200, Some(gpu_snapshot(5000, 24_000)));
+
+        assert_eq!(snapshot.external_vram_mb, 0);
+        assert_eq!(snapshot.effective_vram_mb, 6000);
     }
 
     #[test]
@@ -2897,6 +3080,12 @@ mod tests {
             current_requests: 0,
             available_vram: 10000,
             available_sysmem: 10000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -2937,6 +3126,9 @@ mod tests {
         let state = NodeState::new(config, cookbook, build_manager)
             .await
             .unwrap();
+        state
+            .memory_sampler
+            .set_device_vram_override(Some(gpu_snapshot(300, 1024)));
 
         // Set up learned memory for the test args_hash (100MB VRAM each)
         let test_args_hash = "test_args_hash".to_string();
@@ -3068,11 +3260,139 @@ mod tests {
         let state = NodeState::new(config, cookbook, build_manager)
             .await
             .unwrap();
+        state
+            .memory_sampler
+            .set_device_vram_override(Some(gpu_snapshot(0, 1024)));
 
         // No instances - load should be zero
         let load = state.calculate_current_load().await;
         assert_eq!(load.0, 0); // vram
         assert_eq!(load.1, 0); // sysmem
+    }
+
+    #[tokio::test]
+    async fn test_calculate_current_load_includes_external_vram() {
+        let config = minimal_node_config();
+        let cookbook = Cookbook { models: vec![] };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+
+        state
+            .memory_sampler
+            .set_device_vram_override(Some(gpu_snapshot(700, 1024)));
+
+        let load = state.calculate_current_load().await;
+        assert_eq!(load.0, 700);
+        assert_eq!(load.1, 0);
+
+        let peer = state.get_self_peer_state().await;
+        assert_eq!(peer.available_vram, 324);
+        assert_eq!(peer.external_vram_mb, 700);
+        assert_eq!(peer.device_vram_used_mb, 700);
+        assert!(peer.gpu_telemetry_available);
+    }
+
+    #[tokio::test]
+    async fn pick_victims_accounts_for_external_vram() {
+        let config = minimal_node_config();
+        let profile_small = sample_profile();
+        let model_small = Model {
+            name: "small".into(),
+            description: None,
+            enabled: true,
+            profiles: vec![profile_small],
+        };
+        let cookbook = Cookbook {
+            models: vec![model_small],
+        };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+        state
+            .memory_sampler
+            .set_device_vram_override(Some(gpu_snapshot(700, 1024)));
+
+        let test_args_hash = "test_args_hash".to_string();
+        let hash_metrics = state.metrics.get_hash_metrics(&test_args_hash).await;
+        hash_metrics.observe_memory(100, 0);
+
+        let mut inst_a = Instance::new(
+            "inst-a".into(),
+            "small".into(),
+            "default".into(),
+            "host".into(),
+            8000,
+            test_args_hash.clone(),
+            false,
+        );
+        inst_a.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(1000);
+        inst_a.in_flight_requests = 0;
+
+        let mut inst_b = Instance::new(
+            "inst-b".into(),
+            "small".into(),
+            "default".into(),
+            "host".into(),
+            8001,
+            test_args_hash.clone(),
+            false,
+        );
+        inst_b.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        inst_b.in_flight_requests = 0;
+
+        let mut inst_c = Instance::new(
+            "inst-c".into(),
+            "small".into(),
+            "default".into(),
+            "host".into(),
+            8002,
+            test_args_hash,
+            false,
+        );
+        inst_c.in_flight_requests = 1;
+
+        {
+            let mut instances = state.instances.write().await;
+            instances.insert("inst-a".into(), Arc::new(RwLock::new(inst_a)));
+            instances.insert("inst-b".into(), Arc::new(RwLock::new(inst_b)));
+            instances.insert("inst-c".into(), Arc::new(RwLock::new(inst_c)));
+        }
+
+        let map = state.instances.read().await;
+        let victims = state.pick_victims(&map, 400, 0).await.unwrap();
+        assert_eq!(victims, vec!["inst-a"]);
+    }
+
+    #[tokio::test]
+    async fn memory_estimate_uses_cookbook_until_learned() {
+        let config = minimal_node_config();
+        let cookbook = Cookbook { models: vec![] };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+
+        let mut profile = sample_profile();
+        profile.estimated_vram_mb = Some(321);
+        profile.estimated_sysmem_mb = Some(654);
+        let (pre_args, _, _) = build_pre_args(&profile);
+        let args_hash = compute_args_hash(&pre_args);
+
+        assert_eq!(
+            state.get_memory_estimate(&args_hash, &profile).await,
+            (321, 654)
+        );
+
+        let hash_metrics = state.metrics.get_hash_metrics(&args_hash).await;
+        hash_metrics.observe_memory(123, 456);
+
+        assert_eq!(
+            state.get_memory_estimate(&args_hash, &profile).await,
+            (123, 456)
+        );
     }
 
     #[tokio::test]
@@ -3257,6 +3577,12 @@ mod tests {
             current_requests: 0,
             available_vram: 8000,
             available_sysmem: 16000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -3267,7 +3593,11 @@ mod tests {
 
         // Model fits easily
         let cost = calculate_cold_start_cost(&peer, 4000, 8000);
-        assert!((cost - 30.0).abs() < 0.1, "Expected 30 for cold start, got {}", cost);
+        assert!(
+            (cost - 30.0).abs() < 0.1,
+            "Expected 30 for cold start, got {}",
+            cost
+        );
     }
 
     #[test]
@@ -3283,6 +3613,12 @@ mod tests {
             current_requests: 0,
             available_vram: 0,
             available_sysmem: 0,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -3293,7 +3629,11 @@ mod tests {
 
         // Unknown memory (0, 0) should be optimistic (just cold start)
         let cost = calculate_cold_start_cost(&peer, 0, 0);
-        assert!((cost - 30.0).abs() < 0.1, "Expected 30 for unknown memory, got {}", cost);
+        assert!(
+            (cost - 30.0).abs() < 0.1,
+            "Expected 30 for unknown memory, got {}",
+            cost
+        );
     }
 
     #[test]
@@ -3307,9 +3647,15 @@ mod tests {
             active_instances: 2,
             max_instances: 8,
             current_requests: 0,
-            available_vram: 2000,   // Only 2GB available
+            available_vram: 2000, // Only 2GB available
             available_sysmem: 16000,
-            max_vram: 16000,        // 16GB total
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
+            max_vram: 16000, // 16GB total
             max_sysmem: 64000,
             total_queue_length: 0,
             model_stats: HashMap::new(),
@@ -3320,7 +3666,11 @@ mod tests {
         // Model needs 8GB, only 2GB available - needs eviction
         let cost = calculate_cold_start_cost(&peer, 8000, 0);
         // Should be: 500 (base) + N * 200 (per instance)
-        assert!(cost >= 500.0, "Expected eviction penalty >= 500, got {}", cost);
+        assert!(
+            cost >= 500.0,
+            "Expected eviction penalty >= 500, got {}",
+            cost
+        );
         assert!(cost < 10000.0, "Should not be cannot-fit penalty");
     }
 
@@ -3337,6 +3687,12 @@ mod tests {
             current_requests: 0,
             available_vram: 8000,
             available_sysmem: 16000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -3347,7 +3703,11 @@ mod tests {
 
         // Model needs more VRAM than node has total
         let cost = calculate_cold_start_cost(&peer, 32000, 0);
-        assert!((cost - 10000.0).abs() < 0.1, "Expected 10000 for cannot-fit, got {}", cost);
+        assert!(
+            (cost - 10000.0).abs() < 0.1,
+            "Expected 10000 for cannot-fit, got {}",
+            cost
+        );
     }
 
     #[test]
@@ -3363,12 +3723,18 @@ mod tests {
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
-            current_requests: 0,  // Idle
+            current_requests: 0, // Idle
             available_vram: 8000,
             available_sysmem: 32000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
-            total_queue_length: 0,  // No queue
+            total_queue_length: 0, // No queue
             model_stats: HashMap::new(),
             ready: true,
             loaded_models: vec!["gpt:fast".into()],
@@ -3396,6 +3762,12 @@ mod tests {
             current_requests: 0,
             available_vram: 16000,
             available_sysmem: 64000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -3440,12 +3812,18 @@ mod tests {
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
-            current_requests: 5,  // Busy!
+            current_requests: 5, // Busy!
             available_vram: 8000,
             available_sysmem: 32000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
-            total_queue_length: 2,  // Queue building
+            total_queue_length: 2, // Queue building
             model_stats: HashMap::new(),
             ready: true,
             loaded_models: vec!["gpt:fast".into()],
@@ -3470,12 +3848,18 @@ mod tests {
             supported_models: vec!["gpt:fast".into()],
             active_instances: 0,
             max_instances: 8,
-            current_requests: 0,  // Idle
+            current_requests: 0, // Idle
             available_vram: 16000,
             available_sysmem: 64000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
-            total_queue_length: 0,  // No queue
+            total_queue_length: 0, // No queue
             model_stats: HashMap::new(),
             ready: true,
             loaded_models: vec![],
@@ -3522,6 +3906,12 @@ mod tests {
             current_requests: 0,
             available_vram: 8000,
             available_sysmem: 32000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -3539,29 +3929,27 @@ mod tests {
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
-            current_requests: 10,   // Many in-flight
+            current_requests: 10, // Many in-flight
             available_vram: 8000,
             available_sysmem: 32000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
-            total_queue_length: 5,  // Queued requests
+            total_queue_length: 5, // Queued requests
             model_stats: HashMap::new(),
             ready: true,
             loaded_models: vec!["gpt:fast".into()],
         };
 
-        let idle_score = calculate_node_score(
-            &idle_peer,
-            model_key,
-            local_mem,
-            idle_peer.current_requests,
-        );
-        let busy_score = calculate_node_score(
-            &busy_peer,
-            model_key,
-            local_mem,
-            busy_peer.current_requests,
-        );
+        let idle_score =
+            calculate_node_score(&idle_peer, model_key, local_mem, idle_peer.current_requests);
+        let busy_score =
+            calculate_node_score(&busy_peer, model_key, local_mem, busy_peer.current_requests);
 
         // Idle should score better (lower)
         assert!(
@@ -3589,6 +3977,12 @@ mod tests {
             current_requests: 0,
             available_vram: 8000,
             available_sysmem: 32000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,
@@ -3621,18 +4015,10 @@ mod tests {
             },
         );
 
-        let slow_score = calculate_node_score(
-            &slow_peer,
-            model_key,
-            local_mem,
-            slow_peer.current_requests,
-        );
-        let fast_score = calculate_node_score(
-            &fast_peer,
-            model_key,
-            local_mem,
-            fast_peer.current_requests,
-        );
+        let slow_score =
+            calculate_node_score(&slow_peer, model_key, local_mem, slow_peer.current_requests);
+        let fast_score =
+            calculate_node_score(&fast_peer, model_key, local_mem, fast_peer.current_requests);
 
         // Fast should score better (lower)
         assert!(
@@ -3662,6 +4048,12 @@ mod tests {
             current_requests: 0, // stale gossip value — peer *looks* idle
             available_vram: 8000,
             available_sysmem: 32000,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 0,

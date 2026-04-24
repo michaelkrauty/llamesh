@@ -19,7 +19,7 @@ fn config_yaml(mock_script: &std::path::Path) -> String {
         r#"
 node_id: "test-reload-drain"
 listen_addr: "{}"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
 model_defaults:
@@ -119,7 +119,11 @@ models:
 async fn wait_for_unload(client: &reqwest::Client, model_key: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(format!("{}/cluster/nodes", BASE_URL)).send().await {
+        if let Ok(resp) = client
+            .get(format!("{}/cluster/nodes", BASE_URL))
+            .send()
+            .await
+        {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 let loaded = json["nodes"]["test-reload-drain"]["loaded_models"]
                     .as_array()

@@ -34,6 +34,24 @@ pub struct PeerState {
     pub current_requests: u64,
     pub available_vram: u64,
     pub available_sysmem: u64,
+    /// VRAM attributed to llamesh-managed instances on this node.
+    #[serde(default)]
+    pub llamesh_vram_mb: u64,
+    /// System memory attributed to llamesh-managed instances on this node.
+    #[serde(default)]
+    pub llamesh_sysmem_mb: u64,
+    /// Device VRAM used outside llamesh-managed instances.
+    #[serde(default)]
+    pub external_vram_mb: u64,
+    /// Device-wide used VRAM reported by GPU telemetry.
+    #[serde(default)]
+    pub device_vram_used_mb: u64,
+    /// Device-wide total VRAM reported by GPU telemetry.
+    #[serde(default)]
+    pub device_vram_total_mb: u64,
+    /// Whether device-wide GPU telemetry is available on this node.
+    #[serde(default)]
+    pub gpu_telemetry_available: bool,
     /// Maximum VRAM capacity in MB (for calculating if model fits)
     #[serde(default)]
     pub max_vram: u64,
@@ -99,6 +117,12 @@ mod tests {
             current_requests: 5,
             available_vram: 1000,
             available_sysmem: 2000,
+            llamesh_vram_mb: 1500,
+            llamesh_sysmem_mb: 2500,
+            external_vram_mb: 500,
+            device_vram_used_mb: 2000,
+            device_vram_total_mb: 24000,
+            gpu_telemetry_available: true,
             max_vram: 16000,
             max_sysmem: 64000,
             total_queue_length: 3,
@@ -110,6 +134,8 @@ mod tests {
         assert_eq!(parsed.node_id, "node-1");
         assert_eq!(parsed.address, "http://localhost:8080");
         assert_eq!(parsed.active_instances, 2);
+        assert_eq!(parsed.external_vram_mb, 500);
+        assert!(parsed.gpu_telemetry_available);
         assert_eq!(parsed.max_vram, 16000);
         assert_eq!(parsed.max_sysmem, 64000);
         assert!(parsed.ready);
@@ -134,6 +160,9 @@ mod tests {
         }"#;
         let parsed: PeerState = serde_json::from_str(json).unwrap();
         assert!(parsed.ready); // Should default to true
+        assert_eq!(parsed.external_vram_mb, 0);
+        assert_eq!(parsed.device_vram_used_mb, 0);
+        assert!(!parsed.gpu_telemetry_available);
     }
 
     #[test]

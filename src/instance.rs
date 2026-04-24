@@ -3,10 +3,10 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::sync::LazyLock;
 use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
@@ -518,8 +518,14 @@ mod tests {
     // Compile-time validation of timeout constant bounds
     const _: () = {
         const MIN_STARTUP_TIMEOUT_SECS: u64 = 30;
-        assert!(MIN_STARTUP_TIMEOUT_SECS >= 10, "Minimum timeout should be at least 10 seconds");
-        assert!(MIN_STARTUP_TIMEOUT_SECS <= 120, "Minimum timeout should be at most 120 seconds");
+        assert!(
+            MIN_STARTUP_TIMEOUT_SECS >= 10,
+            "Minimum timeout should be at least 10 seconds"
+        );
+        assert!(
+            MIN_STARTUP_TIMEOUT_SECS <= 120,
+            "Minimum timeout should be at most 120 seconds"
+        );
     };
 
     #[test]

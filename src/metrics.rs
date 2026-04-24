@@ -1,7 +1,7 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -90,6 +90,16 @@ pub struct Metrics {
 
     // Per-hash metrics: args_hash -> HashMetrics
     pub hash_metrics: RwLock<HashMap<String, Arc<HashMetrics>>>,
+
+    // Current node resource accounting. These runtime gauges start fresh on restart.
+    pub node_llamesh_vram_mb: AtomicU64,
+    pub node_llamesh_sysmem_mb: AtomicU64,
+    pub node_external_vram_mb: AtomicU64,
+    pub node_effective_vram_mb: AtomicU64,
+    pub node_effective_sysmem_mb: AtomicU64,
+    pub node_device_vram_used_mb: AtomicU64,
+    pub node_device_vram_total_mb: AtomicU64,
+    pub node_gpu_telemetry_available: AtomicBool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -107,6 +117,20 @@ pub struct MetricsSnapshot {
     pub last_build_error: Option<String>,
     #[serde(default)]
     pub last_build_at: Option<String>,
+    #[serde(default)]
+    pub node_resources: NodeResourceMetricsSnapshot,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+pub struct NodeResourceMetricsSnapshot {
+    pub llamesh_vram_mb: u64,
+    pub llamesh_sysmem_mb: u64,
+    pub external_vram_mb: u64,
+    pub effective_vram_mb: u64,
+    pub effective_sysmem_mb: u64,
+    pub device_vram_used_mb: u64,
+    pub device_vram_total_mb: u64,
+    pub gpu_telemetry_available: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -184,6 +208,14 @@ impl Metrics {
             queue_wait_total_ms: AtomicU64::new(0),  // Not persisted, starts fresh
             queue_wait_count: AtomicU64::new(0),     // Not persisted, starts fresh
             hash_metrics: RwLock::new(map),
+            node_llamesh_vram_mb: AtomicU64::new(0),
+            node_llamesh_sysmem_mb: AtomicU64::new(0),
+            node_external_vram_mb: AtomicU64::new(0),
+            node_effective_vram_mb: AtomicU64::new(0),
+            node_effective_sysmem_mb: AtomicU64::new(0),
+            node_device_vram_used_mb: AtomicU64::new(0),
+            node_device_vram_total_mb: AtomicU64::new(0),
+            node_gpu_telemetry_available: AtomicBool::new(false),
         }
     }
 
@@ -255,12 +287,34 @@ impl Metrics {
     /// Get learned memory for a given args_hash (for backward compat during transition).
     pub async fn get_learned_memory(&self, args_hash: &str) -> Option<(u64, u64)> {
         let map = self.hash_metrics.read().await;
-        map.get(args_hash).map(|m| {
-            (
+        map.get(args_hash).and_then(|m| {
+            if m.sample_count.load(Ordering::Relaxed) == 0 {
+                return None;
+            }
+            Some((
                 m.peak_vram_mb.load(Ordering::Relaxed),
                 m.peak_sysmem_mb.load(Ordering::Relaxed),
-            )
+            ))
         })
+    }
+
+    pub fn observe_node_resources(&self, snapshot: NodeResourceMetricsSnapshot) {
+        self.node_llamesh_vram_mb
+            .store(snapshot.llamesh_vram_mb, Ordering::Relaxed);
+        self.node_llamesh_sysmem_mb
+            .store(snapshot.llamesh_sysmem_mb, Ordering::Relaxed);
+        self.node_external_vram_mb
+            .store(snapshot.external_vram_mb, Ordering::Relaxed);
+        self.node_effective_vram_mb
+            .store(snapshot.effective_vram_mb, Ordering::Relaxed);
+        self.node_effective_sysmem_mb
+            .store(snapshot.effective_sysmem_mb, Ordering::Relaxed);
+        self.node_device_vram_used_mb
+            .store(snapshot.device_vram_used_mb, Ordering::Relaxed);
+        self.node_device_vram_total_mb
+            .store(snapshot.device_vram_total_mb, Ordering::Relaxed);
+        self.node_gpu_telemetry_available
+            .store(snapshot.gpu_telemetry_available, Ordering::Relaxed);
     }
 
     /// Check if we have any memory data for a given args_hash (for cold start detection).
@@ -335,6 +389,16 @@ impl Metrics {
                 .as_ref()
                 .and_then(|s| s.last_build_error.clone()),
             last_build_at: build_status.and_then(|s| s.last_build_at),
+            node_resources: NodeResourceMetricsSnapshot {
+                llamesh_vram_mb: self.node_llamesh_vram_mb.load(Ordering::Relaxed),
+                llamesh_sysmem_mb: self.node_llamesh_sysmem_mb.load(Ordering::Relaxed),
+                external_vram_mb: self.node_external_vram_mb.load(Ordering::Relaxed),
+                effective_vram_mb: self.node_effective_vram_mb.load(Ordering::Relaxed),
+                effective_sysmem_mb: self.node_effective_sysmem_mb.load(Ordering::Relaxed),
+                device_vram_used_mb: self.node_device_vram_used_mb.load(Ordering::Relaxed),
+                device_vram_total_mb: self.node_device_vram_total_mb.load(Ordering::Relaxed),
+                gpu_telemetry_available: self.node_gpu_telemetry_available.load(Ordering::Relaxed),
+            },
         }
     }
 }
@@ -366,6 +430,66 @@ pub async fn render_prometheus_with_circuit_breaker(
         "proxy_current_requests {}\n",
         metrics.current_requests.load(Ordering::Relaxed)
     ));
+    out.push_str(
+        "# HELP proxy_node_llamesh_vram_mb VRAM attributed to llamesh-managed instances.\n",
+    );
+    out.push_str("# TYPE proxy_node_llamesh_vram_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_llamesh_vram_mb {}\n",
+        metrics.node_llamesh_vram_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_node_llamesh_sysmem_mb System memory attributed to llamesh-managed instances.\n");
+    out.push_str("# TYPE proxy_node_llamesh_sysmem_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_llamesh_sysmem_mb {}\n",
+        metrics.node_llamesh_sysmem_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP proxy_node_external_vram_mb Device VRAM used outside llamesh-managed instances.\n",
+    );
+    out.push_str("# TYPE proxy_node_external_vram_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_external_vram_mb {}\n",
+        metrics.node_external_vram_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_node_effective_vram_mb VRAM used for admission control after external usage is included.\n");
+    out.push_str("# TYPE proxy_node_effective_vram_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_effective_vram_mb {}\n",
+        metrics.node_effective_vram_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP proxy_node_effective_sysmem_mb System memory used for admission control.\n",
+    );
+    out.push_str("# TYPE proxy_node_effective_sysmem_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_effective_sysmem_mb {}\n",
+        metrics.node_effective_sysmem_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP proxy_node_device_vram_used_mb Device-wide used VRAM reported by GPU telemetry.\n",
+    );
+    out.push_str("# TYPE proxy_node_device_vram_used_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_device_vram_used_mb {}\n",
+        metrics.node_device_vram_used_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_node_device_vram_total_mb Device-wide total VRAM reported by GPU telemetry.\n");
+    out.push_str("# TYPE proxy_node_device_vram_total_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_device_vram_total_mb {}\n",
+        metrics.node_device_vram_total_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_node_gpu_telemetry_available Whether device-wide GPU telemetry is available (1=true, 0=false).\n");
+    out.push_str("# TYPE proxy_node_gpu_telemetry_available gauge\n");
+    out.push_str(&format!(
+        "proxy_node_gpu_telemetry_available {}\n",
+        if metrics.node_gpu_telemetry_available.load(Ordering::Relaxed) {
+            1
+        } else {
+            0
+        }
+    ));
 
     // Queue fairness metrics
     out.push_str("# HELP proxy_queue_pending_tokens Number of pending queue tokens.\n");
@@ -394,7 +518,9 @@ pub async fn render_prometheus_with_circuit_breaker(
     ));
 
     // Skipped stream cleanups (cleanup failed during shutdown)
-    out.push_str("# HELP proxy_skipped_stream_cleanups_total Stream cleanups skipped during shutdown.\n");
+    out.push_str(
+        "# HELP proxy_skipped_stream_cleanups_total Stream cleanups skipped during shutdown.\n",
+    );
     out.push_str("# TYPE proxy_skipped_stream_cleanups_total counter\n");
     out.push_str(&format!(
         "proxy_skipped_stream_cleanups_total {}\n",
@@ -429,7 +555,9 @@ pub async fn render_prometheus_with_circuit_breaker(
     out.push_str("# TYPE proxy_hash_tokens_generated_total counter\n");
     out.push_str("# HELP proxy_hash_total_latency_ms Total latency in milliseconds per hash.\n");
     out.push_str("# TYPE proxy_hash_total_latency_ms counter\n");
-    out.push_str("# HELP proxy_hash_p95_latency_ms P95 latency in milliseconds (last 100 samples).\n");
+    out.push_str(
+        "# HELP proxy_hash_p95_latency_ms P95 latency in milliseconds (last 100 samples).\n",
+    );
     out.push_str("# TYPE proxy_hash_p95_latency_ms gauge\n");
     out.push_str("# HELP proxy_hash_peak_vram_mb Peak VRAM usage in MB per hash.\n");
     out.push_str("# TYPE proxy_hash_peak_vram_mb gauge\n");
@@ -548,8 +676,20 @@ mod tests {
         hm.observe_latency(100);
         hm.observe_latency(200);
         hm.observe_memory(1000, 2000);
+        metrics.observe_node_resources(NodeResourceMetricsSnapshot {
+            llamesh_vram_mb: 3000,
+            llamesh_sysmem_mb: 4000,
+            external_vram_mb: 500,
+            effective_vram_mb: 3500,
+            effective_sysmem_mb: 4000,
+            device_vram_used_mb: 3500,
+            device_vram_total_mb: 24000,
+            gpu_telemetry_available: true,
+        });
 
-        let snapshot = metrics.snapshot("node-test".into(), "v1".into(), None).await;
+        let snapshot = metrics
+            .snapshot("node-test".into(), "v1".into(), None)
+            .await;
         let hash_snap = snapshot
             .hashes
             .get(args_hash)
@@ -564,12 +704,25 @@ mod tests {
         assert_eq!(hash_snap.peak_sysmem_mb, 2000);
         assert_eq!(hash_snap.sample_count, 1);
         assert!(hash_snap.display_names.contains(&"gpt:fast".to_string()));
+        assert_eq!(snapshot.node_resources.llamesh_vram_mb, 3000);
+        assert_eq!(snapshot.node_resources.external_vram_mb, 500);
+        assert!(snapshot.node_resources.gpu_telemetry_available);
     }
 
     #[tokio::test]
     async fn test_prometheus_rendering() {
         let metrics = Metrics::new();
         metrics.inc_requests();
+        metrics.observe_node_resources(NodeResourceMetricsSnapshot {
+            llamesh_vram_mb: 100,
+            llamesh_sysmem_mb: 200,
+            external_vram_mb: 50,
+            effective_vram_mb: 150,
+            effective_sysmem_mb: 200,
+            device_vram_used_mb: 150,
+            device_vram_total_mb: 1000,
+            gpu_telemetry_available: true,
+        });
 
         let hm = metrics.get_hash_metrics("abc123").await;
         hm.add_display_name("gpt\"cool\"");
@@ -579,6 +732,8 @@ mod tests {
         let output = render_prometheus_with_circuit_breaker(&metrics, None).await;
 
         assert!(output.contains("proxy_requests_total 1"));
+        assert!(output.contains("proxy_node_external_vram_mb 50"));
+        assert!(output.contains("proxy_node_gpu_telemetry_available 1"));
         assert!(output.contains("proxy_hash_requests_total{hash=\"abc123\""));
         assert!(output.contains("names=\"gpt\\\"cool\\\"\""));
     }

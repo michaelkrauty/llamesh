@@ -9,7 +9,7 @@
 
 node_id: "{{NODE_ID}}"
 listen_addr: "{{LISTEN_ADDR}}"
-max_vram_mb: 1024
+max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "{{DEFAULT_MODEL}}"
 model_defaults:

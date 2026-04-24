@@ -833,7 +833,8 @@ fi
         assert!(bm.can_serve());
 
         // Binary exists and building → should STILL serve
-        bm.building.store(true, std::sync::atomic::Ordering::Relaxed);
+        bm.building
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(
             bm.can_serve(),
             "Node must continue serving during builds when binary exists"
