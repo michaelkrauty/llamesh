@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-04-24
+
+### Fixed
+
+- Enforce profile `max_instances` after concurrent spawn races so simultaneous
+  requests cannot exceed the configured per-profile instance cap.
+
 ## [1.3.0] - 2026-04-24
 
 ### Added
