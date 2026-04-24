@@ -1,7 +1,7 @@
 use reqwest::StatusCode;
 
 mod common;
-use common::{cleanup_procs, graceful_stop, setup_mock_script, wait_for_ready};
+use common::{cleanup_procs, graceful_stop, llamesh_binary, setup_mock_script, wait_for_ready};
 
 #[tokio::test]
 async fn test_admin_auth() {
@@ -12,13 +12,7 @@ async fn test_admin_auth() {
     let mock_script = setup_mock_script(&root, "admin_auth").await;
     let config_path = root.join("tests/config_admin_auth.yaml");
     let cookbook_path = root.join("tests/cookbook_admin_auth.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     let config_content = format!(
         r#"

@@ -47,7 +47,7 @@ pub fn load(path: &Path) -> Result<String> {
     // Validate base64
     BASE64
         .decode(&token)
-        .map_err(|e| NoiseError::Token(format!("Invalid token format: {}", e)))?;
+        .map_err(|e| NoiseError::Token(format!("Invalid token format: {e}")))?;
 
     Ok(token)
 }
@@ -62,7 +62,7 @@ pub fn get_or_create(config_dir: &Path) -> Result<String> {
             // Validate
             BASE64
                 .decode(&token)
-                .map_err(|e| NoiseError::Token(format!("Invalid CLUSTER_TOKEN env var: {}", e)))?;
+                .map_err(|e| NoiseError::Token(format!("Invalid CLUSTER_TOKEN env var: {e}")))?;
             tracing::info!("Using cluster token from CLUSTER_TOKEN env var");
             return Ok(token);
         }
@@ -92,7 +92,7 @@ pub fn get_or_create(config_dir: &Path) -> Result<String> {
 pub fn decode(token: &str) -> Result<Vec<u8>> {
     BASE64
         .decode(token)
-        .map_err(|e| NoiseError::Token(format!("Invalid token: {}", e)))
+        .map_err(|e| NoiseError::Token(format!("Invalid token: {e}")))
 }
 
 #[cfg(test)]

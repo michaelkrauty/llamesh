@@ -5,12 +5,12 @@ use crate::node_state::{NodeError, NodeState};
 use axum::{
     body::Body,
     extract::State,
-    http::{header::RETRY_AFTER, HeaderValue, Request, Response, StatusCode},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
     response::IntoResponse,
     response::Json,
 };
 use bytes::Bytes;
-use futures::{future::BoxFuture, Stream};
+use futures::{future::BoxFuture, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -77,7 +77,153 @@ impl Drop for RequestGuard {
     }
 }
 
-pub async fn list_models(State(state): State<Arc<NodeState>>) -> impl IntoResponse {
+enum PeerResponse {
+    Http(reqwest::Response),
+    Noise {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Box<crate::noise::transport::NoiseBodyStream>,
+    },
+}
+
+struct PeerRequest<'a> {
+    peer_id: &'a str,
+    peer_address: &'a str,
+    method: Method,
+    path_and_query: &'a str,
+    headers: HeaderMap,
+    body: Bytes,
+    timeout_ms: u64,
+}
+
+fn peer_status_is_failure(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::FORBIDDEN
+}
+
+async fn record_peer_status(state: &NodeState, peer_id: &str, status: StatusCode) {
+    if peer_status_is_failure(status) {
+        state.circuit_breaker.record_failure(peer_id).await;
+    } else {
+        state.circuit_breaker.record_success(peer_id).await;
+    }
+}
+
+fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &str) -> HeaderMap {
+    let mut forward_headers = HeaderMap::new();
+    for (name, value) in source.iter() {
+        let name_lower = name.as_str().to_lowercase();
+        if matches!(
+            name_lower.as_str(),
+            "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        forward_headers.insert(name.clone(), value.clone());
+    }
+    forward_headers.insert(
+        axum::http::header::HeaderName::from_static("x-llama-mesh-hops"),
+        HeaderValue::from_str(&(current_hops + 1).to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("1")),
+    );
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        forward_headers.insert(
+            axum::http::header::HeaderName::from_static("x-request-id"),
+            value,
+        );
+    }
+    forward_headers
+}
+
+async fn send_peer_request(
+    state: &NodeState,
+    request: PeerRequest<'_>,
+) -> Result<PeerResponse, AppError> {
+    if let Some(noise_context) = state.noise_context.as_ref() {
+        let timeout = (request.timeout_ms > 0).then(|| Duration::from_millis(request.timeout_ms));
+        let response = crate::noise::transport::request(
+            noise_context,
+            crate::noise::transport::OutboundNoiseRequest {
+                peer_base_url: request.peer_address,
+                expected_peer_node_id: Some(request.peer_id),
+                method: request.method.as_str(),
+                path: request.path_and_query,
+                headers: &request.headers,
+                body: &request.body,
+                timeout_duration: timeout,
+            },
+        )
+        .await
+        .map_err(|e| {
+            AppError::new(
+                StatusCode::BAD_GATEWAY,
+                e.to_string(),
+                "peer_forward_failed",
+            )
+        })?;
+
+        let status = StatusCode::from_u16(response.head.status).map_err(|e| {
+            AppError::internal_server_error(format!("Invalid peer response status: {e}"))
+        })?;
+        let mut response_headers = HeaderMap::new();
+        for (name, value) in &response.head.headers {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                response_headers.insert(name, value);
+            }
+        }
+
+        Ok(PeerResponse::Noise {
+            status,
+            headers: response_headers,
+            body: Box::new(response.into_body_stream()),
+        })
+    } else {
+        let base = request.peer_address.trim_end_matches('/');
+        let url = format!("{base}{}", request.path_and_query);
+        let mut client_req = state
+            .cluster_client
+            .request(request.method, &url)
+            .headers(request.headers)
+            .body(request.body);
+
+        if request.timeout_ms > 0 {
+            client_req = client_req.timeout(Duration::from_millis(request.timeout_ms));
+        }
+
+        client_req
+            .send()
+            .await
+            .map(PeerResponse::Http)
+            .map_err(|e| {
+                AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("Failed to forward to peer {}: {e}", request.peer_id),
+                    "peer_forward_failed",
+                )
+            })
+    }
+}
+
+pub async fn list_models(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    crate::security::check_api_key_auth(state.config.auth.as_ref(), &headers)
+        .map_err(AppError::authentication_error)?;
+
     let mut data = Vec::new();
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -167,10 +313,10 @@ pub async fn list_models(State(state): State<Arc<NodeState>>) -> impl IntoRespon
         }
     }
 
-    Json(json!({
+    Ok(Json(json!({
         "object": "list",
         "data": data
-    }))
+    })))
 }
 
 pub async fn route_request(
@@ -204,7 +350,7 @@ pub async fn route_request(
     )
     .await
     .map_err(|_| AppError::request_timeout("Request body read timed out"))?
-    .map_err(|e| AppError::invalid_request(format!("Body too large or error: {}", e)))?;
+    .map_err(|e| AppError::invalid_request(format!("Body too large or error: {e}")))?;
 
     let json_body: Value =
         serde_json::from_slice(&bytes).map_err(|_| AppError::invalid_request("Invalid JSON"))?;
@@ -287,59 +433,30 @@ pub async fn route_request(
                 // see the peer's load before its next gossip tick.
                 let peer_forward_guard = state.track_peer_forward(&peer.node_id).await;
 
-                let base = peer.address.trim_end_matches('/');
-                let url = format!("{}{}", base, path_and_query);
-
-                // Build headers for forwarding
-                let mut forward_headers = axum::http::HeaderMap::new();
-                for (name, value) in parts.headers.iter() {
-                    let name_lower = name.as_str().to_lowercase();
-                    if matches!(
-                        name_lower.as_str(),
-                        "host"
-                            | "content-length"
-                            | "transfer-encoding"
-                            | "connection"
-                            | "keep-alive"
-                            | "proxy-authenticate"
-                            | "proxy-authorization"
-                            | "te"
-                            | "trailer"
-                            | "upgrade"
-                    ) {
-                        continue;
-                    }
-                    forward_headers.insert(name.clone(), value.clone());
-                }
-                forward_headers.insert(
-                    axum::http::header::HeaderName::from_static("x-llama-mesh-hops"),
-                    axum::http::HeaderValue::from_str(&(current_hops + 1).to_string())
-                        .map_err(|e| AppError::internal_server_error(e.to_string()))?,
-                );
-                forward_headers.insert(
-                    axum::http::header::HeaderName::from_static("x-request-id"),
-                    axum::http::HeaderValue::from_str(&request_id)
-                        .map_err(|e| AppError::internal_server_error(e.to_string()))?,
-                );
-
-                // Use default timeout for unknown models
+                let forward_headers =
+                    build_forward_headers(&parts.headers, current_hops, &request_id);
                 let timeout_ms = state.config.model_defaults.max_request_duration_ms;
-                let mut client_req = state
-                    .cluster_client
-                    .request(parts.method, &url)
-                    .headers(forward_headers)
-                    .body(bytes.clone());
 
-                if timeout_ms > 0 {
-                    client_req = client_req.timeout(Duration::from_millis(timeout_ms));
-                }
-
-                match client_req.send().await {
+                match send_peer_request(
+                    &state,
+                    PeerRequest {
+                        peer_id: &peer.node_id,
+                        peer_address: &peer.address,
+                        method: parts.method.clone(),
+                        path_and_query: &path_and_query,
+                        headers: forward_headers,
+                        body: bytes.clone(),
+                        timeout_ms,
+                    },
+                )
+                .await
+                {
                     Ok(resp) => {
-                        state.circuit_breaker.record_success(&peer.node_id).await;
-
-                        let status = resp.status();
-                        let headers = resp.headers().clone();
+                        let status = match &resp {
+                            PeerResponse::Http(resp) => resp.status(),
+                            PeerResponse::Noise { status, .. } => *status,
+                        };
+                        record_peer_status(&state, &peer.node_id, status).await;
 
                         // Defer the dec_current_requests decrement until the
                         // response body finishes streaming to the client (or is
@@ -362,39 +479,27 @@ pub async fn route_request(
                         guard.complete();
 
                         let tokens_counter = Arc::new(AtomicU64::new(0));
-                        let wrapped =
-                            CleanupStream::new(resp.bytes_stream(), cleanup_fut, tokens_counter);
-                        let body = Body::from_stream(wrapped);
-
-                        let mut response = Response::builder().status(status);
-                        for (name, value) in headers.iter() {
-                            response = response.header(name, value);
-                        }
-                        return response.body(body).map_err(|e| {
-                            AppError::internal_server_error(format!(
-                                "Failed to build forwarded response: {}",
-                                e
-                            ))
-                        });
+                        return Ok(peer_response_to_client(
+                            resp,
+                            stream_requested,
+                            cleanup_fut,
+                            tokens_counter,
+                        )
+                        .await);
                     }
                     Err(e) => {
                         state.circuit_breaker.record_failure(&peer.node_id).await;
                         // guard Drop handles dec_current_requests on return.
                         state.metrics.inc_errors();
-                        error!(peer = %peer.node_id, error = %e, "Failed to forward to peer");
-                        return Err(AppError::new(
-                            StatusCode::BAD_GATEWAY,
-                            format!("Failed to forward to peer {}: {}", peer.node_id, e),
-                            "peer_forward_failed",
-                        ));
+                        error!(peer = %peer.node_id, error = ?e, "Failed to forward to peer");
+                        return Err(e);
                     }
                 }
             }
 
             // No local resolution and no peer found
             return Err(AppError::model_not_found(format!(
-                "Model '{}' not found in local cookbook or any peer",
-                model_to_use
+                "Model '{model_to_use}' not found in local cookbook or any peer"
             )));
         }
 
@@ -485,7 +590,7 @@ pub async fn route_request(
                         (inst.host.clone(), inst.port)
                     };
 
-                    let url = format!("http://{}:{}{}", target_host, target_port, path_and_query);
+                    let url = format!("http://{target_host}:{target_port}{path_and_query}");
 
                     info!("Forwarding locally to {}", url);
 
@@ -495,7 +600,7 @@ pub async fn route_request(
                     // Inject authorization if the profile defines an API key
                     if let Some(api_key) = profile.get_api_key() {
                         let value =
-                            axum::http::HeaderValue::from_str(&format!("Bearer {}", api_key))
+                            axum::http::HeaderValue::from_str(&format!("Bearer {api_key}"))
                                 .map_err(|e| {
                                     error!(
                                         "Failed to create Authorization header from API key: {}. \
@@ -623,7 +728,7 @@ pub async fn route_request(
 
                             Err(AppError::new(
                                 StatusCode::BAD_GATEWAY,
-                                format!("Upstream error: {}", e),
+                                format!("Upstream error: {e}"),
                                 "upstream_error",
                             ))
                         }
@@ -645,55 +750,30 @@ pub async fn route_request(
                                 "Local spawn failures exhausted, falling back to peer"
                             );
 
-                            let peer_forward_guard =
-                                state.track_peer_forward(&peer.node_id).await;
-                            let base = peer.address.trim_end_matches('/');
-                            let url = format!("{}{}", base, path_and_query);
+                            let peer_forward_guard = state.track_peer_forward(&peer.node_id).await;
+                            let forward_headers =
+                                build_forward_headers(&parts.headers, current_hops, &request_id);
 
-                            let mut forward_headers = axum::http::HeaderMap::new();
-                            for (name, value) in parts.headers.iter() {
-                                let name_lower = name.as_str().to_lowercase();
-                                if matches!(
-                                    name_lower.as_str(),
-                                    "host"
-                                        | "content-length"
-                                        | "transfer-encoding"
-                                        | "connection"
-                                        | "keep-alive"
-                                        | "proxy-authenticate"
-                                        | "proxy-authorization"
-                                        | "te"
-                                        | "trailer"
-                                        | "upgrade"
-                                ) {
-                                    continue;
-                                }
-                                forward_headers.insert(name.clone(), value.clone());
-                            }
-                            forward_headers.insert(
-                                axum::http::header::HeaderName::from_static("x-llama-mesh-hops"),
-                                axum::http::HeaderValue::from_str(&(current_hops + 1).to_string())
-                                    .map_err(|e| AppError::internal_server_error(e.to_string()))?,
-                            );
-                            forward_headers.insert(
-                                axum::http::header::HeaderName::from_static("x-request-id"),
-                                axum::http::HeaderValue::from_str(&request_id)
-                                    .map_err(|e| AppError::internal_server_error(e.to_string()))?,
-                            );
-
-                            let mut client_req = state
-                                .cluster_client
-                                .request(parts.method, &url)
-                                .headers(forward_headers)
-                                .body(bytes.clone());
-
-                            if timeout_ms > 0 {
-                                client_req = client_req.timeout(Duration::from_millis(timeout_ms));
-                            }
-
-                            match client_req.send().await {
+                            match send_peer_request(
+                                &state,
+                                PeerRequest {
+                                    peer_id: &peer.node_id,
+                                    peer_address: &peer.address,
+                                    method: parts.method.clone(),
+                                    path_and_query: &path_and_query,
+                                    headers: forward_headers,
+                                    body: bytes.clone(),
+                                    timeout_ms,
+                                },
+                            )
+                            .await
+                            {
                                 Ok(resp) => {
-                                    state.circuit_breaker.record_success(&peer.node_id).await;
+                                    let status = match &resp {
+                                        PeerResponse::Http(resp) => resp.status(),
+                                        PeerResponse::Noise { status, .. } => *status,
+                                    };
+                                    record_peer_status(&state, &peer.node_id, status).await;
 
                                     let tokens_counter = Arc::new(AtomicU64::new(0));
                                     let tokens_for_cleanup = tokens_counter.clone();
@@ -718,12 +798,13 @@ pub async fn route_request(
 
                                     guard.complete();
 
-                                    return Ok(if stream_requested {
-                                        build_streaming_response(resp, cleanup_fut, tokens_counter)
-                                    } else {
-                                        handle_non_streaming_response(resp, cleanup_fut, tokens_counter)
-                                            .await
-                                    });
+                                    return Ok(peer_response_to_client(
+                                        resp,
+                                        stream_requested,
+                                        cleanup_fut,
+                                        tokens_counter,
+                                    )
+                                    .await);
                                 }
                                 Err(peer_err) => {
                                     // peer_forward_guard drops on fall-through,
@@ -731,7 +812,7 @@ pub async fn route_request(
                                     state.circuit_breaker.record_failure(&peer.node_id).await;
                                     warn!(
                                         peer = %peer.node_id,
-                                        error = %peer_err,
+                                        error = ?peer_err,
                                         "Peer fallback also failed"
                                     );
                                     // Fall through to return the original error
@@ -786,61 +867,29 @@ pub async fn route_request(
             // for the peer's next gossip tick. Guard is released in the cleanup
             // future (success) or on function return (error).
             let peer_forward_guard = state.track_peer_forward(&best_node.node_id).await;
-            let base = best_node.address.trim_end_matches('/');
-            let url = format!("{}{}", base, path_and_query);
+            let forward_headers =
+                build_forward_headers(&parts.headers, current_hops, &request_id);
 
-            // Build headers for forwarding, excluding hop-by-hop headers that shouldn't be forwarded
-            // and headers that reqwest manages internally
-            let mut forward_headers = axum::http::HeaderMap::new();
-            for (name, value) in parts.headers.iter() {
-                // Skip headers that shouldn't be forwarded or that reqwest manages
-                let name_lower = name.as_str().to_lowercase();
-                if matches!(
-                    name_lower.as_str(),
-                    "host"
-                        | "content-length"
-                        | "transfer-encoding"
-                        | "connection"
-                        | "keep-alive"
-                        | "proxy-authenticate"
-                        | "proxy-authorization"
-                        | "te"
-                        | "trailer"
-                        | "upgrade"
-                ) {
-                    continue;
-                }
-                forward_headers.insert(name.clone(), value.clone());
-            }
-            forward_headers.insert(
-                axum::http::header::HeaderName::from_static("x-llama-mesh-hops"),
-                axum::http::HeaderValue::from_str(&(current_hops + 1).to_string())
-                    .map_err(|e| AppError::internal_server_error(e.to_string()))?,
-            );
-            // Forward request ID for cross-cluster tracing
-            forward_headers.insert(
-                axum::http::header::HeaderName::from_static("x-request-id"),
-                axum::http::HeaderValue::from_str(&request_id)
-                    .map_err(|e| AppError::internal_server_error(e.to_string()))?,
-            );
-
-            let mut client_req = state
-                .cluster_client
-                .request(parts.method, &url)
-                .headers(forward_headers)
-                .body(bytes.clone());
-
-            if timeout_ms > 0 {
-                client_req = client_req.timeout(Duration::from_millis(timeout_ms));
-            }
-
-            match client_req.send().await {
+            match send_peer_request(
+                &state,
+                PeerRequest {
+                    peer_id: &best_node.node_id,
+                    peer_address: &best_node.address,
+                    method: parts.method.clone(),
+                    path_and_query: &path_and_query,
+                    headers: forward_headers,
+                    body: bytes.clone(),
+                    timeout_ms,
+                },
+            )
+            .await
+            {
                 Ok(resp) => {
-                    // Record success for circuit breaker
-                    state
-                        .circuit_breaker
-                        .record_success(&best_node.node_id)
-                        .await;
+                    let status = match &resp {
+                        PeerResponse::Http(resp) => resp.status(),
+                        PeerResponse::Noise { status, .. } => *status,
+                    };
+                    record_peer_status(&state, &best_node.node_id, status).await;
 
                     let tokens_counter = Arc::new(AtomicU64::new(0));
                     let tokens_for_cleanup = tokens_counter.clone();
@@ -868,11 +917,8 @@ pub async fn route_request(
                     // Transfer responsibility to cleanup_fut
                     guard.complete();
 
-                    Ok(if stream_requested {
-                        build_streaming_response(resp, cleanup_fut, tokens_counter)
-                    } else {
-                        handle_non_streaming_response(resp, cleanup_fut, tokens_counter).await
-                    })
+                    Ok(peer_response_to_client(resp, stream_requested, cleanup_fut, tokens_counter)
+                        .await)
                 }
                 Err(e) => {
                     // peer_forward_guard drops here, releasing the counter.
@@ -884,9 +930,9 @@ pub async fn route_request(
 
                     warn!(
                         peer = %best_node.node_id,
-                        url = %url,
-                        error = %e,
-                        error_debug = ?e,
+                        address = %best_node.address,
+                        path = %path_and_query,
+                        error = ?e,
                         "Peer forwarding failed, waiting for capacity to retry"
                     );
 
@@ -1041,6 +1087,117 @@ fn build_streaming_response(
     response
 }
 
+fn build_streaming_response_from_parts<S, E>(
+    status: StatusCode,
+    headers: HeaderMap,
+    stream: S,
+    cleanup: BoxFuture<'static, ()>,
+    tokens_generated: Arc<AtomicU64>,
+) -> Response<Body>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+{
+    let stream = CleanupStream::new(stream, cleanup, tokens_generated);
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+async fn handle_non_streaming_body(
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Bytes,
+    cleanup: BoxFuture<'static, ()>,
+    tokens_generated: Arc<AtomicU64>,
+) -> Response<Body> {
+    let _cleanup_guard = AutoCleanup::new(cleanup);
+
+    if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
+        if let Some(usage) = val.get("usage") {
+            if let Some(completion_tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64())
+            {
+                info!(
+                    "Counted {} tokens from non-streaming response",
+                    completion_tokens
+                );
+                tokens_generated.fetch_add(completion_tokens, Ordering::Relaxed);
+            }
+        } else {
+            info!("No usage field in response");
+        }
+    } else {
+        info!("Failed to parse response as JSON");
+    }
+
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    response
+}
+
+async fn peer_response_to_client(
+    response: PeerResponse,
+    stream_requested: bool,
+    cleanup: BoxFuture<'static, ()>,
+    tokens_generated: Arc<AtomicU64>,
+) -> Response<Body> {
+    match response {
+        PeerResponse::Http(resp) => {
+            if stream_requested {
+                build_streaming_response(resp, cleanup, tokens_generated)
+            } else {
+                handle_non_streaming_response(resp, cleanup, tokens_generated).await
+            }
+        }
+        PeerResponse::Noise {
+            status,
+            headers,
+            body,
+        } => {
+            let body = *body;
+            if stream_requested {
+                build_streaming_response_from_parts(
+                    status,
+                    headers,
+                    body,
+                    cleanup,
+                    tokens_generated,
+                )
+            } else {
+                match body
+                    .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())))
+                    .try_fold(Vec::new(), |mut acc, chunk| async move {
+                        acc.extend_from_slice(&chunk);
+                        Ok(acc)
+                    })
+                    .await
+                {
+                    Ok(bytes) => {
+                        handle_non_streaming_body(
+                            status,
+                            headers,
+                            Bytes::from(bytes),
+                            cleanup,
+                            tokens_generated,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        error!("Failed to read peer response body: {}", e);
+                        let _cleanup_guard = AutoCleanup::new(cleanup);
+                        Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .body(Body::from("Failed to read peer response"))
+                            .unwrap_or_else(|_| Response::new(Body::from("Internal error")))
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Maximum buffer size for token counting (16MB).
 /// If exceeded, token counting is disabled but stream continues unaffected.
 const MAX_TOKEN_BUFFER_SIZE: usize = 16 * 1024 * 1024;
@@ -1053,9 +1210,9 @@ pub static SKIPPED_STREAM_CLEANUPS: AtomicU64 = AtomicU64::new(0);
 /// Exposed via metrics endpoint.
 pub static TOKEN_COUNTING_DISABLED: AtomicU64 = AtomicU64::new(0);
 
-struct CleanupStream<S>
+struct CleanupStream<S, E>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
 {
     inner: Pin<Box<S>>,
     cleanup: Option<BoxFuture<'static, ()>>,
@@ -1065,9 +1222,9 @@ where
     cleanup_executed: bool,
 }
 
-impl<S> CleanupStream<S>
+impl<S, E> CleanupStream<S, E>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
 {
     fn new(inner: S, cleanup: BoxFuture<'static, ()>, tokens_generated: Arc<AtomicU64>) -> Self {
         Self {
@@ -1125,11 +1282,11 @@ fn process_line(line: &[u8], counter: &AtomicU64) {
     }
 }
 
-impl<S> Stream for CleanupStream<S>
+impl<S, E> Stream for CleanupStream<S, E>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
 {
-    type Item = Result<Bytes, reqwest::Error>;
+    type Item = Result<Bytes, E>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.inner.as_mut().poll_next(cx) {
@@ -1226,9 +1383,9 @@ where
     }
 }
 
-impl<S> Drop for CleanupStream<S>
+impl<S, E> Drop for CleanupStream<S, E>
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
 {
     fn drop(&mut self) {
         // Only run cleanup if it wasn't already executed in poll_next
@@ -1291,8 +1448,7 @@ fn ensure_profile_supports_endpoint(
             } else {
                 Err(Box::new(
                     AppError::model_not_found(format!(
-                        "Model '{}' is not configured for embeddings",
-                        requested_model
+                        "Model '{requested_model}' is not configured for embeddings"
                     ))
                     .with_param("model"),
                 ))
@@ -1307,8 +1463,7 @@ fn ensure_profile_supports_endpoint(
             } else {
                 Err(Box::new(
                     AppError::model_not_found(format!(
-                        "Model '{}' is not configured for reranking",
-                        requested_model
+                        "Model '{requested_model}' is not configured for reranking"
                     ))
                     .with_param("model"),
                 ))
@@ -1320,8 +1475,7 @@ fn ensure_profile_supports_endpoint(
             } else {
                 Err(Box::new(
                     AppError::invalid_request(format!(
-                        "Model '{}' is restricted to embeddings or rerank endpoints",
-                        requested_model
+                        "Model '{requested_model}' is restricted to embeddings or rerank endpoints"
                     ))
                     .with_param("model"),
                 ))

@@ -89,7 +89,7 @@ mod tests {
             cluster_addr: "10.0.0.1:9000".to_string(),
             public_key: Some("abc123".to_string()),
         };
-        let debug_str = format!("{:?}", peer);
+        let debug_str = format!("{peer:?}");
         assert!(debug_str.contains("test-node"));
         assert!(debug_str.contains("10.0.0.1:9000"));
         assert!(debug_str.contains("abc123"));
@@ -156,7 +156,7 @@ impl Discovery {
         // Add explicit peers
         for peer_addr in &config.peers {
             peers.write().insert(DiscoveredPeer {
-                node_id: format!("explicit:{}", peer_addr),
+                node_id: format!("explicit:{peer_addr}"),
                 cluster_addr: peer_addr.clone(),
                 public_key: None,
             });
@@ -201,7 +201,7 @@ impl Discovery {
     #[allow(dead_code)] // Reserved for peer management API
     pub fn add_peer(&self, addr: &str) {
         self.peers.write().insert(DiscoveredPeer {
-            node_id: format!("explicit:{}", addr),
+            node_id: format!("explicit:{addr}"),
             cluster_addr: addr.to_string(),
             public_key: None,
         });

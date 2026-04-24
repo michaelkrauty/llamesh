@@ -195,13 +195,13 @@ async fn main() -> anyhow::Result<()> {
             ) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("Failed to create cookbook file watcher: {}", e);
+                    eprintln!("Failed to create cookbook file watcher: {e}");
                     return;
                 }
             };
 
             if let Err(e) = watcher.watch(&watched_dir, RecursiveMode::NonRecursive) {
-                eprintln!("Failed to watch cookbook directory: {}", e);
+                eprintln!("Failed to watch cookbook directory: {e}");
                 return;
             }
 

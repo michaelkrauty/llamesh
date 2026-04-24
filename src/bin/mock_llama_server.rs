@@ -75,7 +75,7 @@ async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next:
             .get("Authorization")
             .and_then(|h| h.to_str().ok());
 
-        let expected_header = format!("Bearer {}", expected_key);
+        let expected_header = format!("Bearer {expected_key}");
 
         if auth_header != Some(&expected_header) {
             return (
@@ -129,15 +129,12 @@ async fn main() {
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse().unwrap();
-    println!(
-        "Starting mock llama-server on {} with {} slots",
-        addr, num_slots
-    );
+    println!("Starting mock llama-server on {addr} with {num_slots} slots");
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Failed to bind to {}: {}", addr, e);
+            eprintln!("Failed to bind to {addr}: {e}");
             std::process::exit(1);
         }
     };
@@ -196,17 +193,16 @@ async fn metrics(State(state): State<Arc<AppState>>) -> String {
     format!(
         "# HELP llama_server_uptime_seconds Uptime of the server\n\
          # TYPE llama_server_uptime_seconds gauge\n\
-         llama_server_uptime_seconds {}\n\
+         llama_server_uptime_seconds {uptime}\n\
          # HELP llama_server_requests_total Total number of requests\n\
          # TYPE llama_server_requests_total counter\n\
-         llama_server_requests_total {}\n\
+         llama_server_requests_total {requests}\n\
          # HELP llama_server_slots_idle Number of idle slots\n\
          # TYPE llama_server_slots_idle gauge\n\
-         llama_server_slots_idle {}\n\
+         llama_server_slots_idle {idle}\n\
          # HELP llama_server_slots_processing Number of processing slots\n\
          # TYPE llama_server_slots_processing gauge\n\
-         llama_server_slots_processing {}\n",
-        uptime, requests, idle, busy
+         llama_server_slots_processing {busy}\n"
     )
 }
 

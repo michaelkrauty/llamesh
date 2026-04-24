@@ -73,7 +73,7 @@ src/
 ├─ protocol_detect.rs — Single-port multiplexing: TLS vs HTTP vs Noise protocol detection
 ├─ noise/
 │  ├─ mod.rs          — Noise Protocol context and error types
-│  ├─ handshake.rs    — Noise_XX server-side handshake with HMAC token verification
+│  ├─ handshake.rs    — Noise_XX handshake with HMAC token verification
 │  ├─ transport.rs    — Encrypted HTTP-over-Noise request/response transport
 │  ├─ keypair.rs      — Ed25519 keypair management
 │  ├─ token.rs        — Cluster shared-secret token generation and storage
@@ -281,8 +281,8 @@ cluster:
   noise:
     tofu: false
     allowed_keys:
-      - "ed25519:xAbC123...="
-      - "ed25519:yDeF456...="
+      - "noise25519:xAbC123...="
+      - "noise25519:yDeF456...="
 ```
 
 **Hybrid (LAN + WAN):** mDNS for local, explicit peers for remote:
@@ -296,7 +296,7 @@ cluster:
   noise:
     tofu: false
     allowed_keys:
-      - "ed25519:xAbC123...="
+      - "noise25519:xAbC123...="
 ```
 
 **Secrets Location:** `~/.llama-mesh/` (mode 700)
@@ -306,7 +306,7 @@ cluster:
 
 **Environment Variable Overrides:**
 - `CLUSTER_TOKEN` - Overrides file-based token
-- `NODE_PRIVATE_KEY` - Base64-encoded Ed25519 key
+- `NODE_PRIVATE_KEY` - Base64-encoded Noise static X25519 private key
 
 `llama_cpp_ports` lets operators constrain which local TCP ports `llama-server` instances may bind to. If omitted, the proxy uses OS-assigned ephemeral ports; if provided, it will choose ports from the configured explicit `ports` list and/or one or more `ranges`, skipping any that are already in use.
 
@@ -467,7 +467,7 @@ The format is internal; stability is not guaranteed, but it must be:
 
 ### Dependencies
 
-* Rust (stable, e.g. 1.80+).
+* Rust (stable, e.g. 1.88+).
 * CMake, a C/C++ compiler, and dependencies for `llama.cpp`.
 * `git` available on PATH.
 * `llama.cpp` repo will be cloned automatically based on config, or you can pre-clone it.
@@ -771,7 +771,7 @@ For full semantics (including drain/shutdown behavior), see **Health, Readiness,
 ### Cluster / Admin
 
 * `GET /cluster/nodes` -> current view of nodes and their capacities.
-* `POST /cluster/gossip` -> internal peer gossip endpoint (used by nodes to exchange state). Reachable over both Noise-encrypted connections and plain HTTP.
+* `POST /cluster/gossip` -> internal peer gossip endpoint (used by nodes to exchange state). When Noise is enabled without cluster mTLS, plain HTTP gossip is rejected.
 * `POST /admin/prewarm` -> request pre-warming of a model/profile.
 * `POST /admin/rebuild-llama` -> trigger on-demand `llama.cpp` rebuild.
 
@@ -1116,7 +1116,7 @@ The proxy attaches a `X-Llama-Mesh-Hops` header to forwarded requests. This is i
 
 The proxy uses the Noise Protocol Framework (`Noise_XX_25519_ChaChaPoly_SHA256`) for encrypted inter-node communication:
 
-* **Zero-config encryption**: Ed25519 keys are auto-generated on first run.
+* **Zero-config encryption**: Noise static X25519 keys are auto-generated on first run.
 * **Perfect forward secrecy**: Each session uses ephemeral keys.
 * **HMAC-SHA256 cluster token**: Shared secret proves cluster membership during handshake.
 * **TOFU (Trust-On-First-Use)**: SSH-style peer trust model. New peer keys are automatically accepted on first connection.
@@ -1125,10 +1125,10 @@ The proxy uses the Noise Protocol Framework (`Noise_XX_25519_ChaChaPoly_SHA256`)
 
 Secrets are stored in `~/.llama-mesh/` with strict permissions (mode 600 for files, mode 700 for directory):
 - `cluster_token` — Auto-generated shared secret, must be copied to other nodes.
-- `node.key` — Auto-generated Ed25519 keypair, unique per node.
+- `node.key` — Auto-generated Noise static X25519 private key, unique per node.
 - `known_peers` — TOFU-managed list of trusted peer public keys.
 
-**Note:** Noise encryption is currently inbound-only (server-side handshake). Outbound gossip uses HTTP or mTLS, not Noise.
+When enabled, Noise is used for cluster gossip and peer request forwarding. mTLS remains available as the legacy fallback when Noise is disabled.
 
 **mTLS (Legacy, Deprecated)**
 
@@ -1137,7 +1137,7 @@ mTLS is still supported but deprecated in favor of Noise Protocol:
 * TLS 1.3 with mutual TLS.
 * Nodes trust a common CA.
 * Node identity is derived from certificate subject (e.g. `CN=node-a`) and strictly enforced against the sender's claimed node ID.
-* When both `noise` and `cluster_tls` are enabled, Noise is preferred for new inbound connections.
+* When both `noise` and `cluster_tls` are enabled, Noise is preferred for cluster gossip and peer request forwarding.
 
 ---
 

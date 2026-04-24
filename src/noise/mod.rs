@@ -1,10 +1,9 @@
 //! Noise Protocol implementation for secure inter-node communication.
 //!
-//! Server-side (responding to incoming Noise connections) is fully integrated.
-//! Cluster gossip uses HTTP/mTLS for outbound communication.
+//! Cluster gossip and peer forwarding use encrypted Noise transport when enabled.
 //!
 //! Uses Noise_XX_25519_ChaChaPoly_SHA256 for:
-//! - Mutual authentication via Ed25519 keypairs
+//! - Mutual authentication via Noise static X25519 keys
 //! - Perfect forward secrecy
 //! - Zero-config encryption (auto-generated keys)
 //!
@@ -80,7 +79,10 @@ pub fn default_config_dir() -> std::path::PathBuf {
 
 /// Initialize the noise subsystem.
 /// Creates config directory and generates keys/token if needed.
-pub async fn initialize(config: &crate::config::ClusterNoiseConfig) -> Result<NoiseContext> {
+pub async fn initialize(
+    config: &crate::config::ClusterNoiseConfig,
+    node_id: String,
+) -> Result<NoiseContext> {
     let config_dir = config.effective_config_dir();
 
     // Ensure config directory exists with correct permissions
@@ -101,6 +103,7 @@ pub async fn initialize(config: &crate::config::ClusterNoiseConfig) -> Result<No
         cluster_token,
         known_peers,
         config: config.clone(),
+        node_id,
     })
 }
 
@@ -111,10 +114,11 @@ pub struct NoiseContext {
     pub cluster_token: String,
     pub known_peers: known_peers::KnownPeers,
     pub config: crate::config::ClusterNoiseConfig,
+    pub node_id: String,
 }
 
 impl NoiseContext {
-    /// Get our public key in display format (ed25519:base64...)
+    /// Get our public key in display format (noise25519:base64...)
     pub fn public_key_display(&self) -> String {
         self.keypair.public_key_display()
     }
@@ -138,7 +142,7 @@ mod tests {
             actual: 0o644,
             expected: 0o600,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("Permission denied"));
         assert!(msg.contains("/some/path"));
     }
@@ -150,7 +154,7 @@ mod tests {
             presented: "key-a".into(),
             known: "key-b".into(),
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("node-1"));
         assert!(msg.contains("key-a"));
         assert!(msg.contains("key-b"));
@@ -159,7 +163,7 @@ mod tests {
     #[test]
     fn test_noise_error_display_token_verification() {
         let err = NoiseError::TokenVerificationFailed;
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("Token verification failed"));
     }
 
@@ -169,7 +173,7 @@ mod tests {
             node_id: "bad-node".into(),
             key: "bad-key".into(),
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("bad-node"));
         assert!(msg.contains("not in allowed_keys"));
     }

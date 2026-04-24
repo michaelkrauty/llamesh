@@ -6,6 +6,8 @@ use crate::node_state::{NodeState, PeerState};
 use crate::protocol_detect::{self, DetectedProtocol};
 use crate::router;
 use crate::security::{self, PeerIdentity};
+use axum::body::Body;
+use axum::http::HeaderName;
 use axum::http::Request;
 use axum::{
     extract::State,
@@ -14,6 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use http_body_util::BodyExt;
 use hyper_util::rt::TokioTimer;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -29,10 +32,17 @@ use tower::Service;
 use tracing::{Instrument, Span};
 
 // ... [Handlers remain unchanged, skipped for brevity] ...
-async fn metrics_handler(State(state): State<Arc<NodeState>>) -> String {
+async fn metrics_handler(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    check_auth(&state, &headers)?;
     let _ = state.calculate_resource_snapshot().await;
-    metrics::render_prometheus_with_circuit_breaker(&state.metrics, Some(&state.circuit_breaker))
-        .await
+    Ok(metrics::render_prometheus_with_circuit_breaker(
+        &state.metrics,
+        Some(&state.circuit_breaker),
+    )
+    .await)
 }
 
 async fn version_handler() -> Json<serde_json::Value> {
@@ -133,16 +143,18 @@ fn spawn_force_exit_listener() {
 
 async fn metrics_json_handler(
     State(state): State<Arc<NodeState>>,
-) -> Json<metrics::MetricsSnapshot> {
+    headers: HeaderMap,
+) -> Result<Json<metrics::MetricsSnapshot>, (StatusCode, Json<serde_json::Value>)> {
+    check_auth(&state, &headers)?;
     let _ = state.calculate_resource_snapshot().await;
     let version = state.build_manager.get_version().await;
     let build_status = state.build_manager.build_status();
-    Json(
+    Ok(Json(
         state
             .metrics
             .snapshot(state.config.node_id.clone(), version, Some(build_status))
             .await,
-    )
+    ))
 }
 
 async fn cluster_nodes_handler(
@@ -587,7 +599,7 @@ async fn handle_noise_connection(
 
     // Verify peer identity via TOFU/allowed_keys
     let peer_pubkey_display = format!(
-        "ed25519:{}",
+        "noise25519:{}",
         base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             session.peer_public_key()
@@ -646,66 +658,14 @@ async fn handle_noise_connection(
             "Received request over Noise"
         );
 
-        // Route based on method and path
-        let (status, status_text, response_body) =
-            match (request.method.as_str(), request.path.as_str()) {
-                ("POST", "/cluster/gossip") => {
-                    // Parse gossip message
-                    match serde_json::from_slice::<cluster::GossipMessage>(&request.body) {
-                        Ok(msg) => {
-                            // Verify peer identity matches message
-                            if msg.origin.node_id != peer_node_id {
-                                (
-                                    403,
-                                    "Forbidden",
-                                    serde_json::json!({"error": "Peer node_id mismatch"})
-                                        .to_string(),
-                                )
-                            } else {
-                                // Process the gossip message
-                                cluster::process_gossip_message(&state, msg, Some(remote_addr))
-                                    .await;
-                                (200, "OK", serde_json::json!({"status": "ok"}).to_string())
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to parse gossip message over Noise");
-                            (
-                                400,
-                                "Bad Request",
-                                serde_json::json!({"error": format!("Invalid JSON: {}", e)})
-                                    .to_string(),
-                            )
-                        }
-                    }
-                }
-                _ => {
-                    // Unknown endpoint
-                    tracing::debug!(
-                        method = %request.method,
-                        path = %request.path,
-                        "Unknown Noise endpoint"
-                    );
-                    (
-                        404,
-                        "Not Found",
-                        serde_json::json!({"error": "Endpoint not found"}).to_string(),
-                    )
-                }
-            };
+        let response = match (request.method.as_str(), request.path.as_str()) {
+            ("POST", "/cluster/gossip") => {
+                handle_noise_gossip(&state, request.body.as_ref(), &peer_node_id, remote_addr).await
+            }
+            _ => handle_noise_http_request(state.clone(), request).await,
+        };
 
-        // Send encrypted response
-        let headers = [("Content-Type", "application/json")];
-        if let Err(e) = crate::noise::transport::send_response(
-            &mut session,
-            &mut tcp_stream,
-            status,
-            status_text,
-            &headers,
-            response_body.as_bytes(),
-        )
-        .await
-        {
+        if let Err(e) = send_noise_response(&mut session, &mut tcp_stream, response).await {
             tracing::debug!(
                 remote_addr = %remote_addr,
                 error = %e,
@@ -714,6 +674,102 @@ async fn handle_noise_connection(
             break;
         }
     }
+}
+
+async fn handle_noise_gossip(
+    state: &Arc<NodeState>,
+    body: &[u8],
+    peer_node_id: &str,
+    remote_addr: SocketAddr,
+) -> axum::response::Response {
+    match serde_json::from_slice::<cluster::GossipMessage>(body) {
+        Ok(msg) => {
+            if msg.origin.node_id != peer_node_id {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "Peer node_id mismatch"})),
+                )
+                    .into_response();
+            }
+
+            cluster::process_gossip_message(state, msg, Some(remote_addr)).await;
+            Json(serde_json::json!({"status": "ok"})).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to parse gossip message over Noise");
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid JSON: {}", e)})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn handle_noise_http_request(
+    state: Arc<NodeState>,
+    request: crate::noise::transport::NoiseRequest,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method(request.method.as_str())
+        .uri(request.path.as_str());
+
+    if let Some(headers) = builder.headers_mut() {
+        for (name, value) in request.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_str(&value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+    }
+
+    let req = match builder.body(Body::from(request.body)) {
+        Ok(req) => req,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid request: {}", e)})),
+            )
+                .into_response()
+        }
+    };
+
+    match router::route_request(State(state), req).await {
+        Ok(resp) => resp.into_response(),
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn send_noise_response(
+    session: &mut crate::noise::handshake::NoiseSession,
+    stream: &mut tokio::net::TcpStream,
+    response: axum::response::Response,
+) -> crate::noise::Result<()> {
+    let status = response.status();
+    let status_text = status.canonical_reason().unwrap_or("");
+    let (parts, mut body) = response.into_parts();
+
+    crate::noise::transport::send_response_head(
+        session,
+        stream,
+        status.as_u16(),
+        status_text,
+        &parts.headers,
+    )
+    .await?;
+
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| crate::noise::NoiseError::Transport(e.to_string()))?;
+        if let Some(data) = frame.data_ref() {
+            if !data.is_empty() {
+                crate::noise::transport::send_body_chunk(session, stream, data).await?;
+            }
+        }
+    }
+
+    crate::noise::transport::send_body_end(session, stream).await
 }
 
 async fn wait_for_drain(state: &NodeState) {

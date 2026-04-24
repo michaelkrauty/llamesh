@@ -4,15 +4,31 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
 
-pub async fn setup_mock_script(root: &Path, suffix: &str) -> PathBuf {
-    let mock_script = root.join(format!("tests/mock_server_{}.sh", suffix));
-    let mut mock_bin = root.join("target/release/mock_llama_server");
-    if !mock_bin.exists() {
-        let debug_bin = root.join("target/debug/mock_llama_server");
-        if debug_bin.exists() {
-            mock_bin = debug_bin;
-        }
+pub fn llamesh_binary(root: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("CARGO_BIN_EXE_llamesh") {
+        return PathBuf::from(path);
     }
+
+    let debug_bin = root.join("target/debug/llamesh");
+    if debug_bin.exists() {
+        debug_bin
+    } else {
+        root.join("target/release/llamesh")
+    }
+}
+
+pub async fn setup_mock_script(root: &Path, suffix: &str) -> PathBuf {
+    let mock_script = root.join(format!("tests/mock_server_{suffix}.sh"));
+    let mock_bin = std::env::var_os("CARGO_BIN_EXE_mock_llama_server")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let debug_bin = root.join("target/debug/mock_llama_server");
+            if debug_bin.exists() {
+                debug_bin
+            } else {
+                root.join("target/release/mock_llama_server")
+            }
+        });
     let script_content = format!(
         r#"#!/bin/bash
 BIN="{}"
@@ -51,7 +67,7 @@ pub async fn cleanup_by_port_range_pattern(port_pattern: &str) {
     // Kill mock_llama_server processes that match the port pattern
     // e.g. port_pattern = "1300[0-9]"
     // match "--port 1300[0-9]"
-    let full_pattern = format!("mock_llama_server.*--port {}", port_pattern);
+    let full_pattern = format!("mock_llama_server.*--port {port_pattern}");
     let _ = tokio::process::Command::new("pkill")
         .arg("-f")
         .arg(&full_pattern)
@@ -80,7 +96,7 @@ pub async fn wait_for_ready(base_url: &str) -> bool {
         .unwrap();
 
     for _ in 0..60 {
-        if let Ok(resp) = client.get(format!("{}/healthz", base_url)).send().await {
+        if let Ok(resp) = client.get(format!("{base_url}/healthz")).send().await {
             if resp.status().is_success() {
                 return true;
             }
@@ -123,9 +139,9 @@ pub async fn load_config_from_template(params: &TestConfigParams<'_>) -> String 
 /// Load a cookbook fixture by name (without .yaml extension)
 #[allow(dead_code)]
 pub async fn load_cookbook_fixture(name: &str) -> String {
-    tokio::fs::read_to_string(format!("tests/fixtures/{}.yaml", name))
+    tokio::fs::read_to_string(format!("tests/fixtures/{name}.yaml"))
         .await
-        .unwrap_or_else(|_| panic!("Failed to read cookbook fixture: {}", name))
+        .unwrap_or_else(|_| panic!("Failed to read cookbook fixture: {name}"))
 }
 
 /// Find an available port in the given range

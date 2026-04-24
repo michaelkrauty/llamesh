@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-04-24
+
+### Added
+
+- Peer forwarding now supports the Noise transport, including streamed response
+  bodies, so inter-node request routing uses the same encrypted channel as
+  cluster gossip.
+- The repository now declares Rust 1.88 as its minimum supported Rust version.
+
+### Changed
+
+- Noise identity keys now use X25519 key material with `noise25519:` public key
+  identifiers. Existing `ed25519:` known-peer entries are normalized for
+  compatibility.
+- Dependency set was refreshed to remove vulnerable or obsolete transitive
+  dependencies, including the legacy Hyper 0.14 stack.
+
+### Fixed
+
+- `/cluster/gossip` rejects plain HTTP when Noise is enabled and cluster mTLS
+  is not configured, preventing accidental unencrypted peer metadata exchange.
+- Peer circuit breakers now distinguish successful and failed peer responses,
+  including failures returned through Noise transport.
+- Request queue cancellation and timeout paths now remove abandoned waiters and
+  pending queue tokens instead of leaving stale queue state behind.
+- Auth checks now consistently protect `/v1/models`, `/metrics`, and
+  `/metrics/json` when API-key auth is enabled.
+- Release-mode port-pool tests no longer depend on ports in the kernel's
+  ephemeral range.
+- Integration tests now prefer Cargo-provided binaries instead of stale
+  `target/release` artifacts.
+
 ## [1.2.0] - 2026-04-24
 
 ### Added

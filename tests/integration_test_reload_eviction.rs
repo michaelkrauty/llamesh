@@ -8,7 +8,8 @@ use tokio::time::sleep;
 
 mod common;
 use common::{
-    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, setup_mock_script, wait_for_ready,
+    cleanup_by_port_range_pattern, cleanup_procs, graceful_stop, llamesh_binary, setup_mock_script,
+    wait_for_ready,
 };
 
 const LISTEN_ADDR: &str = "127.0.0.1:9210";
@@ -170,11 +171,7 @@ models:
 async fn wait_for_unload(client: &reqwest::Client, model_key: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client
-            .get(format!("{}/cluster/nodes", BASE_URL))
-            .send()
-            .await
-        {
+        if let Ok(resp) = client.get(format!("{BASE_URL}/cluster/nodes")).send().await {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 let loaded = json["nodes"]["test-reload-drain"]["loaded_models"]
                     .as_array()
@@ -199,7 +196,7 @@ async fn wait_for_model_unlisted(
 ) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(format!("{}/v1/models", BASE_URL)).send().await {
+        if let Ok(resp) = client.get(format!("{BASE_URL}/v1/models")).send().await {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 let data = json["data"].as_array().cloned().unwrap_or_default();
                 if !data.iter().any(|m| m["id"].as_str() == Some(model_id)) {
@@ -221,7 +218,7 @@ async fn wait_for_model_listed(
 ) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(format!("{}/v1/models", BASE_URL)).send().await {
+        if let Ok(resp) = client.get(format!("{BASE_URL}/v1/models")).send().await {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
                 let data = json["data"].as_array().cloned().unwrap_or_default();
                 if data.iter().any(|m| m["id"].as_str() == Some(model_id)) {
@@ -240,7 +237,7 @@ async fn spawn_instance_for(client: &reqwest::Client, model: &str) {
         "messages": [{"role": "user", "content": "hi"}],
     });
     let resp = client
-        .post(format!("{}/v1/chat/completions", BASE_URL))
+        .post(format!("{BASE_URL}/v1/chat/completions"))
         .json(&body)
         .send()
         .await
@@ -248,8 +245,7 @@ async fn spawn_instance_for(client: &reqwest::Client, model: &str) {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "request to spawn {} failed",
-        model
+        "request to spawn {model} failed"
     );
 }
 
@@ -279,13 +275,7 @@ async fn reload_drains_orphaned_instances() {
     let mock_script = setup_mock_script(&root, "reload_eviction").await;
     let config_path = root.join("tests/config_reload_eviction.yaml");
     let cookbook_path = root.join("tests/cookbook_reload_eviction.yaml");
-    let mut proxy_bin = root.join("target/release/llamesh");
-    if !proxy_bin.exists() {
-        let debug_bin = root.join("target/debug/llamesh");
-        if debug_bin.exists() {
-            proxy_bin = debug_bin;
-        }
-    }
+    let proxy_bin = llamesh_binary(&root);
 
     tokio::fs::write(&config_path, config_yaml(&mock_script))
         .await
@@ -317,7 +307,7 @@ async fn reload_drains_orphaned_instances() {
     spawn_instance_for(&client, "mock-model:default").await;
 
     let resp = client
-        .get(format!("{}/cluster/nodes", BASE_URL))
+        .get(format!("{BASE_URL}/cluster/nodes"))
         .send()
         .await
         .unwrap();
@@ -330,8 +320,7 @@ async fn reload_drains_orphaned_instances() {
         loaded
             .iter()
             .any(|m| m.as_str() == Some("mock-model:default")),
-        "expected mock-model:default to be loaded, got {:?}",
-        loaded
+        "expected mock-model:default to be loaded, got {loaded:?}"
     );
 
     // Case 1 uses an in-place write (the OpenAI-text-editor path).

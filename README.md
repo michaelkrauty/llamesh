@@ -28,7 +28,7 @@ cd llamesh
 cargo build --release
 ```
 
-**Requirements:** Rust 1.80+, CMake, C/C++ compiler, git
+**Requirements:** Rust 1.88+, CMake, C/C++ compiler, git
 
 ### Configure
 

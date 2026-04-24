@@ -607,8 +607,7 @@ pub async fn render_prometheus_with_circuit_breaker(
         };
 
         out.push_str(&format!(
-            "proxy_hash_p95_latency_ms{{hash=\"{}\",names=\"{}\"}} {}\n",
-            escaped_hash, escaped_names, p95
+            "proxy_hash_p95_latency_ms{{hash=\"{escaped_hash}\",names=\"{escaped_names}\"}} {p95}\n"
         ));
 
         out.push_str(&format!(

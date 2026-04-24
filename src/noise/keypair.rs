@@ -1,4 +1,4 @@
-//! Ed25519 keypair management for node identity.
+//! Noise static key management for node identity.
 //!
 //! Keys are stored in ~/.llama-mesh/node.key with mode 600.
 //! Supports env var override via NODE_PRIVATE_KEY (base64-encoded).
@@ -6,65 +6,55 @@
 use super::permissions::{self, FILE_MODE};
 use super::{NoiseError, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::fs;
 use std::path::Path;
+use x25519_dalek::{PublicKey, StaticSecret};
 
-/// Node keypair wrapper
+/// Node static key wrapper for Noise_XX_25519.
 #[derive(Clone)]
 pub struct NodeKeypair {
-    signing_key: SigningKey,
+    private_key: [u8; 32],
 }
 
 impl NodeKeypair {
-    /// Generate a new random keypair
+    /// Generate a new random static keypair.
     pub fn generate() -> Self {
-        // Generate 32 random bytes for the seed
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).expect("Failed to generate random seed");
-        let signing_key = SigningKey::from_bytes(&seed);
-        Self { signing_key }
+        let mut private_key = [0u8; 32];
+        getrandom::getrandom(&mut private_key).expect("Failed to generate random key");
+        Self { private_key }
     }
 
-    /// Load keypair from bytes (32-byte seed)
+    /// Load keypair from raw 32-byte Noise static private key material.
     pub fn from_seed(seed: &[u8; 32]) -> Self {
-        let signing_key = SigningKey::from_bytes(seed);
-        Self { signing_key }
+        Self { private_key: *seed }
     }
 
-    /// Get the signing key (for noise handshake)
-    #[allow(dead_code)] // Reserved for future signing operations
-    pub fn signing_key(&self) -> &SigningKey {
-        &self.signing_key
-    }
-
-    /// Get the verifying (public) key
-    pub fn verifying_key(&self) -> VerifyingKey {
-        self.signing_key.verifying_key()
-    }
-
-    /// Get public key bytes
-    pub fn public_key_bytes(&self) -> [u8; 32] {
-        self.verifying_key().to_bytes()
-    }
-
-    /// Get private key seed bytes
+    /// Get private key bytes for the Noise handshake.
     pub fn private_key_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+        self.private_key
     }
 
-    /// Get public key in display format: ed25519:base64...
+    /// Get the X25519 public key bytes used by the Noise handshake.
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        let secret = StaticSecret::from(self.private_key);
+        PublicKey::from(&secret).to_bytes()
+    }
+
+    /// Get public key in display format: noise25519:base64...
     pub fn public_key_display(&self) -> String {
-        format!("ed25519:{}", BASE64.encode(self.public_key_bytes()))
+        format!("noise25519:{}", BASE64.encode(self.public_key_bytes()))
     }
 
     /// Parse a public key from display format
     #[allow(dead_code)] // Used in tests, reserved for key management CLI
     pub fn parse_public_key(s: &str) -> Result<[u8; 32]> {
-        let s = s.strip_prefix("ed25519:").unwrap_or(s);
+        let s = s
+            .strip_prefix("noise25519:")
+            .or_else(|| s.strip_prefix("ed25519:"))
+            .unwrap_or(s);
         let bytes = BASE64
             .decode(s)
-            .map_err(|e| NoiseError::KeyFile(format!("Invalid base64: {}", e)))?;
+            .map_err(|e| NoiseError::KeyFile(format!("Invalid base64: {e}")))?;
         bytes
             .try_into()
             .map_err(|_| NoiseError::KeyFile("Public key must be 32 bytes".into()))
@@ -91,13 +81,13 @@ impl NodeKeypair {
         let encoded = fs::read_to_string(path)?;
         let bytes = BASE64
             .decode(encoded.trim())
-            .map_err(|e| NoiseError::KeyFile(format!("Invalid base64 in key file: {}", e)))?;
+            .map_err(|e| NoiseError::KeyFile(format!("Invalid base64 in key file: {e}")))?;
 
-        let seed: [u8; 32] = bytes
+        let private_key: [u8; 32] = bytes
             .try_into()
             .map_err(|_| NoiseError::KeyFile("Key file must contain 32 bytes".into()))?;
 
-        Ok(Self::from_seed(&seed))
+        Ok(Self::from_seed(&private_key))
     }
 }
 
@@ -111,12 +101,12 @@ pub fn get_or_create(
     if let Ok(env_key) = std::env::var("NODE_PRIVATE_KEY") {
         let bytes = BASE64
             .decode(env_key.trim())
-            .map_err(|e| NoiseError::KeyFile(format!("Invalid NODE_PRIVATE_KEY env var: {}", e)))?;
-        let seed: [u8; 32] = bytes
+            .map_err(|e| NoiseError::KeyFile(format!("Invalid NODE_PRIVATE_KEY env var: {e}")))?;
+        let private_key: [u8; 32] = bytes
             .try_into()
             .map_err(|_| NoiseError::KeyFile("NODE_PRIVATE_KEY must be 32 bytes base64".into()))?;
         tracing::info!("Using node keypair from NODE_PRIVATE_KEY env var");
-        return Ok(NodeKeypair::from_seed(&seed));
+        return Ok(NodeKeypair::from_seed(&private_key));
     }
 
     let key_path = config.effective_private_key_path(config_dir);
@@ -207,7 +197,7 @@ mod tests {
         let keypair = NodeKeypair::generate();
         // Get the base64 part without prefix
         let display = keypair.public_key_display();
-        let base64_only = display.strip_prefix("ed25519:").unwrap();
+        let base64_only = display.strip_prefix("noise25519:").unwrap();
 
         // Should still parse correctly
         let parsed = NodeKeypair::parse_public_key(base64_only).unwrap();
@@ -223,8 +213,16 @@ mod tests {
     #[test]
     fn test_parse_public_key_wrong_length() {
         // Valid base64 but wrong length (only 16 bytes)
-        let result = NodeKeypair::parse_public_key("ed25519:AAAAAAAAAAAAAAAAAAAAAA==");
+        let result = NodeKeypair::parse_public_key("noise25519:AAAAAAAAAAAAAAAAAAAAAA==");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_public_key_legacy_ed25519_prefix() {
+        let keypair = NodeKeypair::generate();
+        let legacy = format!("ed25519:{}", BASE64.encode(keypair.public_key_bytes()));
+        let parsed = NodeKeypair::parse_public_key(&legacy).unwrap();
+        assert_eq!(keypair.public_key_bytes(), parsed);
     }
 
     #[test]
