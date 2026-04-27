@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-04-27
+
+### Fixed
+
+- Treat `stream: true` as a streaming response only on text-generation
+  endpoints. Embedding and rerank requests now use non-streaming cleanup and
+  strip the unsupported `stream` flag before forwarding, preventing stuck
+  request accounting from keeping an idle embedding instance alive.
+- Request queues now prune abandoned waiters and wake queued requests when an
+  existing ready instance has available capacity before rejecting a fresh
+  request as `queue_full`.
+
 ## [1.3.1] - 2026-04-24
 
 ### Fixed
