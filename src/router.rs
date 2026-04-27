@@ -360,11 +360,17 @@ pub async fn route_request(
         .map(|s| s.to_string())
         .unwrap_or_else(|| state.config.default_model.clone());
 
-    // Check if streaming is requested
-    let stream_requested = json_body
+    // Only text-generation endpoints have a streaming response shape. Some
+    // OpenAI clients include `stream` on all requests; embeddings/rerank must
+    // still use non-streaming cleanup semantics.
+    let client_stream_requested = json_body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let response_streaming =
+        response_streaming_for_endpoint(endpoint_kind, client_stream_requested);
+    let forward_body =
+        request_body_for_endpoint(&json_body, endpoint_kind, client_stream_requested, &bytes);
 
     let session_id = parts
         .headers
@@ -445,7 +451,7 @@ pub async fn route_request(
                         method: parts.method.clone(),
                         path_and_query: &path_and_query,
                         headers: forward_headers,
-                        body: bytes.clone(),
+                        body: forward_body.clone(),
                         timeout_ms,
                     },
                 )
@@ -481,7 +487,7 @@ pub async fn route_request(
                         let tokens_counter = Arc::new(AtomicU64::new(0));
                         return Ok(peer_response_to_client(
                             resp,
-                            stream_requested,
+                            response_streaming,
                             cleanup_fut,
                             tokens_counter,
                         )
@@ -596,6 +602,8 @@ pub async fn route_request(
 
                     let mut headers = parts.headers.clone();
                     headers.remove(axum::http::header::HOST);
+                    headers.remove(axum::http::header::CONTENT_LENGTH);
+                    headers.remove(axum::http::header::TRANSFER_ENCODING);
 
                     // Inject authorization if the profile defines an API key
                     if let Some(api_key) = profile.get_api_key() {
@@ -618,7 +626,7 @@ pub async fn route_request(
                         .http_client
                         .request(parts.method, &url)
                         .headers(headers)
-                        .body(bytes);
+                        .body(forward_body.clone());
 
                     if timeout_ms > 0 {
                         client_req = client_req.timeout(Duration::from_millis(timeout_ms));
@@ -713,7 +721,7 @@ pub async fn route_request(
                             // Transfer responsibility to cleanup_fut
                             guard.complete();
 
-                            Ok(if stream_requested {
+                            Ok(if response_streaming {
                                 build_streaming_response(resp, cleanup_fut, tokens_counter)
                             } else {
                                 handle_non_streaming_response(resp, cleanup_fut, tokens_counter)
@@ -762,7 +770,7 @@ pub async fn route_request(
                                     method: parts.method.clone(),
                                     path_and_query: &path_and_query,
                                     headers: forward_headers,
-                                    body: bytes.clone(),
+                                    body: forward_body.clone(),
                                     timeout_ms,
                                 },
                             )
@@ -800,7 +808,7 @@ pub async fn route_request(
 
                                     return Ok(peer_response_to_client(
                                         resp,
-                                        stream_requested,
+                                        response_streaming,
                                         cleanup_fut,
                                         tokens_counter,
                                     )
@@ -878,7 +886,7 @@ pub async fn route_request(
                     method: parts.method.clone(),
                     path_and_query: &path_and_query,
                     headers: forward_headers,
-                    body: bytes.clone(),
+                    body: forward_body.clone(),
                     timeout_ms,
                 },
             )
@@ -917,8 +925,13 @@ pub async fn route_request(
                     // Transfer responsibility to cleanup_fut
                     guard.complete();
 
-                    Ok(peer_response_to_client(resp, stream_requested, cleanup_fut, tokens_counter)
-                        .await)
+                    Ok(peer_response_to_client(
+                        resp,
+                        response_streaming,
+                        cleanup_fut,
+                        tokens_counter,
+                    )
+                    .await)
                 }
                 Err(e) => {
                     // peer_forward_guard drops here, releasing the counter.
@@ -1414,7 +1427,7 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EndpointKind {
     Text,
     Embeddings,
@@ -1434,6 +1447,39 @@ impl EndpointKind {
             EndpointKind::Other
         }
     }
+}
+
+fn response_streaming_for_endpoint(
+    endpoint_kind: EndpointKind,
+    client_stream_requested: bool,
+) -> bool {
+    client_stream_requested && matches!(endpoint_kind, EndpointKind::Text)
+}
+
+fn request_body_for_endpoint(
+    json_body: &Value,
+    endpoint_kind: EndpointKind,
+    client_stream_requested: bool,
+    original: &Bytes,
+) -> Bytes {
+    if !client_stream_requested
+        || !matches!(
+            endpoint_kind,
+            EndpointKind::Embeddings | EndpointKind::Rerank
+        )
+    {
+        return original.clone();
+    }
+
+    let Some(object) = json_body.as_object() else {
+        return original.clone();
+    };
+
+    let mut sanitized = object.clone();
+    sanitized.remove("stream");
+    serde_json::to_vec(&Value::Object(sanitized))
+        .map(Bytes::from)
+        .unwrap_or_else(|_| original.clone())
 }
 
 fn ensure_profile_supports_endpoint(
@@ -1561,6 +1607,35 @@ mod tests {
             EndpointKind::from_path("/other"),
             EndpointKind::Other
         ));
+    }
+
+    #[test]
+    fn test_response_streaming_is_text_endpoint_only() {
+        assert!(response_streaming_for_endpoint(EndpointKind::Text, true));
+        assert!(!response_streaming_for_endpoint(EndpointKind::Text, false));
+        assert!(!response_streaming_for_endpoint(
+            EndpointKind::Embeddings,
+            true
+        ));
+        assert!(!response_streaming_for_endpoint(EndpointKind::Rerank, true));
+        assert!(!response_streaming_for_endpoint(EndpointKind::Other, true));
+    }
+
+    #[test]
+    fn test_request_body_strips_stream_from_non_text_endpoints() {
+        let body = json!({
+            "model": "embedding-model",
+            "input": "hello",
+            "stream": true
+        });
+        let original = Bytes::from(serde_json::to_vec(&body).unwrap());
+
+        let sanitized = request_body_for_endpoint(&body, EndpointKind::Embeddings, true, &original);
+        let sanitized_json: Value = serde_json::from_slice(&sanitized).unwrap();
+        assert!(sanitized_json.get("stream").is_none());
+
+        let text_body = request_body_for_endpoint(&body, EndpointKind::Text, true, &original);
+        assert_eq!(text_body, original);
     }
 
     // Compile-time validation of buffer size bounds
