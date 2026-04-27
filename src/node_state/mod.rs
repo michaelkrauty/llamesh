@@ -1091,6 +1091,24 @@ impl NodeState {
             // FAIRNESS CHECK: Fresh requests must yield to queued/pending waiters
             // Notified waiters (with token) skip this check to claim their priority slot
             if my_token.is_none() && self.has_pending_waiters(model_name, &profile.id).await {
+                let woken = self
+                    .notify_waiters_for_available_slots(model_name, &profile.id)
+                    .await;
+                if woken > 0 {
+                    info!(
+                        event = "queue_wake_available_capacity",
+                        model = %model_name,
+                        profile = %profile.id,
+                        woken = woken
+                    );
+                }
+
+                // If the only waiters were stale closed receivers, the wake pass
+                // has pruned them and this request can try normal dispatch.
+                if !self.has_pending_waiters(model_name, &profile.id).await {
+                    continue;
+                }
+
                 // There are waiters ahead of us - join the queue instead of trying to grab slot
                 let key = format!("{}:{}", model_name, profile.id);
                 let (tx, rx) = oneshot::channel();
@@ -1110,6 +1128,14 @@ impl NodeState {
                     }
 
                     let queue = queues.entry(key.clone()).or_insert_with(VecDeque::new);
+                    let removed = Self::remove_closed_queue_entries(queue);
+                    if removed > 0 {
+                        info!(
+                            event = "queue_prune_closed",
+                            model = %model_name,
+                            removed = removed
+                        );
+                    }
                     let max_queue = profile.effective_max_queue_size(&self.config.model_defaults);
                     // 0 = unlimited queue size
                     if max_queue > 0 && queue.len() >= max_queue {
@@ -1369,6 +1395,14 @@ impl NodeState {
                             }
 
                             let queue = queues.entry(key.clone()).or_insert_with(VecDeque::new);
+                            let removed = Self::remove_closed_queue_entries(queue);
+                            if removed > 0 {
+                                info!(
+                                    event = "queue_prune_closed",
+                                    model = %model_name,
+                                    removed = removed
+                                );
+                            }
                             let max_queue =
                                 profile.effective_max_queue_size(&self.config.model_defaults);
                             // 0 = unlimited queue size
@@ -2382,6 +2416,78 @@ impl NodeState {
         false
     }
 
+    fn remove_closed_queue_entries(queue: &mut VecDeque<QueueEntry>) -> usize {
+        let before = queue.len();
+        queue.retain(|entry| !entry.tx.is_closed());
+        before - queue.len()
+    }
+
+    async fn pending_token_count(&self, key: &str) -> usize {
+        let pending = self.pending_tokens.read().await;
+        pending.get(key).map(|set| set.len()).unwrap_or(0)
+    }
+
+    async fn available_ready_slots_for_model(&self, model_name: &str, profile_id: &str) -> usize {
+        let max_concurrent = self
+            .config
+            .model_defaults
+            .max_concurrent_requests_per_instance;
+        let instances = self.instances.read().await;
+        let mut available = 0usize;
+
+        for inst_lock in instances.values() {
+            let inst = inst_lock.read().await;
+            if inst.model_name != model_name || inst.profile_id != profile_id {
+                continue;
+            }
+            if !inst.is_alive() || inst.draining.load(Ordering::Relaxed) {
+                continue;
+            }
+            if *inst.status.lock() != InstanceStatus::Ready {
+                continue;
+            }
+
+            if max_concurrent == 0 {
+                available = available.saturating_add(1);
+            } else if inst.in_flight_requests < max_concurrent {
+                available = available.saturating_add(max_concurrent - inst.in_flight_requests);
+            }
+        }
+
+        available
+    }
+
+    async fn notify_waiters_for_available_slots(
+        &self,
+        model_name: &str,
+        profile_id: &str,
+    ) -> usize {
+        let key = format!("{model_name}:{profile_id}");
+        let available = self
+            .available_ready_slots_for_model(model_name, profile_id)
+            .await;
+        if available == 0 {
+            return 0;
+        }
+
+        let pending = self.pending_token_count(&key).await;
+        let wake_budget = available.saturating_sub(pending);
+        if wake_budget == 0 {
+            return 0;
+        }
+
+        let mut woken = 0usize;
+        for _ in 0..wake_budget {
+            if self.notify_queue(model_name, profile_id).await {
+                woken += 1;
+            } else {
+                break;
+            }
+        }
+
+        woken
+    }
+
     /// Remove a pending token after waiter successfully acquires slot or times out.
     async fn remove_pending_token(&self, model_name: &str, profile_id: &str, token: u64) {
         let key = format!("{model_name}:{profile_id}");
@@ -2418,7 +2524,7 @@ impl NodeState {
     /// Pops waiters from the queue until one successfully receives the notification.
     /// Dropped/closed receivers are skipped. Promotes the queued token to pending
     /// for the notified waiter.
-    pub async fn notify_queue(&self, model_name: &str, profile_id: &str) {
+    pub async fn notify_queue(&self, model_name: &str, profile_id: &str) -> bool {
         let key = format!("{model_name}:{profile_id}");
         // LOCK_ORDER: queues (2) - will release before pending_tokens (3)
         let mut queues = self.queues.write().await;
@@ -2434,11 +2540,12 @@ impl NodeState {
                     pending.entry(key).or_default().insert(token);
                     self.metrics.inc_pending_tokens();
                     info!(event = "queue_dequeue", model = %model_name, token = token);
-                    return;
+                    return true;
                 }
                 // Receiver dropped, try next waiter (token not added to pending)
             }
         }
+        false
     }
 
     /// Notify one waiter per model that capacity is available.
@@ -3028,6 +3135,14 @@ mod tests {
         }
     }
 
+    fn attach_live_test_child(inst: &Instance) {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep test child");
+        *inst.child.lock() = Some(child);
+    }
+
     fn gpu_snapshot(used_mb: u64, total_mb: u64) -> GpuMemorySnapshot {
         GpuMemorySnapshot {
             used_mb,
@@ -3230,6 +3345,103 @@ mod tests {
 
         let pending = state.pending_tokens.read().await;
         assert!(pending.get(&key).is_some_and(|set| set.contains(&token)));
+    }
+
+    #[tokio::test]
+    async fn notify_waiters_for_available_slots_wakes_queued_waiter() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        config.model_defaults.max_concurrent_requests_per_instance = 1;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+
+        let inst = Instance::new(
+            "inst-a".into(),
+            "test".into(),
+            "default".into(),
+            "127.0.0.1".into(),
+            8000,
+            "hash".into(),
+            false,
+        );
+        *inst.status.lock() = InstanceStatus::Ready;
+        attach_live_test_child(&inst);
+        state
+            .instances
+            .write()
+            .await
+            .insert("inst-a".into(), Arc::new(RwLock::new(inst)));
+
+        let key = "test:default".to_string();
+        let token = 44;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut queues = state.queues.write().await;
+            queues.insert(key.clone(), VecDeque::from([QueueEntry { token, tx }]));
+        }
+
+        let woken = state
+            .notify_waiters_for_available_slots("test", "default")
+            .await;
+
+        assert_eq!(woken, 1);
+        assert_eq!(rx.await.unwrap(), token);
+        let queues = state.queues.read().await;
+        assert!(queues.get(&key).is_some_and(|queue| queue.is_empty()));
+        drop(queues);
+
+        let pending = state.pending_tokens.read().await;
+        assert!(pending.get(&key).is_some_and(|set| set.contains(&token)));
+    }
+
+    #[tokio::test]
+    async fn get_instance_prunes_closed_waiter_before_queue_full() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        config.model_defaults.max_concurrent_requests_per_instance = 1;
+        config.model_defaults.max_queue_size_per_model = 1;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+
+        let profile = sample_profile();
+        let inst = Instance::new(
+            "inst-a".into(),
+            "test".into(),
+            "default".into(),
+            "127.0.0.1".into(),
+            8000,
+            "hash".into(),
+            false,
+        );
+        *inst.status.lock() = InstanceStatus::Ready;
+        attach_live_test_child(&inst);
+        state
+            .instances
+            .write()
+            .await
+            .insert("inst-a".into(), Arc::new(RwLock::new(inst)));
+
+        let key = "test:default".to_string();
+        let (tx, rx) = oneshot::channel();
+        drop(rx);
+        {
+            let mut queues = state.queues.write().await;
+            queues.insert(key.clone(), VecDeque::from([QueueEntry { token: 45, tx }]));
+        }
+
+        let instance = state
+            .get_instance_for_model("test", &profile, true)
+            .await
+            .expect("closed queue entry should be pruned before queue capacity is enforced");
+
+        assert_eq!(instance.read().await.id, "inst-a");
+        assert_eq!(instance.read().await.in_flight_requests, 1);
+        let queues = state.queues.read().await;
+        assert!(queues.get(&key).is_none_or(|queue| queue.is_empty()));
     }
 
     #[tokio::test]
