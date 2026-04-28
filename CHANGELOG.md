@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-04-28
+
+### Fixed
+
+- Queue priority tokens are now owned by cancellation-safe permits after a
+  waiter is dequeued. If the waiting request is cancelled before it acquires
+  capacity or requeues, the pending token is removed automatically so stale
+  fairness state cannot permanently block fresh dispatch.
+- Local response cleanup now releases request and instance accounting before
+  awaiting drain or queue state. This preserves graceful drain scheduling while
+  avoiding a lock-order inversion that could leave an idle backend appearing
+  full after cancelled or completed non-streaming work.
+- Non-streaming Noise peer responses now install cleanup before buffering the
+  peer body, so client cancellation after peer headers arrive cannot leak node
+  request accounting or peer-forward slots.
+- Drain cancellation checks no longer hold individual instance locks while
+  awaiting queue state.
+
 ## [1.3.2] - 2026-04-27
 
 ### Fixed

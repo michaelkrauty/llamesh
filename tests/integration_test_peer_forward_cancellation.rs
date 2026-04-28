@@ -1,8 +1,11 @@
-//! Verifies that a cancelled request in the forward-to-peer path does not
-//! leak the node-level `current_requests` gauge. Regression coverage for the
-//! counter leak in the local-unknown-model forward handler, where a missing
-//! `RequestGuard` let the `inc_requests()` at the top of the path go
-//! unbalanced on cancellation.
+//! Verifies that cancelled requests in the forward-to-peer path do not leak
+//! the node-level `current_requests` gauge. Regression coverage for two peer
+//! forwarding cancellation sites:
+//!
+//! - forwarding before response headers arrive, where a missing `RequestGuard`
+//!   let the `inc_requests()` at the top of the path go unbalanced;
+//! - Noise peer response body buffering after response headers arrive, where
+//!   the cleanup future was not guarded before awaiting the body stream.
 //!
 //! Setup: two nodes A and B with gossip enabled. Node A owns `peer-model`,
 //! Node B does not. A client sends a request for `peer-model` to Node B with
@@ -14,7 +17,7 @@
 //! interval after the abort. Without the fix, it stays > 0 forever.
 
 use reqwest::StatusCode;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -28,6 +31,10 @@ const NODE_A_ADDR: &str = "127.0.0.1:9230";
 const NODE_B_ADDR: &str = "127.0.0.1:9231";
 const NODE_A_URL: &str = "http://127.0.0.1:9230";
 const NODE_B_URL: &str = "http://127.0.0.1:9231";
+const NODE_A_BODY_ADDR: &str = "127.0.0.1:9232";
+const NODE_B_BODY_ADDR: &str = "127.0.0.1:9233";
+const NODE_A_BODY_URL: &str = "http://127.0.0.1:9232";
+const NODE_B_BODY_URL: &str = "http://127.0.0.1:9233";
 
 fn config_node(
     node_id: &str,
@@ -100,6 +107,44 @@ models:
         max_instances: 1
         llama_server_args: ""
 "#;
+
+/// Mock-server wrapper that sends response headers promptly, then pauses
+/// halfway through the non-streaming body.
+async fn setup_slow_body_mock_script(root: &Path, suffix: &str, body_delay_ms: u64) -> PathBuf {
+    let mock_script = root.join(format!("tests/mock_server_{suffix}.sh"));
+    let mock_bin = std::env::var_os("CARGO_BIN_EXE_mock_llama_server")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let debug_bin = root.join("target/debug/mock_llama_server");
+            if debug_bin.exists() {
+                debug_bin
+            } else {
+                root.join("target/release/mock_llama_server")
+            }
+        });
+    let script = format!(
+        r#"#!/bin/bash
+export MOCK_SLOW_BODY_MS={body_delay_ms}
+BIN="{}"
+"$BIN" "$@" &
+PID=$!
+trap "kill $PID" EXIT TERM INT
+wait $PID
+"#,
+        mock_bin.display()
+    );
+    tokio::fs::write(&mock_script, script).await.unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = tokio::fs::metadata(&mock_script)
+        .await
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o755);
+    tokio::fs::set_permissions(&mock_script, perms)
+        .await
+        .unwrap();
+    mock_script
+}
 
 async fn current_requests(client: &reqwest::Client, base_url: &str) -> u64 {
     let Ok(resp) = client.get(format!("{base_url}/metrics/json")).send().await else {
@@ -297,6 +342,161 @@ async fn cancelled_peer_forward_does_not_leak_current_requests() {
     graceful_stop(&mut proxy_b).await;
     cleanup_procs("mock_server_peer_fwd_cancel.sh").await;
     cleanup_by_port_range_pattern("1312[0-9]").await;
+    let _ = tokio::fs::remove_file(mock_script).await;
+    let _ = tokio::fs::remove_file(config_a_path).await;
+    let _ = tokio::fs::remove_file(cookbook_a_path).await;
+    let _ = tokio::fs::remove_file(config_b_path).await;
+    let _ = tokio::fs::remove_file(cookbook_b_path).await;
+}
+
+#[tokio::test]
+async fn cancelled_peer_forward_during_noise_body_buffer_does_not_leak_current_requests() {
+    cleanup_procs("mock_server_peer_fwd_body_cancel.sh").await;
+    cleanup_procs("config_peer_fwd_body_cancel").await;
+    cleanup_by_port_range_pattern("1313[0-9]").await;
+
+    let root = std::env::current_dir().unwrap();
+    let mock_script = setup_slow_body_mock_script(&root, "peer_fwd_body_cancel", 5000).await;
+
+    let config_a_path = root.join("tests/config_peer_fwd_body_cancel_a.yaml");
+    let cookbook_a_path = root.join("tests/cookbook_peer_fwd_body_cancel_a.yaml");
+    let config_b_path = root.join("tests/config_peer_fwd_body_cancel_b.yaml");
+    let cookbook_b_path = root.join("tests/cookbook_peer_fwd_body_cancel_b.yaml");
+
+    let proxy_bin = llamesh_binary(&root);
+
+    tokio::fs::write(
+        &config_a_path,
+        config_node(
+            "node-a-body-cancel",
+            NODE_A_BODY_ADDR,
+            NODE_B_BODY_URL,
+            13130,
+            13134,
+            &mock_script,
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(&cookbook_a_path, COOKBOOK_A)
+        .await
+        .unwrap();
+    tokio::fs::write(
+        &config_b_path,
+        config_node(
+            "node-b-body-cancel",
+            NODE_B_BODY_ADDR,
+            NODE_A_BODY_URL,
+            13135,
+            13139,
+            &mock_script,
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(&cookbook_b_path, COOKBOOK_B)
+        .await
+        .unwrap();
+
+    let mut proxy_a = tokio::process::Command::new(&proxy_bin)
+        .arg("--config")
+        .arg(&config_a_path)
+        .arg("--cookbook")
+        .arg(&cookbook_a_path)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to start proxy A");
+    let mut proxy_b = tokio::process::Command::new(&proxy_bin)
+        .arg("--config")
+        .arg(&config_b_path)
+        .arg("--cookbook")
+        .arg(&cookbook_b_path)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to start proxy B");
+
+    assert!(
+        wait_for_ready(NODE_A_BODY_URL).await,
+        "node A failed to ready"
+    );
+    assert!(
+        wait_for_ready(NODE_B_BODY_URL).await,
+        "node B failed to ready"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    assert!(
+        wait_for_peer_discovery(
+            &client,
+            NODE_B_BODY_URL,
+            "node-a-body-cancel",
+            Duration::from_secs(15)
+        )
+        .await,
+        "node B should discover node A within 15s"
+    );
+
+    let body = serde_json::json!({
+        "model": "peer-model:default",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+
+    // Warm up the peer path and spawn A's instance so the cancellation below
+    // lands after peer response headers, inside B's Noise body buffering.
+    let warmup_resp = client
+        .post(format!("{NODE_B_BODY_URL}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .expect("warmup forward should succeed");
+    assert_eq!(warmup_resp.status(), StatusCode::OK);
+    let _ = warmup_resp.bytes().await.expect("warmup body should read");
+
+    assert!(
+        wait_for_current_requests(&client, NODE_B_BODY_URL, 0, Duration::from_secs(10)).await,
+        "node B should have 0 in-flight requests after warmup"
+    );
+    assert!(
+        wait_for_current_requests(&client, NODE_A_BODY_URL, 0, Duration::from_secs(10)).await,
+        "node A should have 0 in-flight requests after warmup"
+    );
+
+    // The mock sends peer response headers promptly, then stalls the
+    // non-streaming body for 5s. A 1200ms client timeout cancels B while it is
+    // awaiting the peer Noise body stream.
+    let cancel_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(1200))
+        .build()
+        .unwrap();
+    let result = cancel_client
+        .post(format!("{NODE_B_BODY_URL}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await;
+    assert!(
+        result.is_err(),
+        "short-timeout request should fail before B finishes buffering peer body"
+    );
+
+    assert!(
+        wait_for_current_requests(&client, NODE_B_BODY_URL, 0, Duration::from_secs(10)).await,
+        "node B's current_requests should return to 0 within 10s after body-buffer cancel; \
+         observed {}",
+        current_requests(&client, NODE_B_BODY_URL).await
+    );
+    assert!(
+        wait_for_current_requests(&client, NODE_A_BODY_URL, 0, Duration::from_secs(10)).await,
+        "node A should finish any peer work accepted before B's client cancelled"
+    );
+
+    graceful_stop(&mut proxy_a).await;
+    graceful_stop(&mut proxy_b).await;
+    cleanup_procs("mock_server_peer_fwd_body_cancel.sh").await;
+    cleanup_by_port_range_pattern("1313[0-9]").await;
     let _ = tokio::fs::remove_file(mock_script).await;
     let _ = tokio::fs::remove_file(config_a_path).await;
     let _ = tokio::fs::remove_file(cookbook_a_path).await;

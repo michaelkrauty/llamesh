@@ -143,7 +143,95 @@ use crate::security;
 
 pub struct QueueEntry {
     token: u64,
-    tx: oneshot::Sender<u64>,
+    tx: oneshot::Sender<PendingQueuePermit>,
+}
+
+/// Owns a promoted queue token until the request either acquires capacity,
+/// requeues, errors, or is cancelled.
+pub struct PendingQueuePermit {
+    key: String,
+    token: u64,
+    pending_tokens: Arc<RwLock<HashMap<String, HashSet<u64>>>>,
+    metrics: Arc<Metrics>,
+    released: bool,
+}
+
+impl PendingQueuePermit {
+    fn new(
+        key: String,
+        token: u64,
+        pending_tokens: Arc<RwLock<HashMap<String, HashSet<u64>>>>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            key,
+            token,
+            pending_tokens,
+            metrics,
+            released: false,
+        }
+    }
+
+    async fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        remove_pending_token_from(
+            self.pending_tokens.clone(),
+            self.metrics.clone(),
+            self.key.clone(),
+            self.token,
+        )
+        .await;
+        self.released = true;
+    }
+}
+
+impl Drop for PendingQueuePermit {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+
+        let pending_tokens = self.pending_tokens.clone();
+        let metrics = self.metrics.clone();
+        let key = self.key.clone();
+        let token = self.token;
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    remove_pending_token_from(pending_tokens, metrics, key, token).await;
+                });
+            }
+            Err(_) => {
+                warn!(
+                    token = token,
+                    model_key = %key,
+                    "Pending queue token cleanup skipped: tokio runtime unavailable during drop"
+                );
+            }
+        }
+    }
+}
+
+async fn remove_pending_token_from(
+    pending_tokens: Arc<RwLock<HashMap<String, HashSet<u64>>>>,
+    metrics: Arc<Metrics>,
+    key: String,
+    token: u64,
+) {
+    let mut pending = pending_tokens.write().await;
+    let mut remove_empty = false;
+    if let Some(set) = pending.get_mut(&key) {
+        if set.remove(&token) {
+            metrics.dec_pending_tokens();
+        }
+        remove_empty = set.is_empty();
+    }
+    if remove_empty {
+        pending.remove(&key);
+    }
 }
 
 /// Drop-guard that decrements a per-peer pending-forward counter. Ensures the
@@ -1043,8 +1131,9 @@ impl NodeState {
         // (e.g., missing shared libraries, bad binary path).
         let mut consecutive_spawn_failures = 0u32;
 
-        // Token for this request - None = fresh request, Some = notified waiter with priority
-        let mut my_token: Option<u64> = None;
+        // Token for this request - None = fresh request, Some = notified waiter with priority.
+        // The permit owns pending-token cleanup if this future is cancelled.
+        let mut my_token: Option<PendingQueuePermit> = None;
         // Track when we first started waiting in queue (for metrics)
         let mut queue_start: Option<std::time::Instant> = None;
 
@@ -1055,9 +1144,8 @@ impl NodeState {
             // one more try — if it still fails, the binary is likely broken.
             const MAX_LOCAL_SPAWN_FAILURES: u32 = 3;
             if consecutive_spawn_failures >= MAX_LOCAL_SPAWN_FAILURES {
-                if let Some(token) = my_token {
-                    self.remove_pending_token(model_name, &profile.id, token)
-                        .await;
+                if let Some(mut token) = my_token.take() {
+                    token.release().await;
                 }
                 warn!(
                     event = "spawn_failures_exhausted",
@@ -1070,9 +1158,8 @@ impl NodeState {
             }
             // If node is draining, stop waiting and let the request fail fast
             if self.draining.load(Ordering::Relaxed) {
-                if let Some(token) = my_token {
-                    self.remove_pending_token(model_name, &profile.id, token)
-                        .await;
+                if let Some(mut token) = my_token.take() {
+                    token.release().await;
                 }
                 return Err(NodeError::Other(anyhow::anyhow!("Node is shutting down")));
             }
@@ -1080,9 +1167,8 @@ impl NodeState {
             if let Some(timeout) = queue_timeout {
                 if loop_start.elapsed() > timeout {
                     // Clean up pending token if we have one
-                    if let Some(token) = my_token {
-                        self.remove_pending_token(model_name, &profile.id, token)
-                            .await;
+                    if let Some(mut token) = my_token.take() {
+                        token.release().await;
                     }
                     return Err(NodeError::QueueTimeout);
                 }
@@ -1206,9 +1292,8 @@ impl NodeState {
             {
                 Ok(inst) => {
                     // Successfully acquired slot - clean up pending token and record metrics
-                    if let Some(token) = my_token.take() {
-                        self.remove_pending_token(model_name, &profile.id, token)
-                            .await;
+                    if let Some(mut token) = my_token.take() {
+                        token.release().await;
                     }
                     // Record queue wait time if we waited
                     if let Some(start) = queue_start {
@@ -1372,9 +1457,8 @@ impl NodeState {
                         );
 
                         // If we had a token but failed to acquire, clear it before re-queueing
-                        if let Some(token) = my_token.take() {
-                            self.remove_pending_token(model_name, &profile.id, token)
-                                .await;
+                        if let Some(mut token) = my_token.take() {
+                            token.release().await;
                         }
 
                         let key = format!("{}:{}", model_name, profile.id);
@@ -1480,9 +1564,8 @@ impl NodeState {
                         }
                     } else {
                         // Clean up token for non-retriable errors
-                        if let Some(token) = my_token {
-                            self.remove_pending_token(model_name, &profile.id, token)
-                                .await;
+                        if let Some(mut token) = my_token.take() {
+                            token.release().await;
                         }
                         return Err(e);
                     }
@@ -2491,12 +2574,13 @@ impl NodeState {
     /// Remove a pending token after waiter successfully acquires slot or times out.
     async fn remove_pending_token(&self, model_name: &str, profile_id: &str, token: u64) {
         let key = format!("{model_name}:{profile_id}");
-        let mut pending = self.pending_tokens.write().await;
-        if let Some(set) = pending.get_mut(&key) {
-            if set.remove(&token) {
-                self.metrics.dec_pending_tokens();
-            }
-        }
+        remove_pending_token_from(
+            self.pending_tokens.clone(),
+            self.metrics.clone(),
+            key,
+            token,
+        )
+        .await;
     }
 
     /// Remove a queued waiter by its preassigned token. This is used on timeout
@@ -2526,65 +2610,76 @@ impl NodeState {
     /// for the notified waiter.
     pub async fn notify_queue(&self, model_name: &str, profile_id: &str) -> bool {
         let key = format!("{model_name}:{profile_id}");
-        // LOCK_ORDER: queues (2) - will release before pending_tokens (3)
-        let mut queues = self.queues.write().await;
-        if let Some(queue) = queues.get_mut(&key) {
-            while let Some(entry) = queue.pop_front() {
-                let token = entry.token;
-
-                if entry.tx.send(token).is_ok() {
-                    // Successfully sent - add token to pending set
-                    // LOCK_ORDER: Must drop queues (2) before acquiring pending_tokens (3)
-                    drop(queues);
-                    let mut pending = self.pending_tokens.write().await;
-                    pending.entry(key).or_default().insert(token);
-                    self.metrics.inc_pending_tokens();
-                    info!(event = "queue_dequeue", model = %model_name, token = token);
-                    return true;
-                }
-                // Receiver dropped, try next waiter (token not added to pending)
-            }
-        }
-        false
+        self.notify_queue_by_key(&key).await
     }
 
     /// Notify one waiter per model that capacity is available.
     /// Called when overall node capacity frees up (e.g., instance crash, eviction).
     pub async fn notify_all_queues(&self) {
-        // LOCK_ORDER: queues (2) - will release before pending_tokens (3)
-        let mut queues = self.queues.write().await;
-        let mut tokens_to_add: Vec<(String, u64)> = Vec::new();
+        let keys: Vec<String> = {
+            let queues = self.queues.read().await;
+            queues.keys().cloned().collect()
+        };
 
-        for (key, queue) in queues.iter_mut() {
-            while let Some(entry) = queue.pop_front() {
-                let token = entry.token;
-                if entry.tx.send(token).is_ok() {
-                    tokens_to_add.push((key.clone(), token));
-                    info!(event = "queue_dequeue", model_key = %key, token = token);
-                    break; // Wake one waiter per model
-                }
-                // Receiver dropped, try next waiter
-            }
-        }
-        // LOCK_ORDER: Must drop queues (2) before acquiring pending_tokens (3)
-        drop(queues);
-
-        // Add all pending tokens in one lock acquisition
-        if !tokens_to_add.is_empty() {
-            let count = tokens_to_add.len();
-            // LOCK_ORDER: pending_tokens (3) - safe, queues already released
-            let mut pending = self.pending_tokens.write().await;
-            for (key, token) in tokens_to_add {
-                pending.entry(key).or_default().insert(token);
-            }
-            // Increment metrics for each token added
-            for _ in 0..count {
-                self.metrics.inc_pending_tokens();
-            }
+        for key in keys {
+            self.notify_queue_by_key(&key).await;
         }
 
         // Wake any cluster-aware waiters (route_or_wait callers)
         self.capacity_notify.notify_waiters();
+    }
+
+    async fn notify_queue_by_key(&self, key: &str) -> bool {
+        loop {
+            let entry = {
+                // LOCK_ORDER: queues (2) - released before pending_tokens (3)
+                let mut queues = self.queues.write().await;
+                let Some(queue) = queues.get_mut(key) else {
+                    return false;
+                };
+                let entry = queue.pop_front();
+                if queue.is_empty() {
+                    queues.remove(key);
+                }
+                entry
+            };
+
+            let Some(entry) = entry else {
+                return false;
+            };
+
+            let permit = self
+                .promote_pending_token(key.to_string(), entry.token)
+                .await;
+            match entry.tx.send(permit) {
+                Ok(()) => {
+                    info!(event = "queue_dequeue", model_key = %key, token = entry.token);
+                    return true;
+                }
+                Err(mut returned) => {
+                    returned.release().await;
+                    // Receiver dropped; try the next queued waiter for this model.
+                }
+            }
+        }
+    }
+
+    async fn promote_pending_token(&self, key: String, token: u64) -> PendingQueuePermit {
+        {
+            // LOCK_ORDER: pending_tokens (3) - queues already released
+            let mut pending = self.pending_tokens.write().await;
+            let inserted = pending.entry(key.clone()).or_default().insert(token);
+            if inserted {
+                self.metrics.inc_pending_tokens();
+            }
+        }
+
+        PendingQueuePermit::new(
+            key,
+            token,
+            self.pending_tokens.clone(),
+            self.metrics.clone(),
+        )
     }
 
     // ── Drain Scheduling ─────────────────────────────────────────────────
@@ -2621,34 +2716,51 @@ impl NodeState {
     /// peers or timed out). Notifies the drained model's queue so its
     /// pending requests can resume being dispatched.
     pub async fn maybe_cancel_drains(&self) {
-        let instances = self.instances.read().await;
-        for inst_lock in instances.values() {
-            let inst = inst_lock.read().await;
-            if !inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                continue;
+        let candidates: Vec<(Arc<RwLock<Instance>>, String, String, String)> = {
+            let instances = self.instances.read().await;
+            let mut candidates = Vec::new();
+            for inst_lock in instances.values() {
+                let inst = inst_lock.read().await;
+                if inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    candidates.push((
+                        inst_lock.clone(),
+                        inst.model_name.clone(),
+                        inst.profile_id.clone(),
+                        inst.id.clone(),
+                    ));
+                }
             }
+            candidates
+        };
+
+        for (inst_lock, model_name, profile_id, instance_id) in candidates {
             if self
-                .has_queued_competitors_needing_eviction(&inst.model_name)
+                .has_queued_competitors_needing_eviction(&model_name)
                 .await
             {
                 continue;
             }
 
+            let inst = inst_lock.write().await;
+            if inst.id != instance_id
+                || inst.model_name != model_name
+                || inst.profile_id != profile_id
+                || !inst.draining.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                continue;
+            }
             inst.draining
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            let model_name = inst.model_name.clone();
-            let profile_id = inst.profile_id.clone();
             info!(
                 event = "drain_cancelled",
                 model = %model_name,
                 profile = %profile_id,
-                instance_id = %inst.id,
+                instance_id = %instance_id,
                 "Drain cancelled — no more competitors needing eviction"
             );
             drop(inst);
-            drop(instances);
             self.notify_queue(&model_name, &profile_id).await;
-            return; // Released instances lock, must restart iteration
+            return;
         }
     }
 
@@ -3338,13 +3450,58 @@ mod tests {
 
         state.notify_queue("test", "default").await;
 
-        assert_eq!(rx.await.unwrap(), token);
+        let mut permit = rx.await.unwrap();
+        assert_eq!(permit.token, token);
         let queues = state.queues.read().await;
-        assert!(queues.get(&key).is_some_and(|queue| queue.is_empty()));
+        assert!(queues.get(&key).is_none_or(|queue| queue.is_empty()));
         drop(queues);
 
         let pending = state.pending_tokens.read().await;
         assert!(pending.get(&key).is_some_and(|set| set.contains(&token)));
+        drop(pending);
+
+        permit.release().await;
+        let pending = state.pending_tokens.read().await;
+        assert!(!pending.get(&key).is_some_and(|set| set.contains(&token)));
+    }
+
+    #[tokio::test]
+    async fn notify_queue_drops_pending_token_when_receiver_is_cancelled() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+
+        let key = "test:default".to_string();
+        let token = 43;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut queues = state.queues.write().await;
+            queues.insert(key.clone(), VecDeque::from([QueueEntry { token, tx }]));
+        }
+
+        assert!(state.notify_queue("test", "default").await);
+
+        {
+            let pending = state.pending_tokens.read().await;
+            assert!(pending.get(&key).is_some_and(|set| set.contains(&token)));
+        }
+        assert_eq!(
+            state.metrics.queue_pending_tokens.load(Ordering::Relaxed),
+            1
+        );
+
+        drop(rx);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let pending = state.pending_tokens.read().await;
+        assert!(!pending.get(&key).is_some_and(|set| set.contains(&token)));
+        assert_eq!(
+            state.metrics.queue_pending_tokens.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[tokio::test]
@@ -3387,13 +3544,17 @@ mod tests {
             .await;
 
         assert_eq!(woken, 1);
-        assert_eq!(rx.await.unwrap(), token);
+        let mut permit = rx.await.unwrap();
+        assert_eq!(permit.token, token);
         let queues = state.queues.read().await;
-        assert!(queues.get(&key).is_some_and(|queue| queue.is_empty()));
+        assert!(queues.get(&key).is_none_or(|queue| queue.is_empty()));
         drop(queues);
 
         let pending = state.pending_tokens.read().await;
         assert!(pending.get(&key).is_some_and(|set| set.contains(&token)));
+        drop(pending);
+
+        permit.release().await;
     }
 
     #[tokio::test]
