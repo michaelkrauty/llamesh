@@ -643,56 +643,70 @@ pub async fn route_request(
                                 let hash_metrics = hash_metrics.clone();
 
                                 Box::pin(async move {
-                                    let (model_name, profile_id, became_idle) = {
+                                    let (
+                                        model_name,
+                                        profile_id,
+                                        instance_id,
+                                        became_idle,
+                                        was_draining,
+                                        tenure_expired,
+                                    ) = {
                                         let mut inst = instance_lock.write().await;
                                         inst.in_flight_requests =
                                             inst.in_flight_requests.saturating_sub(1);
                                         let idle = inst.in_flight_requests == 0;
+                                        let was_draining = inst.draining.load(Ordering::Relaxed);
+                                        let tenure_expired = inst
+                                            .evictable_after
+                                            .lock()
+                                            .map(|t| std::time::Instant::now() >= t)
+                                            .unwrap_or(false);
+                                        (
+                                            inst.model_name.clone(),
+                                            inst.profile_id.clone(),
+                                            inst.id.clone(),
+                                            idle,
+                                            was_draining,
+                                            tenure_expired,
+                                        )
+                                    };
+                                    state.metrics.dec_current_requests();
 
-                                        // ── Drain scheduling ────────────────────────────
-                                        // Check if this instance should be drained for a
-                                        // queued competitor that needs its VRAM.
-                                        if !inst.draining.load(Ordering::Relaxed) {
-                                            let dominated = state
-                                                .has_queued_competitors_needing_eviction(
-                                                    &inst.model_name,
-                                                )
-                                                .await;
-                                            if dominated {
-                                                let tenure_expired = inst
-                                                    .evictable_after
-                                                    .lock()
-                                                    .map(|t| std::time::Instant::now() >= t)
-                                                    .unwrap_or(false);
-                                                let own_queue_empty = idle
-                                                    && !state
-                                                        .has_pending_for_model(
-                                                            &inst.model_name,
-                                                            &inst.profile_id,
-                                                        )
-                                                        .await;
+                                    // ── Drain scheduling ────────────────────────────
+                                    // Do not hold the instance lock while checking queues:
+                                    // NodeState's lock order requires queues before
+                                    // individual instance locks.
+                                    if !was_draining {
+                                        let dominated = state
+                                            .has_queued_competitors_needing_eviction(&model_name)
+                                            .await;
+                                        if dominated {
+                                            let own_queue_empty = became_idle
+                                                && !state
+                                                    .has_pending_for_model(
+                                                        &model_name,
+                                                        &profile_id,
+                                                    )
+                                                    .await;
 
-                                                if tenure_expired || own_queue_empty {
+                                            if tenure_expired || own_queue_empty {
+                                                let inst = instance_lock.write().await;
+                                                if inst.id == instance_id
+                                                    && !inst.draining.load(Ordering::Relaxed)
+                                                {
                                                     inst.draining.store(true, Ordering::Relaxed);
                                                     info!(
                                                         event = "drain_triggered",
-                                                        model = %inst.model_name,
-                                                        profile = %inst.profile_id,
-                                                        instance_id = %inst.id,
+                                                        model = %model_name,
+                                                        profile = %profile_id,
+                                                        instance_id = %instance_id,
                                                         reason = if tenure_expired { "tenure_expired" } else { "queue_empty" },
                                                         "Instance marked draining for competing model"
                                                     );
                                                 }
                                             }
                                         }
-
-                                        (
-                                            inst.model_name.clone(),
-                                            inst.profile_id.clone(),
-                                            idle,
-                                        )
-                                    };
-                                    state.metrics.dec_current_requests();
+                                    }
 
                                     // Critical: If instance became idle, we must notify ALL queues.
                                     // Why? Because another model's queue might be blocked by MaxInstancesNode.
@@ -1023,7 +1037,15 @@ async fn handle_non_streaming_response(
         }
     };
 
-    // Parse for usage
+    build_non_streaming_body_response(status, headers, bytes, tokens_generated)
+}
+
+fn build_non_streaming_body_response(
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Bytes,
+    tokens_generated: Arc<AtomicU64>,
+) -> Response<Body> {
     if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
         if let Some(usage) = val.get("usage") {
             if let Some(completion_tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64())
@@ -1118,38 +1140,6 @@ where
     response
 }
 
-async fn handle_non_streaming_body(
-    status: StatusCode,
-    headers: HeaderMap,
-    bytes: Bytes,
-    cleanup: BoxFuture<'static, ()>,
-    tokens_generated: Arc<AtomicU64>,
-) -> Response<Body> {
-    let _cleanup_guard = AutoCleanup::new(cleanup);
-
-    if let Ok(val) = serde_json::from_slice::<Value>(&bytes) {
-        if let Some(usage) = val.get("usage") {
-            if let Some(completion_tokens) = usage.get("completion_tokens").and_then(|v| v.as_u64())
-            {
-                info!(
-                    "Counted {} tokens from non-streaming response",
-                    completion_tokens
-                );
-                tokens_generated.fetch_add(completion_tokens, Ordering::Relaxed);
-            }
-        } else {
-            info!("No usage field in response");
-        }
-    } else {
-        info!("Failed to parse response as JSON");
-    }
-
-    let mut response = Response::new(Body::from(bytes));
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
-}
-
 async fn peer_response_to_client(
     response: PeerResponse,
     stream_requested: bool,
@@ -1179,6 +1169,7 @@ async fn peer_response_to_client(
                     tokens_generated,
                 )
             } else {
+                let _cleanup_guard = AutoCleanup::new(cleanup);
                 match body
                     .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())))
                     .try_fold(Vec::new(), |mut acc, chunk| async move {
@@ -1187,19 +1178,14 @@ async fn peer_response_to_client(
                     })
                     .await
                 {
-                    Ok(bytes) => {
-                        handle_non_streaming_body(
-                            status,
-                            headers,
-                            Bytes::from(bytes),
-                            cleanup,
-                            tokens_generated,
-                        )
-                        .await
-                    }
+                    Ok(bytes) => build_non_streaming_body_response(
+                        status,
+                        headers,
+                        Bytes::from(bytes),
+                        tokens_generated,
+                    ),
                     Err(e) => {
                         error!("Failed to read peer response body: {}", e);
-                        let _cleanup_guard = AutoCleanup::new(cleanup);
                         Response::builder()
                             .status(StatusCode::BAD_GATEWAY)
                             .body(Body::from("Failed to read peer response"))
