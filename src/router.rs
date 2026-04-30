@@ -110,6 +110,167 @@ async fn record_peer_status(state: &NodeState, peer_id: &str, status: StatusCode
     }
 }
 
+/// Error `type` strings that signal a peer is patient-but-currently-saturated.
+/// Receiving one of these means the peer would be able to serve the request
+/// after some cluster state change (capacity freed, queue drained, gossip
+/// update). The forwarder treats them as healable and waits for capacity
+/// instead of surfacing the 503 to the client.
+const HEALABLE_PEER_ERROR_TYPES: &[&str] = &[
+    "queue_timeout",
+    "queue_full",
+    "no_capacity",
+    "insufficient_resources",
+    "peer_unavailable_retry",
+    "spawn_failures_exhausted",
+];
+
+/// Inspect a buffered peer error body to decide whether the failure is
+/// healable. A healable response is one where retrying after a cluster
+/// capacity change is likely to succeed.
+fn is_healable_error_body(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let Some(error_type) = value
+        .get("error")
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str())
+    else {
+        return false;
+    };
+    HEALABLE_PEER_ERROR_TYPES.contains(&error_type)
+}
+
+/// Outcome of attempting to forward a request to a peer.
+enum ForwardOutcome {
+    /// Peer responded with a status the client should see. Body bytes are
+    /// already buffered so the caller can build a fresh response.
+    Surface {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+    /// Peer streamed a successful response. The streaming response is
+    /// constructed by the caller.
+    StreamingSurface(PeerResponse),
+    /// Peer reported a healable failure. Caller should wait for capacity and
+    /// retry (possibly against a different peer).
+    Heal { reason: String },
+    /// Peer transport failed (network error, handshake, etc.). Caller should
+    /// record a circuit-breaker failure and may retry.
+    Transport(AppError),
+}
+
+/// Forward a request to a peer and classify the outcome. Buffers non-streaming
+/// 5xx response bodies so the caller can decide whether to surface them or
+/// retry. Streaming and 2xx/4xx responses are handed back unbuffered for
+/// pass-through to the client.
+async fn attempt_peer_forward(
+    state: &NodeState,
+    peer_id: &str,
+    peer_address: &str,
+    method: &Method,
+    path_and_query: &str,
+    headers: HeaderMap,
+    body: Bytes,
+    timeout_ms: u64,
+    response_streaming: bool,
+) -> ForwardOutcome {
+    let resp = match send_peer_request(
+        state,
+        PeerRequest {
+            peer_id,
+            peer_address,
+            method: method.clone(),
+            path_and_query,
+            headers,
+            body,
+            timeout_ms,
+        },
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return ForwardOutcome::Transport(e),
+    };
+
+    let status = match &resp {
+        PeerResponse::Http(r) => r.status(),
+        PeerResponse::Noise { status, .. } => *status,
+    };
+    record_peer_status(state, peer_id, status).await;
+
+    // Pass through streaming successful responses without buffering. A 5xx
+    // never opens a stream because the peer commits to its response shape
+    // before opening one — error responses are always non-streaming JSON.
+    if response_streaming && status.is_success() {
+        return ForwardOutcome::StreamingSurface(resp);
+    }
+
+    // For non-streaming or any error response, buffer the body so we can
+    // either inspect it (for healing) or hand it to the client.
+    let (status, response_headers, body_bytes) = match resp {
+        PeerResponse::Http(r) => {
+            let headers = r.headers().clone();
+            let bytes = match r.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return ForwardOutcome::Transport(AppError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to read peer response body from {peer_id}: {e}"),
+                        "peer_body_read_failed",
+                    ));
+                }
+            };
+            (status, headers, bytes)
+        }
+        PeerResponse::Noise {
+            status,
+            headers,
+            body,
+        } => {
+            let body = *body;
+            let bytes = match body
+                .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())))
+                .try_fold(Vec::new(), |mut acc, chunk| async move {
+                    acc.extend_from_slice(&chunk);
+                    Ok(acc)
+                })
+                .await
+            {
+                Ok(b) => Bytes::from(b),
+                Err(e) => {
+                    return ForwardOutcome::Transport(AppError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to read Noise peer response body from {peer_id}: {e}"),
+                        "peer_body_read_failed",
+                    ));
+                }
+            };
+            (status, headers, bytes)
+        }
+    };
+
+    if status.is_server_error() && is_healable_error_body(&body_bytes) {
+        let reason = serde_json::from_slice::<Value>(&body_bytes)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("type"))
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| status.as_u16().to_string());
+        return ForwardOutcome::Heal { reason };
+    }
+
+    ForwardOutcome::Surface {
+        status,
+        headers: response_headers,
+        body: body_bytes,
+    }
+}
+
 fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &str) -> HeaderMap {
     let mut forward_headers = HeaderMap::new();
     for (name, value) in source.iter() {
@@ -418,10 +579,57 @@ pub async fn route_request(
         // Try local model resolution first
         let local_resolution = state.resolve_model(&model_to_use).await;
 
-        // If local resolution fails, check if any peer supports this model
+        // If local resolution fails, check if any peer supports this model.
+        // The forwarder is patient: a peer that responds with a healable 503
+        // (queue timeout, queue full, no capacity, etc.) is treated as
+        // "saturated for now" and the request waits for cluster capacity to
+        // change before retrying instead of surfacing the failure to the
+        // client.
         if local_resolution.is_none() {
-            if let Some(peer) = state.find_peer_for_model(&model_to_use).await {
-                // Forward to the peer that supports this model
+            // Counted once for the whole forwarding effort; cleanup_fut /
+            // guard Drop decrements exactly once when we either commit the
+            // response stream or bail out.
+            state.metrics.inc_requests();
+            let guard = RequestGuard::new(state.clone());
+
+            let forward_headers =
+                build_forward_headers(&parts.headers, current_hops, &request_id);
+            let timeout_ms = state.config.model_defaults.max_request_duration_ms;
+
+            loop {
+                let Some(peer) = state.find_peer_for_model(&model_to_use).await else {
+                    // No peer currently supports this model. Either it really
+                    // does not exist anywhere, or every peer that advertises
+                    // it is currently filtered (open circuit, draining,
+                    // stale). For the latter, wait for cluster state to
+                    // change before giving up.
+                    if state.draining.load(Ordering::Relaxed) {
+                        state.metrics.inc_errors();
+                        return Err(AppError::service_unavailable(
+                            "Node is shutting down",
+                            "draining",
+                        ));
+                    }
+                    // We can only distinguish "no one will ever serve this"
+                    // from "no one can serve it right now" by checking
+                    // whether any peer ever advertised the model. If the
+                    // model has never been seen on any peer, fail fast with
+                    // model_not_found. Otherwise wait.
+                    if !state.any_peer_advertises_model(&model_to_use).await {
+                        state.metrics.inc_errors();
+                        return Err(AppError::model_not_found(format!(
+                            "Model '{model_to_use}' not found in local cookbook or any peer"
+                        )));
+                    }
+                    info!(
+                        event = "forward_waiting_for_peer",
+                        model = %model_to_use,
+                        "All peers advertising model are currently unavailable, waiting for cluster capacity"
+                    );
+                    state.capacity_notify.notified().await;
+                    continue;
+                };
+
                 info!(
                     event = "forward_unknown_model",
                     model = %model_to_use,
@@ -429,47 +637,27 @@ pub async fn route_request(
                     "Model not in local cookbook, forwarding to peer"
                 );
 
-                state.metrics.inc_requests();
-                // RequestGuard ensures current_requests is decremented if this
-                // handler is cancelled before we can install the body-level
-                // cleanup below. Without it, a client disconnect during
-                // `client_req.send().await` would leak the gauge monotonically.
-                let guard = RequestGuard::new(state.clone());
                 // Track this forward locally so concurrent routing decisions
-                // see the peer's load before its next gossip tick.
+                // see the peer's load before its next gossip tick. This guard
+                // is per-attempt: released when we retry, kept alive into
+                // cleanup_fut on the attempt that commits.
                 let peer_forward_guard = state.track_peer_forward(&peer.node_id).await;
 
-                let forward_headers =
-                    build_forward_headers(&parts.headers, current_hops, &request_id);
-                let timeout_ms = state.config.model_defaults.max_request_duration_ms;
-
-                match send_peer_request(
+                let outcome = attempt_peer_forward(
                     &state,
-                    PeerRequest {
-                        peer_id: &peer.node_id,
-                        peer_address: &peer.address,
-                        method: parts.method.clone(),
-                        path_and_query: &path_and_query,
-                        headers: forward_headers,
-                        body: forward_body.clone(),
-                        timeout_ms,
-                    },
+                    &peer.node_id,
+                    &peer.address,
+                    &parts.method,
+                    &path_and_query,
+                    forward_headers.clone(),
+                    forward_body.clone(),
+                    timeout_ms,
+                    response_streaming,
                 )
-                .await
-                {
-                    Ok(resp) => {
-                        let status = match &resp {
-                            PeerResponse::Http(resp) => resp.status(),
-                            PeerResponse::Noise { status, .. } => *status,
-                        };
-                        record_peer_status(&state, &peer.node_id, status).await;
+                .await;
 
-                        // Defer the dec_current_requests decrement until the
-                        // response body finishes streaming to the client (or is
-                        // dropped on client disconnect). CleanupStream::Drop
-                        // spawns this future on end-of-stream or on drop,
-                        // closing the cancellation window between headers
-                        // arriving and the body fully flushing.
+                match outcome {
+                    ForwardOutcome::StreamingSurface(resp) => {
                         let cleanup_fut: BoxFuture<'static, ()> = {
                             let state = state.clone();
                             let mut peer_forward_guard = peer_forward_guard;
@@ -478,12 +666,7 @@ pub async fn route_request(
                                 peer_forward_guard.release();
                             })
                         };
-
-                        // Hand off responsibility for dec from `guard` to
-                        // `cleanup_fut` now that we're committed to returning
-                        // the streaming response.
                         guard.complete();
-
                         let tokens_counter = Arc::new(AtomicU64::new(0));
                         return Ok(peer_response_to_client(
                             resp,
@@ -493,20 +676,63 @@ pub async fn route_request(
                         )
                         .await);
                     }
-                    Err(e) => {
+                    ForwardOutcome::Surface {
+                        status,
+                        headers,
+                        body,
+                    } => {
+                        let cleanup_fut: BoxFuture<'static, ()> = {
+                            let state = state.clone();
+                            let mut peer_forward_guard = peer_forward_guard;
+                            Box::pin(async move {
+                                state.metrics.dec_current_requests();
+                                peer_forward_guard.release();
+                            })
+                        };
+                        guard.complete();
+                        let tokens_counter = Arc::new(AtomicU64::new(0));
+                        let _cleanup_guard = AutoCleanup::new(cleanup_fut);
+                        return Ok(build_non_streaming_body_response(
+                            status,
+                            headers,
+                            body,
+                            tokens_counter,
+                        ));
+                    }
+                    ForwardOutcome::Heal { reason } => {
+                        // peer_forward_guard drops here, releasing this
+                        // attempt's edge-counter slot. The peer's
+                        // circuit-breaker state was already updated inside
+                        // attempt_peer_forward via record_peer_status.
+                        info!(
+                            event = "forward_heal_wait",
+                            peer = %peer.node_id,
+                            reason = %reason,
+                            "Peer reported saturation, waiting for cluster capacity"
+                        );
+                        drop(peer_forward_guard);
+                        state.capacity_notify.notified().await;
+                        continue;
+                    }
+                    ForwardOutcome::Transport(e) => {
+                        // Already recorded as circuit-breaker failure inside
+                        // send_peer_request? No — record explicitly here. The
+                        // forwarder retries against any peer that comes back
+                        // online (including this one once its circuit
+                        // resets).
                         state.circuit_breaker.record_failure(&peer.node_id).await;
-                        // guard Drop handles dec_current_requests on return.
-                        state.metrics.inc_errors();
-                        error!(peer = %peer.node_id, error = ?e, "Failed to forward to peer");
-                        return Err(e);
+                        warn!(
+                            event = "forward_transport_retry",
+                            peer = %peer.node_id,
+                            error = ?e,
+                            "Peer transport failure, waiting for cluster capacity to retry"
+                        );
+                        drop(peer_forward_guard);
+                        state.capacity_notify.notified().await;
+                        continue;
                     }
                 }
             }
-
-            // No local resolution and no peer found
-            return Err(AppError::model_not_found(format!(
-                "Model '{model_to_use}' not found in local cookbook or any peer"
-            )));
         }
 
         let (model_name, profile) = local_resolution.ok_or_else(|| {
@@ -882,126 +1108,168 @@ pub async fn route_request(
                 }
             }
         } else {
-            // Remote routing
-            info!("Forwarding remotely to peer {}", best_node.node_id);
-            // Track this forward locally so subsequent routing decisions reflect
-            // it instantly rather than waiting up to `gossip_interval_seconds`
-            // for the peer's next gossip tick. Guard is released in the cleanup
-            // future (success) or on function return (error).
-            let peer_forward_guard = state.track_peer_forward(&best_node.node_id).await;
+            // Remote routing — patient retry loop.
+            //
+            // The forwarder treats a peer's healable 503 (queue_timeout,
+            // queue_full, no_capacity, ...) as "saturated for now" and waits
+            // for cluster capacity to change before re-selecting and trying
+            // again. This avoids surfacing transient peer saturation to the
+            // client, which is the inverse of the "patient proxy" intent.
+            //
+            // Each iteration re-selects via `select_best_node` so that a
+            // freed peer, a circuit reset, or a gossip update can route us
+            // somewhere new without bouncing back to the original client.
             let forward_headers =
                 build_forward_headers(&parts.headers, current_hops, &request_id);
 
-            match send_peer_request(
-                &state,
-                PeerRequest {
-                    peer_id: &best_node.node_id,
-                    peer_address: &best_node.address,
-                    method: parts.method.clone(),
-                    path_and_query: &path_and_query,
-                    headers: forward_headers,
-                    body: forward_body.clone(),
+            let mut current_node = best_node;
+            loop {
+                info!(
+                    event = "forward_remote",
+                    peer = %current_node.node_id,
+                    "Forwarding remotely to peer"
+                );
+
+                let peer_forward_guard =
+                    state.track_peer_forward(&current_node.node_id).await;
+
+                let outcome = attempt_peer_forward(
+                    &state,
+                    &current_node.node_id,
+                    &current_node.address,
+                    &parts.method,
+                    &path_and_query,
+                    forward_headers.clone(),
+                    forward_body.clone(),
                     timeout_ms,
-                },
-            )
-            .await
-            {
-                Ok(resp) => {
-                    let status = match &resp {
-                        PeerResponse::Http(resp) => resp.status(),
-                        PeerResponse::Noise { status, .. } => *status,
-                    };
-                    record_peer_status(&state, &best_node.node_id, status).await;
+                    response_streaming,
+                )
+                .await;
 
-                    let tokens_counter = Arc::new(AtomicU64::new(0));
-                    let tokens_for_cleanup = tokens_counter.clone();
-
-                    let cleanup_fut: BoxFuture<'static, ()> = {
-                        let state = state.clone();
-                        let hash_metrics = hash_metrics.clone();
-                        // Move the peer-forward guard into the cleanup future so
-                        // it's decremented exactly when the response completes.
-                        let mut peer_forward_guard = peer_forward_guard;
-                        Box::pin(async move {
-                            state.metrics.dec_current_requests();
-                            peer_forward_guard.release();
-                            let duration = start_time.elapsed().as_millis() as u64;
-                            hash_metrics
-                                .total_latency_ms
-                                .fetch_add(duration, Ordering::Relaxed);
-                            hash_metrics.tokens_generated_total.fetch_add(
-                                tokens_for_cleanup.load(Ordering::Relaxed),
-                                Ordering::Relaxed,
-                            );
-                        })
-                    };
-
-                    // Transfer responsibility to cleanup_fut
-                    guard.complete();
-
-                    Ok(peer_response_to_client(
-                        resp,
-                        response_streaming,
-                        cleanup_fut,
-                        tokens_counter,
-                    )
-                    .await)
-                }
-                Err(e) => {
-                    // peer_forward_guard drops here, releasing the counter.
-                    // Record failure for circuit breaker
-                    state
-                        .circuit_breaker
-                        .record_failure(&best_node.node_id)
-                        .await;
-
-                    warn!(
-                        peer = %best_node.node_id,
-                        address = %best_node.address,
-                        path = %path_and_query,
-                        error = ?e,
-                        "Peer forwarding failed, waiting for capacity to retry"
-                    );
-
-                    // Wait for cluster capacity change and retry
-                    // This allows the circuit breaker to open, other peers to become available,
-                    // or the failed peer to recover
-                    state.capacity_notify.notified().await;
-
-                    // Re-select best node (might be different now due to circuit breaker)
-                    let retry_node = loop {
-                        if let Some(node) = state
-                            .select_best_node(&model_name, &profile, prefer_local)
-                            .await
-                        {
-                            break node;
-                        }
-                        // No node available, wait again
+                match outcome {
+                    ForwardOutcome::StreamingSurface(resp) => {
+                        let tokens_counter = Arc::new(AtomicU64::new(0));
+                        let tokens_for_cleanup = tokens_counter.clone();
+                        let cleanup_fut: BoxFuture<'static, ()> = {
+                            let state = state.clone();
+                            let hash_metrics = hash_metrics.clone();
+                            let mut peer_forward_guard = peer_forward_guard;
+                            Box::pin(async move {
+                                state.metrics.dec_current_requests();
+                                peer_forward_guard.release();
+                                let duration = start_time.elapsed().as_millis() as u64;
+                                hash_metrics
+                                    .total_latency_ms
+                                    .fetch_add(duration, Ordering::Relaxed);
+                                hash_metrics.tokens_generated_total.fetch_add(
+                                    tokens_for_cleanup.load(Ordering::Relaxed),
+                                    Ordering::Relaxed,
+                                );
+                            })
+                        };
+                        guard.complete();
+                        return Ok(peer_response_to_client(
+                            resp,
+                            response_streaming,
+                            cleanup_fut,
+                            tokens_counter,
+                        )
+                        .await);
+                    }
+                    ForwardOutcome::Surface {
+                        status,
+                        headers,
+                        body,
+                    } => {
+                        let tokens_counter = Arc::new(AtomicU64::new(0));
+                        let tokens_for_cleanup = tokens_counter.clone();
+                        let cleanup_fut: BoxFuture<'static, ()> = {
+                            let state = state.clone();
+                            let hash_metrics = hash_metrics.clone();
+                            let mut peer_forward_guard = peer_forward_guard;
+                            Box::pin(async move {
+                                state.metrics.dec_current_requests();
+                                peer_forward_guard.release();
+                                let duration = start_time.elapsed().as_millis() as u64;
+                                hash_metrics
+                                    .total_latency_ms
+                                    .fetch_add(duration, Ordering::Relaxed);
+                                hash_metrics.tokens_generated_total.fetch_add(
+                                    tokens_for_cleanup.load(Ordering::Relaxed),
+                                    Ordering::Relaxed,
+                                );
+                            })
+                        };
+                        guard.complete();
+                        let _cleanup_guard = AutoCleanup::new(cleanup_fut);
+                        return Ok(build_non_streaming_body_response(
+                            status,
+                            headers,
+                            body,
+                            tokens_counter,
+                        ));
+                    }
+                    ForwardOutcome::Heal { reason } => {
                         info!(
-                            event = "retry_waiting",
-                            model = %model_name,
-                            "Retry waiting for node after peer failure"
+                            event = "forward_heal_wait",
+                            peer = %current_node.node_id,
+                            reason = %reason,
+                            "Peer reported saturation, waiting for cluster capacity"
                         );
-                        state.capacity_notify.notified().await;
-                    };
+                        drop(peer_forward_guard);
+                    }
+                    ForwardOutcome::Transport(e) => {
+                        state
+                            .circuit_breaker
+                            .record_failure(&current_node.node_id)
+                            .await;
+                        warn!(
+                            event = "forward_transport_retry",
+                            peer = %current_node.node_id,
+                            address = %current_node.address,
+                            path = %path_and_query,
+                            error = ?e,
+                            "Peer forwarding failed, waiting for cluster capacity to retry"
+                        );
+                        drop(peer_forward_guard);
+                    }
+                }
 
-                    // Note: Full automatic retry would require restructuring route_request()
-                    // to use a top-level loop. For now, we wait for capacity and return
-                    // an error - the client can retry and get routed to the new best node.
-                    // This is "soft" never-reject: we don't fail immediately, but eventually
-                    // ask the client to retry after waiting for cluster state to stabilize.
+                // Wait for cluster state to change (capacity freed, peer
+                // recovered, gossip update, drain finished) before retrying.
+                state.capacity_notify.notified().await;
+
+                if state.draining.load(Ordering::Relaxed) {
                     state.metrics.inc_errors();
                     hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                    info!(
-                        original_peer = %best_node.node_id,
-                        retry_peer = %retry_node.node_id,
-                        "Peer forwarding failed after wait, suggesting client retry"
-                    );
-                    Err(AppError::service_unavailable(
-                        format!("Peer {} temporarily unavailable, please retry", best_node.node_id),
-                        "peer_unavailable_retry",
-                    ))
+                    return Err(AppError::service_unavailable(
+                        "Node is shutting down",
+                        "draining",
+                    ));
                 }
+
+                // Re-select. Could be the same peer (its circuit may have
+                // closed or its queue drained), a different peer, or even
+                // local routing if best_node now points to self. For
+                // simplicity we keep the remote-only path here: if local
+                // routing has become best after a wait, the original
+                // top-level decision still stands and the request will reach
+                // the same peer-or-better via this loop until the peer
+                // actually serves it.
+                current_node = loop {
+                    if let Some(node) = state
+                        .select_best_node(&model_name, &profile, prefer_local)
+                        .await
+                    {
+                        break node;
+                    }
+                    info!(
+                        event = "retry_waiting",
+                        model = %model_name,
+                        "No node available during retry, waiting for cluster capacity"
+                    );
+                    state.capacity_notify.notified().await;
+                };
             }
         }
     }
@@ -1549,6 +1817,38 @@ mod tests {
         assert!(ensure_profile_supports_endpoint(&p, EndpointKind::Embeddings, "m").is_ok());
         assert!(ensure_profile_supports_endpoint(&p, EndpointKind::Text, "m").is_err());
         assert!(ensure_profile_supports_endpoint(&p, EndpointKind::Rerank, "m").is_err());
+    }
+
+    #[test]
+    fn test_is_healable_error_body_recognises_known_types() {
+        for ty in HEALABLE_PEER_ERROR_TYPES {
+            let body = format!(
+                r#"{{"error": {{"message": "x", "type": "{ty}", "param": null, "code": null}}}}"#
+            );
+            assert!(
+                is_healable_error_body(body.as_bytes()),
+                "{ty} should be classified as healable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_healable_error_body_rejects_unknown_types() {
+        let body =
+            br#"{"error": {"message": "x", "type": "invalid_request_error", "param": null, "code": null}}"#;
+        assert!(!is_healable_error_body(body.as_slice()));
+    }
+
+    #[test]
+    fn test_is_healable_error_body_rejects_non_json() {
+        assert!(!is_healable_error_body(b"upstream connect error: 503"));
+        assert!(!is_healable_error_body(b""));
+    }
+
+    #[test]
+    fn test_is_healable_error_body_rejects_missing_type() {
+        let body = br#"{"error": {"message": "x"}}"#;
+        assert!(!is_healable_error_body(body.as_slice()));
     }
 
     #[test]

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-04-29
+
+### Fixed
+
+- Mesh forwarding now waits for cluster capacity instead of surfacing peer
+  queue saturation to clients. When a peer responds with a healable 503
+  (`queue_timeout`, `queue_full`, `no_capacity`, `insufficient_resources`,
+  `peer_unavailable_retry`, `spawn_failures_exhausted`), the forwarder drops
+  the buffered response, awaits a capacity-changed signal, re-selects the best
+  peer, and retries. Transport errors against a peer follow the same patient
+  retry path. Both the unknown-model forward and the cookbook-known
+  remote-routing forward share the new behaviour, and `forward_heal_wait` /
+  `forward_transport_retry` events surface in the log each time the loop
+  iterates.
+
 ## [1.3.3] - 2026-04-28
 
 ### Fixed
