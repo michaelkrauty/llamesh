@@ -540,6 +540,21 @@ impl NodeState {
         self.model_index.resolve(model_name).await
     }
 
+    /// Check whether any currently-known peer (regardless of readiness, circuit
+    /// breaker state, or staleness) advertises support for a model. The
+    /// patient-mesh forwarder uses this to distinguish "no peer advertises
+    /// this model" (404) from "every peer that advertises it is currently
+    /// unavailable" (wait for capacity).
+    pub async fn any_peer_advertises_model(&self, model_name: &str) -> bool {
+        let peers = self.peers.read().await;
+        let parts: Vec<&str> = model_name.split(':').collect();
+        let base_model = parts[0];
+        let profile_id = if parts.len() > 1 { parts[1] } else { "default" };
+        peers
+            .values()
+            .any(|p| peer_supports_profile(p, base_model, profile_id))
+    }
+
     /// Find a peer that supports a model (case-insensitive).
     /// Used when local cookbook doesn't have the model but a peer might.
     /// Returns the PeerState of the best candidate peer, if any.
