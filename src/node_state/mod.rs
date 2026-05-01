@@ -296,6 +296,70 @@ impl Drop for PeerForwardGuard {
     }
 }
 
+/// RAII guard for an `in_flight_requests` slot reservation on an instance.
+///
+/// `try_get_or_spawn` increments `in_flight_requests` synchronously when it
+/// returns Ok. The caller (`get_instance_for_model`) then awaits readiness on
+/// the instance, which exposes the slot to cancellation if the calling
+/// future is dropped between the increment and the responsibility transfer
+/// to the router's `RequestGuard`. This guard closes that gap: it owns the
+/// release until the caller explicitly detaches it on a successful return.
+///
+/// On Drop without prior detach, decrements `in_flight_requests` via a
+/// spawned task (Drop is sync; the lock is async) and notifies waiters /
+/// drains so the instance can become idle and be evicted.
+pub struct SlotReleaseGuard {
+    state: Arc<NodeState>,
+    instance: Arc<RwLock<Instance>>,
+    released: bool,
+}
+
+impl SlotReleaseGuard {
+    pub fn new(state: Arc<NodeState>, instance: Arc<RwLock<Instance>>) -> Self {
+        Self {
+            state,
+            instance,
+            released: false,
+        }
+    }
+
+    /// Caller has taken responsibility for the slot release (e.g. by handing
+    /// the instance to a `RequestGuard` whose Drop or whose paired
+    /// `cleanup_fut` will perform the decrement). Subsequent Drop becomes a
+    /// no-op. Returns the inner instance Arc for convenience.
+    pub fn detach(mut self) -> Arc<RwLock<Instance>> {
+        self.released = true;
+        self.instance.clone()
+    }
+}
+
+impl Drop for SlotReleaseGuard {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        let inst = self.instance.clone();
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let (model, profile, became_idle) = {
+                let mut i = inst.write().await;
+                i.in_flight_requests = i.in_flight_requests.saturating_sub(1);
+                (
+                    i.model_name.clone(),
+                    i.profile_id.clone(),
+                    i.in_flight_requests == 0,
+                )
+            };
+            if became_idle {
+                state.maybe_cancel_drains().await;
+                state.notify_all_queues().await;
+            } else {
+                state.notify_queue(&model, &profile).await;
+            }
+        });
+    }
+}
+
 impl NodeState {
     pub async fn new(
         config: NodeConfig,
@@ -1121,7 +1185,7 @@ impl NodeState {
     }
 
     pub async fn get_instance_for_model(
-        &self,
+        self: &Arc<Self>,
         model_name: &str,
         profile: &Profile,
         reserve_slot: bool,
@@ -1306,6 +1370,15 @@ impl NodeState {
                 .await
             {
                 Ok(inst) => {
+                    // try_get_or_spawn incremented in_flight_requests
+                    // synchronously and returned Ok. The awaits below (token
+                    // release, ready_signal, status re-read) are cancellation
+                    // points; without an RAII guard, a cancelled caller would
+                    // leak the slot and block the instance's drain forever.
+                    // SlotReleaseGuard transfers responsibility to the caller
+                    // only on the explicit detach() at the Ready returns.
+                    let slot_guard = SlotReleaseGuard::new(self.clone(), inst.clone());
+
                     // Successfully acquired slot - clean up pending token and record metrics
                     if let Some(mut token) = my_token.take() {
                         token.release().await;
@@ -1320,17 +1393,14 @@ impl NodeState {
                         let r = inst.read().await;
                         let s = r.status.lock().clone();
                         if s == InstanceStatus::Ready {
-                            return Ok(inst.clone());
+                            return Ok(slot_guard.detach());
                         }
                         if s == InstanceStatus::Failed {
                             // Instance failed immediately - check for cold-start OOM recovery
                             let is_cold = r.is_cold_start;
                             drop(r);
-                            let mut w = inst.write().await;
-                            if w.in_flight_requests > 0 {
-                                w.in_flight_requests -= 1;
-                            }
-                            drop(w);
+                            // SlotReleaseGuard's Drop will decrement and notify.
+                            drop(slot_guard);
 
                             consecutive_spawn_failures += 1;
 
@@ -1388,16 +1458,13 @@ impl NodeState {
                     let r = inst.read().await;
                     let s = r.status.lock().clone();
                     if s == InstanceStatus::Ready {
-                        return Ok(inst.clone());
+                        return Ok(slot_guard.detach());
                     } else {
                         // Instance failed after startup - check for cold-start OOM recovery
                         let is_cold = is_cold_start;
                         drop(r);
-                        let mut w = inst.write().await;
-                        if w.in_flight_requests > 0 {
-                            w.in_flight_requests -= 1;
-                        }
-                        drop(w);
+                        // SlotReleaseGuard's Drop will decrement and notify.
+                        drop(slot_guard);
 
                         consecutive_spawn_failures += 1;
 
@@ -3579,9 +3646,11 @@ mod tests {
         config.model_defaults.max_concurrent_requests_per_instance = 1;
         config.model_defaults.max_queue_size_per_model = 1;
         let build_manager = BuildManager::new(config.llama_cpp.clone());
-        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
-            .await
-            .unwrap();
+        let state = Arc::new(
+            NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                .await
+                .unwrap(),
+        );
 
         let profile = sample_profile();
         let inst = Instance::new(
@@ -3618,6 +3687,94 @@ mod tests {
         assert_eq!(instance.read().await.in_flight_requests, 1);
         let queues = state.queues.read().await;
         assert!(queues.get(&key).is_none_or(|queue| queue.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn slot_release_guard_decrements_on_drop() {
+        // Regression test for the cancel-safety hole in get_instance_for_model:
+        // when the caller's future is cancelled between try_get_or_spawn
+        // returning Ok (which already incremented in_flight_requests) and the
+        // Ready return that hands the instance to the router, the slot would
+        // leak forever, blocking the instance's drain. SlotReleaseGuard's
+        // Drop is responsible for closing that gap.
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(
+            NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                .await
+                .unwrap(),
+        );
+
+        let inst = Instance::new(
+            "inst-x".into(),
+            "test".into(),
+            "default".into(),
+            "127.0.0.1".into(),
+            8000,
+            "hash".into(),
+            false,
+        );
+        let inst_arc = Arc::new(RwLock::new(inst));
+        // Simulate try_get_or_spawn's increment.
+        inst_arc.write().await.in_flight_requests = 1;
+
+        // Drop the guard without detaching — the cancellation case.
+        let guard = SlotReleaseGuard::new(state.clone(), inst_arc.clone());
+        drop(guard);
+
+        // Drop is sync but spawns the decrement task; wait for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let in_flight = inst_arc.read().await.in_flight_requests;
+            if in_flight == 0 {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "in_flight_requests did not drain after SlotReleaseGuard drop; got {in_flight}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_release_guard_no_op_after_detach() {
+        // On the success path, get_instance_for_model calls .detach() to
+        // transfer the slot release to the caller's RequestGuard /
+        // cleanup_fut. The guard's own Drop must NOT then double-decrement.
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(
+            NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                .await
+                .unwrap(),
+        );
+
+        let inst = Instance::new(
+            "inst-y".into(),
+            "test".into(),
+            "default".into(),
+            "127.0.0.1".into(),
+            8000,
+            "hash".into(),
+            false,
+        );
+        let inst_arc = Arc::new(RwLock::new(inst));
+        inst_arc.write().await.in_flight_requests = 1;
+
+        let guard = SlotReleaseGuard::new(state.clone(), inst_arc.clone());
+        let returned = guard.detach();
+        // detach returns the same Arc so the caller can dispatch.
+        assert!(Arc::ptr_eq(&returned, &inst_arc));
+
+        // Give any (incorrectly spawned) decrement task a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The slot must still be reserved: caller now owns the release.
+        assert_eq!(inst_arc.read().await.in_flight_requests, 1);
     }
 
     #[tokio::test]
