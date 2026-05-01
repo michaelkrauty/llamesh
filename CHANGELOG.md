@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-05-01
+
+### Fixed
+
+- Plug a slot leak in `get_instance_for_model` that could prevent an instance
+  from ever completing its drain. `try_get_or_spawn` increments
+  `in_flight_requests` synchronously when it returns Ok, but the caller then
+  awaits readiness on the instance through several `.await` points (token
+  release, status reads, `ready_signal.notified()`). A future cancelled at
+  any of those awaits would leak the slot, leaving `in_flight_requests > 0`
+  with no request actively running. Drain blocks on `in_flight_requests == 0`,
+  so a leaked slot would pin the instance's VRAM forever. Fix: wrap the slot
+  in a new `SlotReleaseGuard` RAII type. Drop spawns the decrement and queue
+  notifications; the existing happy-path `Ok(inst)` returns now go through
+  `slot_guard.detach()` to transfer responsibility to the router's
+  `RequestGuard` / `cleanup_fut` chain. Removes the manual decrements that
+  previously only handled the explicit `Failed` paths.
+
 ## [1.3.4] - 2026-04-29
 
 ### Fixed
