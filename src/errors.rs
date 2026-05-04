@@ -100,6 +100,14 @@ impl AppError {
     pub fn request_timeout(message: impl Into<String>) -> Self {
         Self::new(StatusCode::REQUEST_TIMEOUT, message, "request_timeout")
     }
+
+    pub fn client_disconnected() -> Self {
+        Self::new(
+            StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+            "Client closed connection",
+            "client_disconnected",
+        )
+    }
 }
 
 #[cfg(test)]

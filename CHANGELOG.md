@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.6] - 2026-05-04
+
+### Fixed
+
+- Prevent CLOSE-WAIT socket leak that exhausts file descriptors. Request
+  handlers waiting for cluster capacity (`capacity_notify`) now detect client
+  disconnect by polling the TCP socket state via `getsockopt(TCP_INFO)` every
+  5 seconds. When the socket enters CLOSE-WAIT (client sent FIN), the handler
+  exits and all resources are released through existing Drop guards. Also
+  unconditionally set hyper's timer and `header_read_timeout` on HTTP
+  connections. No timeouts are imposed — requests still wait indefinitely when
+  `max_request_duration_ms=0`, as long as the client remains connected.
+
 ## [1.3.5] - 2026-05-01
 
 ### Fixed

@@ -1,4 +1,5 @@
 use crate::config::Profile;
+use crate::connection::ConnectionHandle;
 use crate::errors::AppError;
 use crate::instance::Instance;
 use crate::node_state::{NodeError, NodeState};
@@ -8,6 +9,7 @@ use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
     response::IntoResponse,
     response::Json,
+    Extension,
 };
 use bytes::Bytes;
 use futures::{future::BoxFuture, Stream, StreamExt, TryStreamExt};
@@ -23,6 +25,31 @@ use std::{
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::{error, info, warn, Instrument};
+
+const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Wait for a capacity notification, but bail early if the client has
+/// disconnected. Returns `Err` if the client is gone.
+async fn wait_for_capacity_or_disconnect(
+    notify: &tokio::sync::Notify,
+    conn: &Option<ConnectionHandle>,
+) -> Result<(), AppError> {
+    match conn {
+        Some(handle) => {
+            tokio::select! {
+                _ = notify.notified() => Ok(()),
+                _ = crate::connection::poll_client_disconnect(handle, DISCONNECT_POLL_INTERVAL) => {
+                    info!(event = "client_disconnected", "Client disconnected during capacity wait");
+                    Err(AppError::client_disconnected())
+                }
+            }
+        }
+        None => {
+            notify.notified().await;
+            Ok(())
+        }
+    }
+}
 
 struct RequestGuard {
     state: Arc<NodeState>,
@@ -482,8 +509,10 @@ pub async fn list_models(
 
 pub async fn route_request(
     State(state): State<Arc<NodeState>>,
+    conn_handle: Option<Extension<ConnectionHandle>>,
     req: Request<Body>,
 ) -> Result<impl IntoResponse, AppError> {
+    let conn_handle = conn_handle.map(|Extension(h)| h);
     let (parts, body) = req.into_parts();
     let path_only = parts.uri.path().to_string();
     let path_and_query = parts
@@ -626,7 +655,7 @@ pub async fn route_request(
                         model = %model_to_use,
                         "All peers advertising model are currently unavailable, waiting for cluster capacity"
                     );
-                    state.capacity_notify.notified().await;
+                    wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
                     continue;
                 };
 
@@ -711,7 +740,7 @@ pub async fn route_request(
                             "Peer reported saturation, waiting for cluster capacity"
                         );
                         drop(peer_forward_guard);
-                        state.capacity_notify.notified().await;
+                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
                         continue;
                     }
                     ForwardOutcome::Transport(e) => {
@@ -728,7 +757,7 @@ pub async fn route_request(
                             "Peer transport failure, waiting for cluster capacity to retry"
                         );
                         drop(peer_forward_guard);
-                        state.capacity_notify.notified().await;
+                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
                         continue;
                     }
                 }
@@ -803,16 +832,31 @@ pub async fn route_request(
                 profile = %profile.id,
                 "No node available, waiting for cluster capacity"
             );
-            state.capacity_notify.notified().await;
+            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
             // Loop back to retry select_best_node
         };
 
         if best_node.node_id == state.config.node_id {
-            // Local routing
-            match state
-                .get_instance_for_model(&model_name, &profile, true)
-                .await
-            {
+            // Local routing — wrap in disconnect check so we don't block
+            // forever inside get_instance_for_model's internal capacity waits
+            // if the client has already gone.
+            let instance_result = match &conn_handle {
+                Some(handle) => {
+                    tokio::select! {
+                        res = state.get_instance_for_model(&model_name, &profile, true) => res,
+                        _ = crate::connection::poll_client_disconnect(handle, DISCONNECT_POLL_INTERVAL) => {
+                            info!(event = "client_disconnected", "Client disconnected during instance acquisition");
+                            return Err(AppError::client_disconnected());
+                        }
+                    }
+                }
+                None => {
+                    state
+                        .get_instance_for_model(&model_name, &profile, true)
+                        .await
+                }
+            };
+            match instance_result {
                 Ok(instance_lock) => {
                     guard.set_instance(instance_lock.clone());
 
@@ -1237,7 +1281,7 @@ pub async fn route_request(
 
                 // Wait for cluster state to change (capacity freed, peer
                 // recovered, gossip update, drain finished) before retrying.
-                state.capacity_notify.notified().await;
+                wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
 
                 if state.draining.load(Ordering::Relaxed) {
                     state.metrics.inc_errors();
@@ -1268,7 +1312,7 @@ pub async fn route_request(
                         model = %model_name,
                         "No node available during retry, waiting for cluster capacity"
                     );
-                    state.capacity_notify.notified().await;
+                    wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
                 };
             }
         }

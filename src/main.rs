@@ -3,6 +3,7 @@ mod build_manager;
 mod circuit_breaker;
 mod cluster;
 mod config;
+mod connection;
 #[allow(clippy::items_after_test_module)]
 mod discovery;
 mod errors;

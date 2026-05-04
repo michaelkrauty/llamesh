@@ -1,5 +1,6 @@
 use crate::cluster;
 use crate::config::NodeConfig;
+use crate::connection::ConnectionHandle;
 use crate::health;
 use crate::metrics;
 use crate::node_state::{NodeState, PeerState};
@@ -14,12 +15,13 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioTimer;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -455,6 +457,9 @@ async fn handle_tls_connection(
     app: Router<()>,
     http_config: crate::config::HttpConfig,
 ) {
+    // Grab raw fd before TLS consumes the stream (fd survives the TLS wrapper)
+    let conn_handle = ConnectionHandle::new(tcp_stream.as_raw_fd());
+
     let tls_stream = match acceptor.accept(tcp_stream).await {
         Ok(s) => s,
         Err(e) => {
@@ -477,6 +482,8 @@ async fn handle_tls_connection(
         remote_addr,
     };
 
+    let app = app.layer(Extension(conn_handle));
+
     let mut make_service = app.into_make_service_with_connect_info::<PeerIdentity>();
     let service = match make_service.call(&wrapper).await {
         Ok(s) => s,
@@ -496,6 +503,9 @@ async fn handle_http_connection(
     app: Router<()>,
     http_config: crate::config::HttpConfig,
 ) {
+    let conn_handle = ConnectionHandle::new(tcp_stream.as_raw_fd());
+    let app = app.layer(Extension(conn_handle));
+
     let mut make_service = app.into_make_service_with_connect_info::<SocketAddr>();
     let service = match make_service.call(remote_addr).await {
         Ok(s) => s,
@@ -537,10 +547,9 @@ where
         });
 
     let mut builder = hyper::server::conn::http1::Builder::new();
-    if http_config.idle_timeout_seconds > 0 {
-        builder.timer(TokioTimer::new());
-        builder.header_read_timeout(Duration::from_secs(http_config.idle_timeout_seconds));
-    }
+    builder.timer(TokioTimer::new());
+    let idle_secs = http_config.idle_timeout_seconds.max(30);
+    builder.header_read_timeout(Duration::from_secs(idle_secs));
 
     if let Err(err) = builder.serve_connection(io, hyper_service).await {
         tracing::debug!("Connection error: {}", err);
@@ -736,7 +745,7 @@ async fn handle_noise_http_request(
         }
     };
 
-    match router::route_request(State(state), req).await {
+    match router::route_request(State(state), None, req).await {
         Ok(resp) => resp.into_response(),
         Err(err) => err.into_response(),
     }
