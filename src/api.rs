@@ -40,9 +40,11 @@ async fn metrics_handler(
 ) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     check_auth(&state, &headers)?;
     let _ = state.calculate_resource_snapshot().await;
+    let llama_cpp_version = state.build_manager.get_version().await;
     Ok(metrics::render_prometheus_with_circuit_breaker(
         &state.metrics,
         Some(&state.circuit_breaker),
+        &llama_cpp_version,
     )
     .await)
 }

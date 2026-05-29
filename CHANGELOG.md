@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-05-29
+
+### Added
+
+- Add the `llama_cpp_version` label to the `proxy_build_info` Prometheus metric,
+  bringing the scrape surface to parity with the `/metrics/json` snapshot (which
+  already carries both `version` and `llama_cpp_version`). The gauge now renders
+  as `proxy_build_info{version="x.y.z",llama_cpp_version="<commit>"} 1`, so
+  monitoring can track llama.cpp version skew across a cluster (e.g.
+  `count by (llama_cpp_version) (proxy_build_info)`) — previously the llama.cpp
+  commit was only observable via `/cluster/nodes` or the JSON snapshot, not the
+  scrape layer. The label reflects the running binary and updates live after an
+  auto-rebuild swaps it. The value is run through the label-value escaper for
+  safety; the existing `version` label is unchanged, so queries such as
+  `count by (version) (proxy_build_info)` keep working.
+
+### Fixed
+
+- `llama_cpp_version` (surfaced in `/metrics`, `/metrics/json`, and
+  `/cluster/nodes`) now reflects the llama.cpp binary that is actually running.
+  The reported commit was previously recorded at git-checkout time — before the
+  build and binary swap — so during an auto-rebuild it briefly advertised the
+  new commit while the old binary was still serving, and a failed build left it
+  pinned to a commit that never ran. The version is now recorded only after the
+  binary swap succeeds.
+
 ## [1.4.0] - 2026-05-29
 
 ### Added

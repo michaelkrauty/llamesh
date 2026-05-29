@@ -413,22 +413,28 @@ use crate::circuit_breaker::{CircuitBreaker, CircuitState};
 pub async fn render_prometheus_with_circuit_breaker(
     metrics: &Metrics,
     circuit_breaker: Option<&CircuitBreaker>,
+    llama_cpp_version: &str,
 ) -> String {
     let mut out = String::new();
 
-    // Build info as a constant gauge with the proxy version in a label. This is
-    // the conventional Prometheus pattern for exposing version (cf.
-    // `*_build_info`): the value is always 1 and rollout/skew is tracked via the
-    // label, e.g. `count by (version) (proxy_build_info)`. The version comes from
-    // `CARGO_PKG_VERSION`, a compile-time constant that is always a valid semver,
-    // so it needs no label-value escaping.
+    // Build info as a constant gauge carrying identifying labels. This is the
+    // conventional Prometheus pattern for exposing version (cf. `*_build_info`):
+    // the value is always 1 and rollout/skew is tracked via the labels, e.g.
+    // `count by (version) (proxy_build_info)` or
+    // `count by (llama_cpp_version) (proxy_build_info)`. The proxy `version`
+    // comes from `CARGO_PKG_VERSION`, a compile-time constant that is always a
+    // valid semver, so it needs no escaping; `llama_cpp_version` is derived from
+    // git output at runtime, so it is passed through `escape_label_value` for
+    // safety. Both labels mirror the `/metrics/json` snapshot, which carries the
+    // same two version fields.
     out.push_str(
         "# HELP proxy_build_info Build information for the llamesh proxy; value is always 1.\n",
     );
     out.push_str("# TYPE proxy_build_info gauge\n");
     out.push_str(&format!(
-        "proxy_build_info{{version=\"{}\"}} 1\n",
-        env!("CARGO_PKG_VERSION")
+        "proxy_build_info{{version=\"{}\",llama_cpp_version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION"),
+        escape_label_value(llama_cpp_version)
     ));
 
     // Global metrics with TYPE/HELP headers for Prometheus spec compliance
@@ -748,7 +754,7 @@ mod tests {
         hm.requests_total.fetch_add(1, Ordering::Relaxed);
         hm.observe_latency(50);
 
-        let output = render_prometheus_with_circuit_breaker(&metrics, None).await;
+        let output = render_prometheus_with_circuit_breaker(&metrics, None, "abc123def").await;
 
         assert!(output.contains("proxy_requests_total 1"));
         assert!(output.contains("proxy_node_external_vram_mb 50"));
@@ -760,13 +766,28 @@ mod tests {
     #[tokio::test]
     async fn test_prometheus_build_info() {
         let metrics = Metrics::new();
-        let output = render_prometheus_with_circuit_breaker(&metrics, None).await;
+        let output = render_prometheus_with_circuit_breaker(&metrics, None, "6ed481eea").await;
 
         // build_info is rendered as a constant gauge carrying the proxy version
-        // in a label, matching the crate version at compile time.
+        // (the crate version at compile time) and the llama.cpp binary version
+        // in labels, mirroring the `/metrics/json` snapshot.
         assert!(output.contains("# TYPE proxy_build_info gauge"));
         assert!(output.contains(&format!(
-            "proxy_build_info{{version=\"{}\"}} 1",
+            "proxy_build_info{{version=\"{}\",llama_cpp_version=\"6ed481eea\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_build_info_escapes_llama_cpp_version() {
+        // `llama_cpp_version` is derived from git output at runtime, so the
+        // renderer must escape it for Prometheus label-value safety even though
+        // commit hashes never contain special characters in practice.
+        let metrics = Metrics::new();
+        let output = render_prometheus_with_circuit_breaker(&metrics, None, "weird\"\\\nver").await;
+
+        assert!(output.contains(&format!(
+            "proxy_build_info{{version=\"{}\",llama_cpp_version=\"weird\\\"\\\\\\nver\"}} 1",
             env!("CARGO_PKG_VERSION")
         )));
     }
