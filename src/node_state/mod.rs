@@ -2337,10 +2337,17 @@ impl NodeState {
                 .collect()
         };
 
+        // Reflect the llama.cpp commit of the binary currently serving, so the
+        // cluster view (`/cluster/nodes`) and gossip carry per-node llama.cpp
+        // version for skew detection. Matches the value surfaced via `/metrics`
+        // (`proxy_build_info`) and `/metrics/json`.
+        let llama_cpp_version = self.build_manager.get_version().await;
+
         PeerState {
             node_id: self.config.node_id.clone(),
             address,
             version: env!("CARGO_PKG_VERSION").to_string(),
+            llama_cpp_version,
             last_seen: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -3254,6 +3261,7 @@ mod tests {
             node_id: "peer-a".into(),
             address: "http://peer-a".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: supported.into_iter().map(|s| s.to_string()).collect(),
             active_instances: 0,
@@ -3478,6 +3486,7 @@ mod tests {
             node_id: "remote-peer".into(),
             address: "http://remote-peer".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: now,                                        // Recent
             supported_models: vec!["remote-model:default".into()], // Supports our model
             active_instances: 0,
@@ -3847,6 +3856,11 @@ mod tests {
         assert!(!self_peer
             .supported_models
             .contains(&"local-model:zero-capacity".into()));
+
+        // The self peer reports its llama.cpp version from the build manager.
+        // With no build recorded, get_version() yields the "unknown" sentinel,
+        // which is what gossip and /cluster/nodes will carry for this node.
+        assert_eq!(self_peer.llama_cpp_version, "unknown");
     }
 
     #[tokio::test]
@@ -4368,6 +4382,7 @@ mod tests {
             node_id: "test".into(),
             address: "http://test".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec![],
             active_instances: 2,
@@ -4403,6 +4418,7 @@ mod tests {
             node_id: "test".into(),
             address: "http://test".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec![],
             active_instances: 0,
@@ -4438,6 +4454,7 @@ mod tests {
             node_id: "test".into(),
             address: "http://test".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec![],
             active_instances: 2,
@@ -4475,6 +4492,7 @@ mod tests {
             node_id: "test".into(),
             address: "http://test".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec![],
             active_instances: 2,
@@ -4513,6 +4531,7 @@ mod tests {
             node_id: "loaded".into(),
             address: "http://loaded".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
@@ -4549,6 +4568,7 @@ mod tests {
             node_id: "unloaded".into(),
             address: "http://unloaded".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 0,
@@ -4600,6 +4620,7 @@ mod tests {
             node_id: "loaded".into(),
             address: "http://loaded".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
@@ -4636,6 +4657,7 @@ mod tests {
             node_id: "unloaded".into(),
             address: "http://unloaded".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 0,
@@ -4689,6 +4711,7 @@ mod tests {
             node_id: "idle".into(),
             address: "http://idle".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
@@ -4715,6 +4738,7 @@ mod tests {
             node_id: "busy".into(),
             address: "http://busy".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
@@ -4758,6 +4782,7 @@ mod tests {
             node_id: "slow".into(),
             address: "http://slow".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
@@ -4827,6 +4852,7 @@ mod tests {
             node_id: "peer".into(),
             address: "http://peer".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,

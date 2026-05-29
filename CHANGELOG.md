@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-05-29
+
+### Added
+
+- The cluster view (`GET /cluster/nodes`) now reports each node's
+  `llama_cpp_version` — the llama.cpp commit of the binary currently serving on
+  that node, or `"unknown"` if no build has been recorded. The value rides the
+  existing gossip channel, so any single node's `/cluster/nodes` response carries
+  the llama.cpp commit for every reachable peer. This makes llama.cpp version
+  skew observable cluster-wide from one endpoint, without scraping each node's
+  `/metrics` individually. The field mirrors the commit already exposed by the
+  `proxy_build_info` metric and the `/metrics/json` snapshot, and it reflects the
+  running binary live after an auto-rebuild swaps it. The gossip field is
+  additive and deserializes with a default, so a rolling upgrade interoperates:
+  peers that predate the field are recorded as `"unknown"`, and older nodes
+  ignore the field sent by upgraded peers.
+
+### Fixed
+
+- `/cluster/nodes` now actually surfaces `llama_cpp_version`. The 1.5.0 changelog
+  described the llama.cpp commit as "surfaced in ... `/cluster/nodes`", but the
+  field was never present on the cluster/gossip node representation — the view
+  exposed only the proxy `version`. Every node entry now includes the commit.
+
 ## [1.5.0] - 2026-05-29
 
 ### Added
