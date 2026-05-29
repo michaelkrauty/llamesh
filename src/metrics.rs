@@ -105,6 +105,10 @@ pub struct Metrics {
 #[derive(Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub node_id: String,
+    /// Version of the llamesh proxy itself (from `CARGO_PKG_VERSION`).
+    /// `#[serde(default)]` keeps snapshots written by older versions loadable.
+    #[serde(default)]
+    pub version: String,
     pub llama_cpp_version: String,
     pub requests_total: u64,
     pub errors_total: u64,
@@ -375,6 +379,7 @@ impl Metrics {
 
         MetricsSnapshot {
             node_id,
+            version: env!("CARGO_PKG_VERSION").to_string(),
             llama_cpp_version: version,
             requests_total: self.requests_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
@@ -410,6 +415,21 @@ pub async fn render_prometheus_with_circuit_breaker(
     circuit_breaker: Option<&CircuitBreaker>,
 ) -> String {
     let mut out = String::new();
+
+    // Build info as a constant gauge with the proxy version in a label. This is
+    // the conventional Prometheus pattern for exposing version (cf.
+    // `*_build_info`): the value is always 1 and rollout/skew is tracked via the
+    // label, e.g. `count by (version) (proxy_build_info)`. The version comes from
+    // `CARGO_PKG_VERSION`, a compile-time constant that is always a valid semver,
+    // so it needs no label-value escaping.
+    out.push_str(
+        "# HELP proxy_build_info Build information for the llamesh proxy; value is always 1.\n",
+    );
+    out.push_str("# TYPE proxy_build_info gauge\n");
+    out.push_str(&format!(
+        "proxy_build_info{{version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION")
+    ));
 
     // Global metrics with TYPE/HELP headers for Prometheus spec compliance
     out.push_str("# HELP proxy_requests_total Total number of requests received.\n");
@@ -735,6 +755,52 @@ mod tests {
         assert!(output.contains("proxy_node_gpu_telemetry_available 1"));
         assert!(output.contains("proxy_hash_requests_total{hash=\"abc123\""));
         assert!(output.contains("names=\"gpt\\\"cool\\\"\""));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_build_info() {
+        let metrics = Metrics::new();
+        let output = render_prometheus_with_circuit_breaker(&metrics, None).await;
+
+        // build_info is rendered as a constant gauge carrying the proxy version
+        // in a label, matching the crate version at compile time.
+        assert!(output.contains("# TYPE proxy_build_info gauge"));
+        assert!(output.contains(&format!(
+            "proxy_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_includes_proxy_version() {
+        let metrics = Metrics::new();
+        let snapshot = metrics
+            .snapshot("node-a".to_string(), "llama-cpp-1234".to_string(), None)
+            .await;
+
+        // The proxy version is the crate version and is distinct from the
+        // llama.cpp binary version carried in `llama_cpp_version`.
+        assert_eq!(snapshot.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(snapshot.llama_cpp_version, "llama-cpp-1234");
+    }
+
+    #[test]
+    fn test_snapshot_deserializes_without_version_field() {
+        // Snapshots persisted by versions predating the `version` field must
+        // still load (the field is `#[serde(default)]`).
+        let legacy = r#"{
+            "node_id": "node-a",
+            "llama_cpp_version": "old",
+            "requests_total": 7,
+            "errors_total": 1,
+            "current_requests": 0,
+            "hashes": {},
+            "updated_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let snapshot: MetricsSnapshot =
+            serde_json::from_str(legacy).expect("legacy snapshot should deserialize");
+        assert_eq!(snapshot.version, "");
+        assert_eq!(snapshot.requests_total, 7);
     }
 
     #[tokio::test]

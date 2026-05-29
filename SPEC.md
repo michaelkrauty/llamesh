@@ -421,6 +421,7 @@ Per node, metrics snapshots are stored as JSON files at the path specified by `m
 ```json
 {
   "node_id": "node-a",
+  "version": "1.4.0",
   "llama_cpp_version": "7099-d23355afc",
   "requests_total": 1234,
   "errors_total": 12,
