@@ -1100,7 +1100,7 @@ First gossip tick fires immediately on startup (no initial delay).
 
 Every `gossip_interval_seconds`, nodes exchange metadata including:
 
-* `node_id`, `version`, supported models.
+* `node_id`, `version` (proxy version), `llama_cpp_version` (llama.cpp commit of the binary currently serving, or `unknown` if none recorded yet), supported models.
 * `loaded_models`: Which models are currently loaded and running.
 * `model_stats`: Per-model metrics including tokens per second, queue length, and learned VRAM/sysmem usage.
 * `ready` flag: Whether the node is ready to serve (false when draining or binary is unavailable).

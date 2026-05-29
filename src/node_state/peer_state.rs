@@ -25,6 +25,13 @@ pub struct PeerState {
     pub node_id: String,
     pub address: String,
     pub version: String,
+    /// llama.cpp commit of the binary currently serving on this node, or
+    /// `"unknown"` if no build has been recorded yet. Mirrors the value the node
+    /// reports via `/metrics` (`proxy_build_info`) and `/metrics/json`, letting
+    /// the cluster view (`/cluster/nodes`) surface llama.cpp version skew across
+    /// nodes from any single node.
+    #[serde(default = "default_llama_cpp_version")]
+    pub llama_cpp_version: String,
     pub last_seen: u64,
     pub supported_models: Vec<String>,
     #[serde(default)]
@@ -71,6 +78,13 @@ fn default_ready() -> bool {
     true // For backwards compatibility with older nodes that don't send this field
 }
 
+fn default_llama_cpp_version() -> String {
+    // Pre-1.6.0 peers don't gossip this field; treat them as "version not yet
+    // known", matching the sentinel `BuildManager::get_version` returns before a
+    // build is recorded.
+    "unknown".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +123,7 @@ mod tests {
             node_id: "node-1".into(),
             address: "http://localhost:8080".into(),
             version: "1.0.0".into(),
+            llama_cpp_version: "b2c3d4e5f".into(),
             last_seen: 12345,
             supported_models: vec!["model:fast".into()],
             model_stats: HashMap::new(),
@@ -133,6 +148,8 @@ mod tests {
         let parsed: PeerState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.node_id, "node-1");
         assert_eq!(parsed.address, "http://localhost:8080");
+        assert_eq!(parsed.version, "1.0.0");
+        assert_eq!(parsed.llama_cpp_version, "b2c3d4e5f");
         assert_eq!(parsed.active_instances, 2);
         assert_eq!(parsed.external_vram_mb, 500);
         assert!(parsed.gpu_telemetry_available);
@@ -144,7 +161,8 @@ mod tests {
 
     #[test]
     fn test_peer_state_default_ready() {
-        // Test backwards compatibility - missing "ready" field defaults to true
+        // Test backwards compatibility - a pre-1.6.0 node's gossip omits both the
+        // "ready" and "llama_cpp_version" fields, which must fall back to defaults.
         let json = r#"{
             "node_id": "node-old",
             "address": "http://old:8080",
@@ -160,6 +178,10 @@ mod tests {
         }"#;
         let parsed: PeerState = serde_json::from_str(json).unwrap();
         assert!(parsed.ready); // Should default to true
+
+        // Missing "llama_cpp_version" (older peer) defaults to "unknown" rather
+        // than failing the gossip deserialize.
+        assert_eq!(parsed.llama_cpp_version, "unknown");
         assert_eq!(parsed.external_vram_mb, 0);
         assert_eq!(parsed.device_vram_used_mb, 0);
         assert!(!parsed.gpu_telemetry_available);
@@ -168,5 +190,10 @@ mod tests {
     #[test]
     fn test_default_ready_returns_true() {
         assert!(default_ready());
+    }
+
+    #[test]
+    fn test_default_llama_cpp_version_returns_unknown() {
+        assert_eq!(default_llama_cpp_version(), "unknown");
     }
 }

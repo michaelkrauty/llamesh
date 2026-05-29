@@ -475,6 +475,8 @@ pub async fn process_gossip_message(
                     node_id: info.node_id,
                     address: info.address,
                     version: "unknown".to_string(),
+                    // Not yet heard from directly; filled in on first gossip.
+                    llama_cpp_version: "unknown".to_string(),
                     last_seen: now_secs,
                     supported_models: vec![],
                     active_instances: 0,
@@ -585,6 +587,7 @@ mod tests {
             node_id: "node-origin".into(),
             address: "http://node-origin".into(),
             version: "0.1.0".into(),
+            llama_cpp_version: "origincpp1".into(),
             last_seen: 1000,
             supported_models: vec![],
             active_instances: 0,
@@ -620,14 +623,19 @@ mod tests {
 
         let peers = state.peers.read().await;
 
-        // Should have origin peer
+        // Should have origin peer, including the llama.cpp version it gossiped
+        // (so /cluster/nodes can surface per-node llama.cpp version skew).
         assert!(peers.contains_key("node-origin"));
+        let origin = peers.get("node-origin").unwrap();
+        assert_eq!(origin.llama_cpp_version, "origincpp1");
 
-        // Should have discovered peer
+        // Should have discovered peer. Transitively-discovered peers have no
+        // direct gossip yet, so their llama.cpp version is "unknown" until heard.
         assert!(peers.contains_key("node-new"));
         let new_peer = peers.get("node-new").unwrap();
         assert_eq!(new_peer.address, "http://node-new");
         assert_eq!(new_peer.version, "unknown");
+        assert_eq!(new_peer.llama_cpp_version, "unknown");
     }
 
     #[test]
@@ -667,6 +675,7 @@ mod tests {
                     node_id: "remote-peer".into(),
                     address: "http://node-b:8080".into(), // Real hostname
                     version: "0.1.0".into(),
+                    llama_cpp_version: "unknown".into(),
                     last_seen: 1000,
                     supported_models: vec!["model:default".into()],
                     active_instances: 0,
@@ -695,6 +704,7 @@ mod tests {
             node_id: "remote-peer".into(),
             address: "http://127.0.0.1:8080".into(), // Loopback - should be ignored
             version: "0.1.0".into(),
+            llama_cpp_version: "unknown".into(),
             last_seen: 2000,
             supported_models: vec!["model:default".into(), "new-model:default".into()],
             active_instances: 1,
