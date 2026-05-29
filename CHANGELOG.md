@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-05-29
+
+### Added
+
+- Expose the llamesh proxy version through the metrics surface. The Prometheus
+  endpoint now renders a `proxy_build_info{version="x.y.z"} 1` constant gauge
+  (the conventional `*_build_info` pattern), and the JSON metrics snapshot
+  (`/metrics/json`) gains a top-level `version` field alongside the existing
+  `llama_cpp_version`. This lets monitoring track proxy version rollout and skew
+  across a cluster (e.g. `count by (version) (proxy_build_info)`) — previously a
+  node could report its peers' versions via `/cluster/nodes` but not surface its
+  own to the scrape layer. The new snapshot field is `#[serde(default)]`, so
+  metrics files written by older versions still load.
+
 ## [1.3.6] - 2026-05-04
 
 ### Fixed
