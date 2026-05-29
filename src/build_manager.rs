@@ -152,6 +152,15 @@ impl BuildManager {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    /// Record the llama.cpp commit that is now the live binary. Called only
+    /// after `update_symlink` succeeds, so `get_version()` reflects the binary
+    /// that is actually serving — never a commit that is still building, and
+    /// never one whose build later failed (which would otherwise leave the
+    /// reported version pinned to a commit that never ran).
+    fn record_running_version(&self, commit: &str) {
+        *self.current_version.write() = Some(commit.to_string());
+    }
+
     pub async fn update_and_build(&self) -> Result<()> {
         let result = self.update_and_build_inner().await;
         match &result {
@@ -255,11 +264,6 @@ impl BuildManager {
 
         info!(event = "llama_build_start", branch = %self.config.branch, commit = %commit_hash);
 
-        {
-            let mut lock = self.current_version.write();
-            *lock = Some(commit_hash.clone());
-        }
-
         // Determine unique build directory for this commit
         // Assuming config.build_path is a base like "./llama.cpp/build"
         // We make "./llama.cpp/build-<commit>"
@@ -295,6 +299,7 @@ impl BuildManager {
             if self.verify_binary(&actual_binary_path).await.is_ok() {
                 info!("Existing binary verified. Switching symlink.");
                 self.update_symlink(&actual_binary_path).await?;
+                self.record_running_version(&commit_hash);
                 return Ok(());
             }
             warn!("Existing binary verification failed. Rebuilding.");
@@ -345,6 +350,7 @@ impl BuildManager {
 
         // Switch symlink
         self.update_symlink(&actual_binary_path).await?;
+        self.record_running_version(&commit_hash);
 
         // Cleanup old builds
         if let Err(e) = self.cleanup_old_builds().await {
@@ -755,6 +761,37 @@ fi
         let bm = BuildManager::new(config);
         let version = bm.get_version().await;
         assert_eq!(version, "unknown");
+    }
+
+    #[tokio::test]
+    async fn test_get_version_reflects_only_recorded_running_version() {
+        let config = crate::config::LlamaCppConfig {
+            repo_url: "".into(),
+            repo_path: "".into(),
+            build_path: "".into(),
+            binary_path: "/nonexistent".into(),
+            branch: "".into(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: false,
+            keep_builds: 3,
+        };
+        let bm = BuildManager::new(config);
+
+        // Until a binary is actually swapped in, no commit is reported. This is
+        // what keeps the metric/snapshot from advertising a commit that is only
+        // checked out or still building.
+        assert_eq!(bm.get_version().await, "unknown");
+
+        // `record_running_version` is the sole setter and is only called after a
+        // successful `update_symlink`, so this models the post-swap transition.
+        bm.record_running_version("06d26dfdf");
+        assert_eq!(bm.get_version().await, "06d26dfdf");
+
+        // A subsequent successful swap moves the reported version forward.
+        bm.record_running_version("deadbeef");
+        assert_eq!(bm.get_version().await, "deadbeef");
     }
 
     #[test]

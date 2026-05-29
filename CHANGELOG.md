@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   safety; the existing `version` label is unchanged, so queries such as
   `count by (version) (proxy_build_info)` keep working.
 
+### Fixed
+
+- `llama_cpp_version` (surfaced in `/metrics`, `/metrics/json`, and
+  `/cluster/nodes`) now reflects the llama.cpp binary that is actually running.
+  The reported commit was previously recorded at git-checkout time — before the
+  build and binary swap — so during an auto-rebuild it briefly advertised the
+  new commit while the old binary was still serving, and a failed build left it
+  pinned to a commit that never ran. The version is now recorded only after the
+  binary swap succeeds.
+
 ## [1.4.0] - 2026-05-29
 
 ### Added
