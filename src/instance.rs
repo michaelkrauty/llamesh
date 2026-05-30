@@ -390,11 +390,14 @@ impl Instance {
         let lines = self.startup_log.lock();
         let params = parse_llama_server_log(&lines);
 
-        // Check if we got any meaningful data
-        // `n_ctx` is present in every healthy startup log regardless of
-        // verbosity, so a parse yielding no data at all now reliably indicates a
-        // genuinely malformed/empty log rather than an upstream log-format change.
+        // Check if we got any meaningful data. Both `n_ctx` and `n_slots` are
+        // present in every healthy startup log regardless of verbosity, so a
+        // parse yielding none of these reliably indicates a genuinely
+        // malformed/empty log rather than an upstream log-format change. Each
+        // extracted field is included so a successfully parsed value is never
+        // discarded just because a sibling line drifted in spelling.
         let has_data = params.n_ctx.is_some()
+            || params.n_slots.is_some()
             || params.n_ctx_train.is_some()
             || params.arch.is_some()
             || params.model_name.is_some();
@@ -787,6 +790,35 @@ mod tests {
         );
         // Before parsing, should be None
         assert!(instance.get_parsed_params().is_none());
+    }
+
+    #[test]
+    fn test_parse_and_store_keeps_n_slots_only() {
+        // If a future llama.cpp build drifts the spelling of the `new slot,
+        // n_ctx` line (or it is missing from the buffered log), the slot-init
+        // line may be the only recognized value. `has_data` must still treat
+        // that as a successful parse rather than discarding n_slots and logging
+        // a spurious "Failed to parse" warning.
+        let instance = Instance::new(
+            "test-id".to_string(),
+            "test-model".to_string(),
+            "default".to_string(),
+            "127.0.0.1".to_string(),
+            8080,
+            "hash123".to_string(),
+            false,
+        );
+        instance
+            .startup_log
+            .lock()
+            .push("5.09.925.994 I srv    load_model: initializing slots, n_slots = 4".to_string());
+        instance.parse_and_store_startup_params();
+
+        let parsed = instance
+            .get_parsed_params()
+            .expect("slot count alone should count as parseable data");
+        assert_eq!(parsed.n_slots, Some(4));
+        assert_eq!(parsed.n_ctx, None);
     }
 
     #[test]
