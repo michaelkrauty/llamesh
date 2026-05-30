@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-05-30
+
+### Added
+
+- The `parsed_model_params` reported per profile by `GET /v1/models` now includes
+  `n_ctx` — the effective per-request context window the running instance is
+  serving (parsed from llama-server's `new slot, n_ctx = <N>` line). This is the
+  context length a client can actually use, which may be smaller than the model's
+  trained maximum (`n_ctx_train`) when an instance is launched with a reduced
+  context.
+
+### Fixed
+
+- Restore model-parameter parsing against current `llama-server` builds. Recent
+  llama.cpp releases (build ~9425) raised the verbosity of the `print_info:`
+  model-metadata block above the default log threshold, so it no longer appears
+  in a default-verbosity startup log. The startup-log parser recognized only that
+  block, so on current builds it extracted nothing and logged `Failed to parse
+  model params from startup log` on essentially every instance spawn, while
+  `parsed_model_params` in `/v1/models` was always null. The parser now also reads
+  the fields that remain available at default verbosity — the effective context
+  window (`new slot, n_ctx = <N>`) and the trained context length (from the
+  `n_ctx_seq (<x>) < n_ctx_train (<N>)` capacity warning) — so model params are
+  observable again without raising llama-server verbosity. Existing `print_info:`
+  parsing is retained (its regex already tolerates the new timestamp/severity log
+  prefix), so older builds and instances launched with raised verbosity continue
+  to yield the full metadata set. Because `n_ctx` is present in every healthy
+  startup log regardless of verbosity, the "failed to parse" warning is now
+  emitted only when a startup log is genuinely unparseable rather than on every
+  spawn.
+
 ## [1.6.1] - 2026-05-29
 
 ### Fixed
