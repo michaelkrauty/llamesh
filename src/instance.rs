@@ -20,6 +20,12 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 pub struct ParsedModelParams {
     // Core context/batch
     pub n_ctx_train: Option<u64>,
+    /// Effective per-request context window the instance is serving, parsed from
+    /// `new slot, n_ctx = <N>`. May be smaller than `n_ctx_train` when the
+    /// instance is launched with a reduced context. Unlike the other fields here
+    /// (which come from the model-metadata block), this line is present in every
+    /// healthy startup log regardless of llama.cpp log verbosity.
+    pub n_ctx: Option<u64>,
     pub n_batch: Option<u64>,
     pub n_ubatch: Option<u64>,
 
@@ -44,9 +50,27 @@ pub struct ParsedModelParams {
     pub freq_base_train: Option<f64>,
 }
 
-/// Static compiled regex for parsing llama-server log lines.
+/// Static compiled regex for the model-metadata block (`print_info: <key> = <value>`).
+///
+/// Since llama.cpp build ~9425 these lines are emitted only *above* the default
+/// log verbosity threshold (`-lv 3`), so they are typically absent from a
+/// default-verbosity startup log; they are still parsed here for older builds
+/// and for instances launched with raised verbosity. The pattern is
+/// intentionally unanchored so the timestamp/severity prefix that newer builds
+/// prepend (e.g. `0.00.670.006 I print_info: ...`) is ignored.
 static LOG_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"print_info:\s+(\S+)\s+=\s+(.+)").unwrap());
+
+/// Effective per-slot context window, logged at default verbosity as
+/// `slot load_model: ... new slot, n_ctx = <N>`.
+static SLOT_N_CTX_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"new slot, n_ctx = (\d+)").unwrap());
+
+/// Trained context length, logged at default verbosity only inside the capacity
+/// warning `n_ctx_seq (<x>) < n_ctx_train (<N>)` (printed when an instance is
+/// launched with a context smaller than the model was trained on).
+static N_CTX_TRAIN_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"n_ctx_train \((\d+)\)").unwrap());
 
 /// Maximum number of startup log lines to buffer per instance.
 /// Prevents unbounded memory growth if an instance floods stdout before becoming ready.
@@ -101,6 +125,24 @@ pub fn parse_llama_server_log(lines: &[String]) -> ParsedModelParams {
         } else if line.contains("print_info: model params") {
             if let Some(idx) = line.find('=') {
                 params.model_params = Some(line[idx + 1..].trim().to_string());
+            }
+        }
+
+        // New default-verbosity format (llama.cpp build ~9425+): the verbose
+        // `print_info:` block above is suppressed, but the effective context
+        // window is always logged per slot, and the trained context length is
+        // logged (when the running context is reduced) in a capacity warning.
+        // Parsing these keeps model params observable without raising verbosity.
+        // `print_info:` values, when present, are parsed first and take
+        // precedence, hence the `is_none` guards.
+        if params.n_ctx.is_none() {
+            if let Some(caps) = SLOT_N_CTX_REGEX.captures(line) {
+                params.n_ctx = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            }
+        }
+        if params.n_ctx_train.is_none() {
+            if let Some(caps) = N_CTX_TRAIN_REGEX.captures(line) {
+                params.n_ctx_train = caps.get(1).and_then(|m| m.as_str().parse().ok());
             }
         }
     }
@@ -330,14 +372,19 @@ impl Instance {
         let params = parse_llama_server_log(&lines);
 
         // Check if we got any meaningful data
-        let has_data =
-            params.n_ctx_train.is_some() || params.arch.is_some() || params.model_name.is_some();
+        // `n_ctx` is present in every healthy startup log regardless of
+        // verbosity, so a parse yielding no data at all now reliably indicates a
+        // genuinely malformed/empty log rather than an upstream log-format change.
+        let has_data = params.n_ctx.is_some()
+            || params.n_ctx_train.is_some()
+            || params.arch.is_some()
+            || params.model_name.is_some();
 
         if has_data {
             info!(
                 instance_id = %self.id,
-                "Parsed model params: arch={:?}, n_ctx_train={:?}, n_layer={:?}, model_name={:?}",
-                params.arch, params.n_ctx_train, params.n_layer, params.model_name
+                "Parsed model params: n_ctx={:?}, n_ctx_train={:?}, arch={:?}, n_layer={:?}, model_name={:?}",
+                params.n_ctx, params.n_ctx_train, params.arch, params.n_layer, params.model_name
             );
             *self.parsed_params.lock() = Some(params);
         } else {
@@ -737,11 +784,49 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_llama_server_log_new_default_verbosity_format() {
+        // Real default-verbosity startup output from llama.cpp build 9425: the
+        // verbose `print_info:` block is suppressed, but the effective context
+        // window (per slot) and the trained context length (capacity warning)
+        // are still present. Both lines carry the new timestamp/severity prefix.
+        let lines = vec![
+            "0.04.710.907 W llama_context: n_ctx_seq (4096) < n_ctx_train (131072) -- the full capacity of the model will not be utilized".to_string(),
+            "0.04.730.906 I srv    load_model: initializing slots, n_slots = 4".to_string(),
+            "0.04.789.423 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 4096".to_string(),
+            "0.04.789.437 I slot   load_model: id  1 | task -1 | new slot, n_ctx = 4096".to_string(),
+        ];
+        let params = parse_llama_server_log(&lines);
+        assert_eq!(params.n_ctx, Some(4096));
+        assert_eq!(params.n_ctx_train, Some(131072));
+    }
+
+    #[test]
+    fn test_parse_llama_server_log_high_verbosity_prefixed_print_info() {
+        // At raised verbosity (or on older builds) the `print_info:` block
+        // returns, prefixed with a timestamp/severity. The unanchored regex must
+        // still extract it, and `print_info: n_ctx_train` must take precedence
+        // over the capacity warning's value.
+        let lines = vec![
+            "0.00.670.006 I print_info: arch                  = gemma4".to_string(),
+            "0.00.670.006 I print_info: n_ctx_train           = 131072".to_string(),
+            "0.00.670.008 I print_info: n_layer               = 35".to_string(),
+            "0.04.710.907 W llama_context: n_ctx_seq (4096) < n_ctx_train (131072) -- the full capacity of the model will not be utilized".to_string(),
+            "0.04.789.423 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 4096".to_string(),
+        ];
+        let params = parse_llama_server_log(&lines);
+        assert_eq!(params.arch, Some("gemma4".to_string()));
+        assert_eq!(params.n_ctx_train, Some(131072));
+        assert_eq!(params.n_layer, Some(35));
+        assert_eq!(params.n_ctx, Some(4096));
+    }
+
+    #[test]
     fn test_parse_llama_server_log_empty() {
         let lines: Vec<String> = vec!["no matching lines here".to_string()];
         let params = parse_llama_server_log(&lines);
         // All fields should be None
         assert!(params.n_ctx_train.is_none());
+        assert!(params.n_ctx.is_none());
         assert!(params.arch.is_none());
     }
 
