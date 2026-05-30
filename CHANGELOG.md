@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-05-30
+
+### Added
+
+- The `parsed_model_params` reported per profile by `GET /v1/models` now includes
+  `n_slots` — the number of parallel decode slots the running instance
+  initialized, i.e. the number of requests it can serve concurrently. This is
+  parsed from llama-server's `initializing slots, n_slots = <N>` startup line,
+  which (like the `new slot, n_ctx = <N>` line added in 1.7.0) is present at the
+  default log verbosity. When a profile does not pin `--parallel`/`-np`,
+  llama-server resolves the slot count automatically, so the running instance's
+  real concurrency can differ from the proxy's configured
+  `max_concurrent_requests_per_instance`; surfacing `n_slots` makes that
+  divergence observable through the API. This is observability only — admission
+  and slot-aware scheduling are unchanged, and the field is an additive,
+  backward-compatible addition to the JSON response (absent as `null` until an
+  instance is running).
+
 ## [1.7.0] - 2026-05-30
 
 ### Added

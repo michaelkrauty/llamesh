@@ -561,7 +561,11 @@ Response:
         "profile_description": "Lower context, higher throughput",
         "idle_timeout_seconds": 600,
         "estimated_tokens_per_second": 42.5,
-        "parsed_model_params": "20B"
+        "parsed_model_params": {
+          "n_ctx": 4096,
+          "n_ctx_train": 131072,
+          "n_slots": 4
+        }
       }
     },
     {
@@ -575,7 +579,8 @@ Response:
       "metadata": {
         "model": "gpt-oss-20b",
         "profile_id": "quality",
-        "profile_description": "Larger context, more careful settings"
+        "profile_description": "Larger context, more careful settings",
+        "parsed_model_params": null
       }
     }
   ],
@@ -586,7 +591,7 @@ Response:
 Implementation notes:
 
 * `owned_by` is set to the `node_id` of the node that hosts the model.
-* Metadata includes `model`, `profile_id`, `profile_description`, `idle_timeout_seconds`, `estimated_tokens_per_second` (from learned metrics), and `parsed_model_params` (extracted from startup logs, e.g. `"20B"`).
+* Metadata includes `model`, `profile_id`, `profile_description`, `idle_timeout_seconds`, `estimated_tokens_per_second` (from learned metrics), and `parsed_model_params` (an object extracted from the running instance's startup log, or `null` when no instance is running). At default llama.cpp log verbosity it carries the effective context window (`n_ctx`), the trained context length (`n_ctx_train`), and the resolved slot count (`n_slots`); the model-metadata fields (architecture, layer/head counts, etc.) are additionally populated on older builds or when the instance is launched at raised verbosity, and are `null` otherwise.
 * For models advertised by cluster peers, metadata is `{ "source": "cluster", "advertised_by": "<peer_node_id>", "cluster_url": "<peer_url>" }`.
 * When in cluster mode, returns the union of models supported by the cluster.
 
@@ -925,7 +930,7 @@ Each instance is a `llama-server` process spawned by the proxy:
 
 * Startup log parsing:
 
-  * The proxy parses `llama-server` startup logs to extract model parameters (`n_ctx_train`, `n_layer`, architecture). These are exposed in `/v1/models` metadata as `parsed_model_params`.
+  * The proxy parses `llama-server` startup logs to extract model parameters. At default log verbosity it reads the effective context window (`n_ctx`), the trained context length (`n_ctx_train`), and the resolved parallel-slot count (`n_slots`); the model-metadata block (`n_layer`, architecture, etc.) is also parsed when present (older builds or raised verbosity). These are exposed in `/v1/models` metadata as `parsed_model_params`.
 
 * Idle eviction:
 
