@@ -26,6 +26,13 @@ pub struct ParsedModelParams {
     /// (which come from the model-metadata block), this line is present in every
     /// healthy startup log regardless of llama.cpp log verbosity.
     pub n_ctx: Option<u64>,
+    /// Number of parallel decode slots the instance initialized, parsed from
+    /// `initializing slots, n_slots = <N>`. This is the number of requests the
+    /// instance can serve concurrently. When a profile does not pin
+    /// `--parallel`/`-np`, llama-server derives this automatically, so it may
+    /// differ from the proxy's configured `max_concurrent_requests_per_instance`.
+    /// Like `n_ctx`, this line is present at default llama.cpp log verbosity.
+    pub n_slots: Option<u64>,
     pub n_batch: Option<u64>,
     pub n_ubatch: Option<u64>,
 
@@ -65,6 +72,13 @@ static LOG_REGEX: LazyLock<Regex> =
 /// `slot load_model: ... new slot, n_ctx = <N>`.
 static SLOT_N_CTX_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"new slot, n_ctx = (\d+)").unwrap());
+
+/// Number of parallel decode slots the instance initialized, logged at default
+/// verbosity as `srv load_model: initializing slots, n_slots = <N>`. This is the
+/// instance's real concurrency capacity, present whether `--parallel`/`-np` was
+/// set explicitly or left for llama-server to resolve automatically.
+static N_SLOTS_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"initializing slots, n_slots = (\d+)").unwrap());
 
 /// Trained context length, logged at default verbosity only inside the capacity
 /// warning `n_ctx_seq (<x>) < n_ctx_train (<N>)` (printed when an instance is
@@ -143,6 +157,11 @@ pub fn parse_llama_server_log(lines: &[String]) -> ParsedModelParams {
         if params.n_ctx_train.is_none() {
             if let Some(caps) = N_CTX_TRAIN_REGEX.captures(line) {
                 params.n_ctx_train = caps.get(1).and_then(|m| m.as_str().parse().ok());
+            }
+        }
+        if params.n_slots.is_none() {
+            if let Some(caps) = N_SLOTS_REGEX.captures(line) {
+                params.n_slots = caps.get(1).and_then(|m| m.as_str().parse().ok());
             }
         }
     }
@@ -371,11 +390,14 @@ impl Instance {
         let lines = self.startup_log.lock();
         let params = parse_llama_server_log(&lines);
 
-        // Check if we got any meaningful data
-        // `n_ctx` is present in every healthy startup log regardless of
-        // verbosity, so a parse yielding no data at all now reliably indicates a
-        // genuinely malformed/empty log rather than an upstream log-format change.
+        // Check if we got any meaningful data. Both `n_ctx` and `n_slots` are
+        // present in every healthy startup log regardless of verbosity, so a
+        // parse yielding none of these reliably indicates a genuinely
+        // malformed/empty log rather than an upstream log-format change. Each
+        // extracted field is included so a successfully parsed value is never
+        // discarded just because a sibling line drifted in spelling.
         let has_data = params.n_ctx.is_some()
+            || params.n_slots.is_some()
             || params.n_ctx_train.is_some()
             || params.arch.is_some()
             || params.model_name.is_some();
@@ -383,8 +405,8 @@ impl Instance {
         if has_data {
             info!(
                 instance_id = %self.id,
-                "Parsed model params: n_ctx={:?}, n_ctx_train={:?}, arch={:?}, n_layer={:?}, model_name={:?}",
-                params.n_ctx, params.n_ctx_train, params.arch, params.n_layer, params.model_name
+                "Parsed model params: n_ctx={:?}, n_ctx_train={:?}, n_slots={:?}, arch={:?}, n_layer={:?}, model_name={:?}",
+                params.n_ctx, params.n_ctx_train, params.n_slots, params.arch, params.n_layer, params.model_name
             );
             *self.parsed_params.lock() = Some(params);
         } else {
@@ -771,6 +793,35 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_and_store_keeps_n_slots_only() {
+        // If a future llama.cpp build drifts the spelling of the `new slot,
+        // n_ctx` line (or it is missing from the buffered log), the slot-init
+        // line may be the only recognized value. `has_data` must still treat
+        // that as a successful parse rather than discarding n_slots and logging
+        // a spurious "Failed to parse" warning.
+        let instance = Instance::new(
+            "test-id".to_string(),
+            "test-model".to_string(),
+            "default".to_string(),
+            "127.0.0.1".to_string(),
+            8080,
+            "hash123".to_string(),
+            false,
+        );
+        instance
+            .startup_log
+            .lock()
+            .push("5.09.925.994 I srv    load_model: initializing slots, n_slots = 4".to_string());
+        instance.parse_and_store_startup_params();
+
+        let parsed = instance
+            .get_parsed_params()
+            .expect("slot count alone should count as parseable data");
+        assert_eq!(parsed.n_slots, Some(4));
+        assert_eq!(parsed.n_ctx, None);
+    }
+
+    #[test]
     fn test_parse_llama_server_log_extracts_params() {
         let lines = vec![
             "print_info: n_ctx_train = 32768".to_string(),
@@ -798,6 +849,22 @@ mod tests {
         let params = parse_llama_server_log(&lines);
         assert_eq!(params.n_ctx, Some(4096));
         assert_eq!(params.n_ctx_train, Some(131072));
+        assert_eq!(params.n_slots, Some(4));
+    }
+
+    #[test]
+    fn test_parse_llama_server_log_n_slots() {
+        // The per-slot-init line is present at default verbosity (same tier as
+        // `new slot, n_ctx`) and carries the timestamp/severity prefix; the
+        // unanchored regex must still extract the resolved slot count.
+        let lines = vec![
+            "5.08.226.892 I srv  llama_server: n_parallel is set to auto, using n_parallel = 4 and kv_unified = true".to_string(),
+            "5.09.925.994 I srv    load_model: initializing slots, n_slots = 8".to_string(),
+            "5.10.028.388 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 202752".to_string(),
+        ];
+        let params = parse_llama_server_log(&lines);
+        assert_eq!(params.n_slots, Some(8));
+        assert_eq!(params.n_ctx, Some(202752));
     }
 
     #[test]
@@ -827,6 +894,7 @@ mod tests {
         // All fields should be None
         assert!(params.n_ctx_train.is_none());
         assert!(params.n_ctx.is_none());
+        assert!(params.n_slots.is_none());
         assert!(params.arch.is_none());
     }
 
@@ -834,6 +902,7 @@ mod tests {
     fn test_parsed_model_params_default() {
         let params = ParsedModelParams::default();
         assert!(params.n_ctx_train.is_none());
+        assert!(params.n_slots.is_none());
         assert!(params.n_layer.is_none());
         assert!(params.arch.is_none());
         assert!(params.model_name.is_none());
