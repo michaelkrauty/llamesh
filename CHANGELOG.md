@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-05-30
+
+### Added
+
+- `GET /metrics` now exposes `proxy_node_active_instances`, a gauge reporting the
+  number of llama-server instances this node is currently managing (spawned and
+  not yet evicted). It matches the `active_instances` field already shown per
+  node in `/cluster/nodes`, but as a scrapeable Prometheus time series it lets
+  operators dashboard and alert on instance count and churn directly — for
+  example, catching a node that is backing up requests while running zero
+  instances (`proxy_queue_pending_tokens > 0` with `proxy_node_active_instances
+  == 0`), or watching spawn/evict thrash. The same count is added to the
+  `node_resources` object in the `/metrics/json` snapshot. The gauge is
+  recomputed from live instance state on every scrape (the metrics handler
+  refreshes the node resource snapshot before rendering), so it does not go
+  stale. This is additive and backward-compatible: the new
+  `node_resources.active_instances` snapshot field is `#[serde(default)]`, so
+  metrics snapshots written by older versions still load and historical counters
+  are preserved across the upgrade.
+
 ## [1.8.3] - 2026-05-30
 
 ### Fixed

@@ -100,6 +100,10 @@ pub struct Metrics {
     pub node_device_vram_used_mb: AtomicU64,
     pub node_device_vram_total_mb: AtomicU64,
     pub node_gpu_telemetry_available: AtomicBool,
+    /// Number of llama-server instances currently managed on this node
+    /// (spawned and not yet evicted), matching `active_instances` in
+    /// `/cluster/nodes`.
+    pub node_active_instances: AtomicU64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -135,6 +139,10 @@ pub struct NodeResourceMetricsSnapshot {
     pub device_vram_used_mb: u64,
     pub device_vram_total_mb: u64,
     pub gpu_telemetry_available: bool,
+    /// Number of llama-server instances managed on this node. `#[serde(default)]`
+    /// keeps snapshots written by older versions (without this field) loadable.
+    #[serde(default)]
+    pub active_instances: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -220,6 +228,7 @@ impl Metrics {
             node_device_vram_used_mb: AtomicU64::new(0),
             node_device_vram_total_mb: AtomicU64::new(0),
             node_gpu_telemetry_available: AtomicBool::new(false),
+            node_active_instances: AtomicU64::new(0),
         }
     }
 
@@ -319,6 +328,8 @@ impl Metrics {
             .store(snapshot.device_vram_total_mb, Ordering::Relaxed);
         self.node_gpu_telemetry_available
             .store(snapshot.gpu_telemetry_available, Ordering::Relaxed);
+        self.node_active_instances
+            .store(snapshot.active_instances, Ordering::Relaxed);
     }
 
     /// Check if we have any memory data for a given args_hash (for cold start detection).
@@ -403,6 +414,7 @@ impl Metrics {
                 device_vram_used_mb: self.node_device_vram_used_mb.load(Ordering::Relaxed),
                 device_vram_total_mb: self.node_device_vram_total_mb.load(Ordering::Relaxed),
                 gpu_telemetry_available: self.node_gpu_telemetry_available.load(Ordering::Relaxed),
+                active_instances: self.node_active_instances.load(Ordering::Relaxed),
             },
         }
     }
@@ -515,6 +527,14 @@ pub async fn render_prometheus_with_circuit_breaker(
         } else {
             0
         }
+    ));
+    out.push_str(
+        "# HELP proxy_node_active_instances Number of llama-server instances currently managed on this node.\n",
+    );
+    out.push_str("# TYPE proxy_node_active_instances gauge\n");
+    out.push_str(&format!(
+        "proxy_node_active_instances {}\n",
+        metrics.node_active_instances.load(Ordering::Relaxed)
     ));
 
     // Queue fairness metrics
@@ -710,6 +730,7 @@ mod tests {
             device_vram_used_mb: 3500,
             device_vram_total_mb: 24000,
             gpu_telemetry_available: true,
+            active_instances: 2,
         });
 
         let snapshot = metrics
@@ -732,6 +753,7 @@ mod tests {
         assert_eq!(snapshot.node_resources.llamesh_vram_mb, 3000);
         assert_eq!(snapshot.node_resources.external_vram_mb, 500);
         assert!(snapshot.node_resources.gpu_telemetry_available);
+        assert_eq!(snapshot.node_resources.active_instances, 2);
     }
 
     #[tokio::test]
@@ -747,6 +769,7 @@ mod tests {
             device_vram_used_mb: 150,
             device_vram_total_mb: 1000,
             gpu_telemetry_available: true,
+            active_instances: 3,
         });
 
         let hm = metrics.get_hash_metrics("abc123").await;
@@ -759,6 +782,7 @@ mod tests {
         assert!(output.contains("proxy_requests_total 1"));
         assert!(output.contains("proxy_node_external_vram_mb 50"));
         assert!(output.contains("proxy_node_gpu_telemetry_available 1"));
+        assert!(output.contains("proxy_node_active_instances 3"));
         assert!(output.contains("proxy_hash_requests_total{hash=\"abc123\""));
         assert!(output.contains("names=\"gpt\\\"cool\\\"\""));
     }
@@ -790,6 +814,39 @@ mod tests {
             "proxy_build_info{{version=\"{}\",llama_cpp_version=\"weird\\\"\\\\\\nver\"}} 1",
             env!("CARGO_PKG_VERSION")
         )));
+    }
+
+    #[test]
+    fn snapshot_without_active_instances_field_still_loads() {
+        // A node_resources object written by a pre-1.9.0 version has no
+        // `active_instances` field. `#[serde(default)]` on that field must keep
+        // the snapshot loadable so an in-place upgrade preserves persisted
+        // counters (e.g. requests_total) instead of resetting them via the
+        // parse-error fallback in `Metrics::load`. This JSON mirrors the
+        // node_resources shape written by older releases.
+        let json = r#"{
+            "node_id": "n",
+            "llama_cpp_version": "abc",
+            "requests_total": 1421955,
+            "errors_total": 10,
+            "current_requests": 0,
+            "hashes": {},
+            "updated_at": "2026-05-30T00:00:00Z",
+            "node_resources": {
+                "llamesh_vram_mb": 0,
+                "llamesh_sysmem_mb": 0,
+                "external_vram_mb": 3686,
+                "effective_vram_mb": 3686,
+                "effective_sysmem_mb": 0,
+                "device_vram_used_mb": 3686,
+                "device_vram_total_mb": 24564,
+                "gpu_telemetry_available": true
+            }
+        }"#;
+        let snapshot: MetricsSnapshot =
+            serde_json::from_str(json).expect("pre-1.9.0 snapshot must still deserialize");
+        assert_eq!(snapshot.requests_total, 1_421_955);
+        assert_eq!(snapshot.node_resources.active_instances, 0);
     }
 
     #[tokio::test]
