@@ -462,9 +462,33 @@ pub struct Cookbook {
 
 impl Cookbook {
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Tracks the first display name seen for each case-insensitive
+        // "model:profile" key, mirroring how `build_model_index` keys the model
+        // index. The index inserts into a HashMap, so a duplicate key would
+        // silently overwrite (shadow) one definition; reject it here instead.
+        // Only enabled pairs are indexed, so only those can actually collide.
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for model in &self.models {
             for profile in &model.profiles {
                 profile.validate(&model.name)?;
+
+                if model.enabled && profile.enabled {
+                    let key = format!(
+                        "{}:{}",
+                        model.name.to_lowercase(),
+                        profile.id.to_lowercase()
+                    );
+                    let display = format!("{}:{}", model.name, profile.id);
+                    if let Some(first) = seen.get(&key) {
+                        return Err(anyhow::anyhow!(
+                            "Duplicate model:profile identifier: '{first}' and '{display}' both \
+                             resolve to '{key}'. Model and profile names are matched \
+                             case-insensitively, so these would shadow each other in the model \
+                             index; make each model:profile unique."
+                        ));
+                    }
+                    seen.insert(key, display);
+                }
             }
         }
         Ok(())
@@ -987,6 +1011,87 @@ mod tests {
             min_eviction_tenure_secs: None,
         };
         assert!(profile.validate("test_model").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_profile_id() {
+        // Two enabled profiles with the same id in one model collide on the
+        // model-index key "foo:fast" and would silently shadow each other.
+        let yaml = r#"
+models:
+  - name: foo
+    profiles:
+      - id: fast
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+      - id: fast
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+"#;
+        let cb: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cb.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_case_insensitive_duplicate() {
+        // "Foo:Default" and "foo:default" lowercase to the same index key.
+        let yaml = r#"
+models:
+  - name: Foo
+    profiles:
+      - id: Default
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+  - name: foo
+    profiles:
+      - id: default
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+"#;
+        let cb: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cb.validate().is_err());
+    }
+
+    #[test]
+    fn validate_allows_disabled_duplicate() {
+        // A disabled profile is never indexed, so it cannot collide.
+        let yaml = r#"
+models:
+  - name: foo
+    profiles:
+      - id: fast
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+      - id: fast
+        enabled: false
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+"#;
+        let cb: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cb.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_unique_identifiers() {
+        // Same profile id under different model names is fine (distinct keys).
+        let yaml = r#"
+models:
+  - name: foo
+    profiles:
+      - id: fast
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+      - id: quality
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+  - name: bar
+    profiles:
+      - id: fast
+        model_path: /tmp/m.gguf
+        llama_server_args: ""
+"#;
+        let cb: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cb.validate().is_ok());
     }
 
     #[test]

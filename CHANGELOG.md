@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-05-30
+
+### Fixed
+
+- The cookbook now rejects duplicate `model:profile` identifiers at load time
+  instead of silently shadowing one of them. `build_model_index` keys the model
+  index by a case-insensitive `"<model>:<profile>"` string in a `HashMap`, so two
+  entries that resolve to the same key — a repeated profile `id` within a model,
+  or a model `name` reused with an overlapping profile id (matching is
+  case-insensitive) — would overwrite each other, leaving one configuration
+  unreachable with no error or warning at startup or on hot-reload.
+  `Cookbook::validate()` now detects this collision among the enabled
+  `(model, profile)` pairs that the index actually builds and fails with an error
+  naming both conflicting identifiers. Because hot-reload validates before
+  swapping the index, a live edit that introduces a duplicate is rejected and the
+  previously loaded cookbook keeps serving.
+
 ## [1.8.0] - 2026-05-30
 
 ### Added
