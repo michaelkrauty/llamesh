@@ -137,6 +137,36 @@ impl NodeConfig {
             }
         }
 
+        // Validate cluster gossip settings. When cluster mode is enabled, the
+        // gossip loop drives a `tokio::time::interval` from
+        // `gossip_interval_seconds` and a `Semaphore` from
+        // `max_concurrent_gossip`. A zero interval panics `tokio::time::interval`
+        // ("interval period must be non-zero"), killing the gossip task so the
+        // node silently never advertises itself or polls peers; a zero
+        // `max_concurrent_gossip` leaves the semaphore with no permits, so every
+        // outbound gossip attempt times out and is skipped. Both deserialize
+        // cleanly otherwise, so catch them at startup. `gossip_interval_seconds`
+        // is required and has no default, which makes a stray 0 easy to
+        // introduce. Only checked when cluster mode is on, since the gossip loop
+        // (and these fields) are otherwise unused.
+        if self.cluster.enabled {
+            if self.cluster.gossip_interval_seconds == 0 {
+                return Err(anyhow::anyhow!(
+                    "cluster.gossip_interval_seconds is 0, but cluster mode is enabled; \
+                     the gossip loop requires a non-zero interval (a zero interval panics \
+                     the gossip task). Set gossip_interval_seconds to at least 1."
+                ));
+            }
+            if self.cluster.max_concurrent_gossip == 0 {
+                return Err(anyhow::anyhow!(
+                    "cluster.max_concurrent_gossip is 0, but cluster mode is enabled; \
+                     with no permits every outbound gossip attempt times out and is skipped, \
+                     so the node never gossips. Set max_concurrent_gossip to at least 1, \
+                     or disable cluster mode."
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -1062,6 +1092,44 @@ mod tests {
             ranges: None,
         };
         assert!(config_with_ports(Some(none_none)).validate().is_err());
+    }
+
+    fn config_with_cluster(
+        enabled: bool,
+        gossip_interval_seconds: u64,
+        max_concurrent_gossip: usize,
+    ) -> NodeConfig {
+        let mut config = config_with_ports(None);
+        config.cluster.enabled = enabled;
+        config.cluster.gossip_interval_seconds = gossip_interval_seconds;
+        config.cluster.max_concurrent_gossip = max_concurrent_gossip;
+        config
+    }
+
+    #[test]
+    fn validate_accepts_valid_gossip_settings_when_cluster_enabled() {
+        assert!(config_with_cluster(true, 5, 16).validate().is_ok());
+        // A 1-second interval and a single gossip permit are the minimum valid values.
+        assert!(config_with_cluster(true, 1, 1).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_gossip_interval_when_cluster_enabled() {
+        // A zero interval panics tokio::time::interval in the gossip loop.
+        assert!(config_with_cluster(true, 0, 16).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_concurrent_gossip_when_cluster_enabled() {
+        // A zero-permit semaphore makes every outbound gossip attempt time out.
+        assert!(config_with_cluster(true, 5, 0).validate().is_err());
+    }
+
+    #[test]
+    fn validate_ignores_zero_gossip_settings_when_cluster_disabled() {
+        // The gossip loop never runs with cluster disabled, so these unused
+        // fields must not be rejected (avoids breaking single-node configs).
+        assert!(config_with_cluster(false, 0, 0).validate().is_ok());
     }
 
     #[test]
