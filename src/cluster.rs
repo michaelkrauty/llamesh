@@ -347,6 +347,24 @@ fn is_loopback_address(url: &str) -> bool {
         || host == "[::1]"
 }
 
+/// Decide whether a peer version mismatch should be logged now, recording the
+/// version when it should. Returns `true` only when the peer's mismatched
+/// version is newly seen or has changed since the last time we logged about that
+/// peer — edge-triggering the log so a persistent skew is reported once per
+/// distinct version rather than on every gossip round.
+fn note_version_mismatch_for_logging(
+    logged: &mut std::collections::HashMap<String, String>,
+    node_id: &str,
+    peer_version: &str,
+) -> bool {
+    if logged.get(node_id).map(String::as_str) == Some(peer_version) {
+        false
+    } else {
+        logged.insert(node_id.to_string(), peer_version.to_string());
+        true
+    }
+}
+
 pub async fn process_gossip_message(
     state: &NodeState,
     msg: GossipMessage,
@@ -369,24 +387,52 @@ pub async fn process_gossip_message(
             _ => false, // "warn" or any other value
         };
 
-        if should_reject {
-            tracing::warn!(
-                event = "peer_rejected_version_mismatch",
-                peer_node_id = %peer_state.node_id,
-                peer_version = %peer_state.version,
-                local_version = %local_version,
-                action = %action,
-                "Rejecting peer due to version mismatch"
-            );
-            return; // Don't process this gossip message
+        // Edge-trigger the mismatch log. This handler runs on every inbound
+        // gossip (once per `gossip_interval_seconds` per peer), so logging on
+        // each round floods the log for the entire duration of a version skew
+        // (e.g. a rolling upgrade). Only log when this peer's version is first
+        // seen or changes.
+        //
+        // LOCK_ORDER: `logged_peer_versions` is a synchronous leaf mutex held
+        // only for this map access and never across `.await`, so it is outside
+        // the async lock ordering documented on `NodeState`.
+        let should_log = {
+            let mut logged = state.logged_peer_versions.lock().unwrap();
+            note_version_mismatch_for_logging(&mut logged, &peer_state.node_id, &peer_state.version)
+        };
+
+        if should_log {
+            if should_reject {
+                tracing::warn!(
+                    event = "peer_rejected_version_mismatch",
+                    peer_node_id = %peer_state.node_id,
+                    peer_version = %peer_state.version,
+                    local_version = %local_version,
+                    action = %action,
+                    "Rejecting peer due to version mismatch"
+                );
+            } else {
+                tracing::warn!(
+                    "Version mismatch detected: Peer {} is on version {}, but local node is on version {}",
+                    peer_state.node_id,
+                    peer_state.version,
+                    local_version
+                );
+            }
         }
 
-        tracing::warn!(
-            "Version mismatch detected: Peer {} is on version {}, but local node is on version {}",
-            peer_state.node_id,
-            peer_state.version,
-            local_version
-        );
+        if should_reject {
+            return; // Don't process this gossip message
+        }
+    } else {
+        // Versions match: forget any remembered skew so that if this peer later
+        // diverges again it is logged afresh, and the map does not retain stale
+        // entries for peers that have caught up.
+        state
+            .logged_peer_versions
+            .lock()
+            .unwrap()
+            .remove(&peer_state.node_id);
     }
 
     // Update the origin peer with local timestamp
@@ -572,6 +618,134 @@ mod tests {
             logging: None,
             max_total_queue_entries: 0,
         }
+    }
+
+    /// Build a `PeerState` for a peer at a given version with otherwise
+    /// unremarkable fields, for exercising version-skew handling.
+    fn peer_state_with_version(node_id: &str, version: &str) -> PeerState {
+        PeerState {
+            node_id: node_id.to_string(),
+            address: format!("http://{node_id}"),
+            version: version.to_string(),
+            llama_cpp_version: "unknown".to_string(),
+            last_seen: 1000,
+            supported_models: vec![],
+            active_instances: 0,
+            max_instances: 8,
+            current_requests: 0,
+            available_vram: 1,
+            available_sysmem: 1,
+            llamesh_vram_mb: 0,
+            llamesh_sysmem_mb: 0,
+            external_vram_mb: 0,
+            device_vram_used_mb: 0,
+            device_vram_total_mb: 0,
+            gpu_telemetry_available: false,
+            max_vram: 16000,
+            max_sysmem: 64000,
+            total_queue_length: 0,
+            model_stats: std::collections::HashMap::new(),
+            ready: true,
+            loaded_models: vec![],
+        }
+    }
+
+    #[test]
+    fn test_note_version_mismatch_logs_once_per_distinct_version() {
+        let mut logged = std::collections::HashMap::new();
+
+        // First sight of a skewed version logs.
+        assert!(note_version_mismatch_for_logging(
+            &mut logged,
+            "peer-a",
+            "1.5.0"
+        ));
+        // The same version on subsequent gossip rounds does not log again.
+        assert!(!note_version_mismatch_for_logging(
+            &mut logged,
+            "peer-a",
+            "1.5.0"
+        ));
+        assert!(!note_version_mismatch_for_logging(
+            &mut logged,
+            "peer-a",
+            "1.5.0"
+        ));
+        // A changed (still-skewed) version logs once for the new value.
+        assert!(note_version_mismatch_for_logging(
+            &mut logged,
+            "peer-a",
+            "1.5.1"
+        ));
+        assert!(!note_version_mismatch_for_logging(
+            &mut logged,
+            "peer-a",
+            "1.5.1"
+        ));
+        // Other peers are tracked independently.
+        assert!(note_version_mismatch_for_logging(
+            &mut logged,
+            "peer-b",
+            "1.5.1"
+        ));
+        assert!(!note_version_mismatch_for_logging(
+            &mut logged,
+            "peer-b",
+            "1.5.1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_gossip_records_then_clears_version_mismatch() {
+        let config = minimal_node_config();
+        let cookbook = Cookbook { models: vec![] };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+
+        let local = env!("CARGO_PKG_VERSION");
+
+        // A peer on a different version is recorded so the skew is logged only
+        // once instead of on every gossip round.
+        let skewed = peer_state_with_version("peer-skew", "0.0.1");
+        process_gossip_message(
+            &state,
+            GossipMessage {
+                origin: skewed,
+                known_peers: vec![],
+            },
+            None,
+        )
+        .await;
+        assert_eq!(
+            state
+                .logged_peer_versions
+                .lock()
+                .unwrap()
+                .get("peer-skew")
+                .map(String::as_str),
+            Some("0.0.1")
+        );
+
+        // When that peer reports the local version, the dedup record is cleared
+        // so a later divergence is logged afresh.
+        let matched = peer_state_with_version("peer-skew", local);
+        process_gossip_message(
+            &state,
+            GossipMessage {
+                origin: matched,
+                known_peers: vec![],
+            },
+            None,
+        )
+        .await;
+        assert!(state
+            .logged_peer_versions
+            .lock()
+            .unwrap()
+            .get("peer-skew")
+            .is_none());
     }
 
     #[tokio::test]

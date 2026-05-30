@@ -137,6 +137,13 @@ pub struct NodeState {
     /// peer just received work. Bridges the up-to-`gossip_interval` staleness
     /// of `peer.current_requests` during bursts.
     pub peer_pending_forwards: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
+    /// Most recent peer version we have logged a version-mismatch for, keyed by
+    /// peer `node_id`. Lets `process_gossip_message` log version skew only when a
+    /// peer's version is first seen or changes, instead of on every gossip round
+    /// (which floods logs for the whole duration of a rolling upgrade). This is a
+    /// synchronous leaf mutex, held only for the map read/insert/remove and never
+    /// across `.await`, so it is outside the async lock ordering documented above.
+    pub logged_peer_versions: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 use crate::security;
@@ -457,6 +464,7 @@ impl NodeState {
             needs_eviction: Arc::new(RwLock::new(HashSet::new())),
             gossip_trigger: Arc::new(Notify::new()),
             peer_pending_forwards: Arc::new(RwLock::new(HashMap::new())),
+            logged_peer_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
