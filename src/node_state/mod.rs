@@ -258,6 +258,8 @@ pub struct ResourceSnapshot {
     pub device_vram_used_mb: u64,
     pub device_vram_total_mb: u64,
     pub gpu_telemetry_available: bool,
+    /// Number of llama-server instances managed on this node at snapshot time.
+    pub active_instances: u64,
 }
 
 impl ResourceSnapshot {
@@ -265,6 +267,7 @@ impl ResourceSnapshot {
         llamesh_vram_mb: u64,
         llamesh_sysmem_mb: u64,
         device_vram: Option<GpuMemorySnapshot>,
+        active_instances: u64,
     ) -> Self {
         let (device_vram_used_mb, device_vram_total_mb, gpu_telemetry_available) = match device_vram
         {
@@ -283,6 +286,7 @@ impl ResourceSnapshot {
             device_vram_used_mb,
             device_vram_total_mb,
             gpu_telemetry_available,
+            active_instances,
         }
     }
 }
@@ -764,7 +768,12 @@ impl NodeState {
             vram += v;
             sysmem += s;
         }
-        ResourceSnapshot::from_samples(vram, sysmem, self.memory_sampler.sample_device_vram())
+        ResourceSnapshot::from_samples(
+            vram,
+            sysmem,
+            self.memory_sampler.sample_device_vram(),
+            instances.len() as u64,
+        )
     }
 
     fn observe_resource_snapshot(&self, snapshot: &ResourceSnapshot) {
@@ -778,6 +787,7 @@ impl NodeState {
                 device_vram_used_mb: snapshot.device_vram_used_mb,
                 device_vram_total_mb: snapshot.device_vram_total_mb,
                 gpu_telemetry_available: snapshot.gpu_telemetry_available,
+                active_instances: snapshot.active_instances,
             });
     }
 
@@ -3370,18 +3380,20 @@ mod tests {
     #[test]
     fn resource_snapshot_includes_external_vram() {
         let snapshot =
-            ResourceSnapshot::from_samples(6000, 1200, Some(gpu_snapshot(10_000, 24_000)));
+            ResourceSnapshot::from_samples(6000, 1200, Some(gpu_snapshot(10_000, 24_000)), 2);
 
         assert_eq!(snapshot.llamesh_vram_mb, 6000);
         assert_eq!(snapshot.external_vram_mb, 4000);
         assert_eq!(snapshot.effective_vram_mb, 10_000);
         assert_eq!(snapshot.effective_sysmem_mb, 1200);
         assert!(snapshot.gpu_telemetry_available);
+        assert_eq!(snapshot.active_instances, 2);
     }
 
     #[test]
     fn resource_snapshot_keeps_tracked_peak_when_device_sample_is_lower() {
-        let snapshot = ResourceSnapshot::from_samples(6000, 1200, Some(gpu_snapshot(5000, 24_000)));
+        let snapshot =
+            ResourceSnapshot::from_samples(6000, 1200, Some(gpu_snapshot(5000, 24_000)), 1);
 
         assert_eq!(snapshot.external_vram_mb, 0);
         assert_eq!(snapshot.effective_vram_mb, 6000);
