@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.2] - 2026-05-30
+
+### Fixed
+
+- `llama_cpp_ports` is now validated at startup. A configured-but-unusable port
+  set — a range with `start > end` (an empty `RangeInclusive`), or a
+  `llama_cpp_ports` block with no `ports` and no `ranges` — previously loaded
+  cleanly but left the port pool empty, so every instance spawn failed at
+  runtime with `No available ports` and no indication that the port
+  configuration was the cause. `NodeConfig::validate()` now rejects an inverted
+  range and a port set that yields no usable ports, failing fast with a clear
+  message that identifies the offending setting. Omitting `llama_cpp_ports`
+  entirely (OS-assigned ephemeral ports) remains valid.
+
 ## [1.8.1] - 2026-05-30
 
 ### Fixed

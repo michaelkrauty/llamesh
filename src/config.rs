@@ -108,6 +108,35 @@ impl NodeConfig {
                 }
             }
         }
+
+        // Validate llama_cpp_ports. A configured-but-unusable port set — an
+        // inverted range, or no `ports` and no `ranges` — otherwise loads
+        // cleanly but leaves the port pool empty, so every instance spawn fails
+        // at runtime with "No available ports". Catch it at startup instead.
+        if let Some(ports) = &self.llama_cpp_ports {
+            if let Some(ranges) = &ports.ranges {
+                for range in ranges {
+                    if range.start > range.end {
+                        return Err(anyhow::anyhow!(
+                            "llama_cpp_ports range has start {} greater than end {}; \
+                             ranges are inclusive and must have start <= end",
+                            range.start,
+                            range.end
+                        ));
+                    }
+                }
+            }
+            let explicit_ports = ports.ports.as_ref().map_or(0, |p| p.len());
+            let range_count = ports.ranges.as_ref().map_or(0, |r| r.len());
+            if explicit_ports == 0 && range_count == 0 {
+                return Err(anyhow::anyhow!(
+                    "llama_cpp_ports is configured but provides no usable ports; \
+                     specify a non-empty `ports` list or at least one `ranges` entry, \
+                     or omit llama_cpp_ports to use OS-assigned ephemeral ports"
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -915,6 +944,124 @@ mod tests {
             server_tls.enabled = true;
         }
         assert!(config.validate().is_ok());
+    }
+
+    fn config_with_ports(ports: Option<LlamaCppPorts>) -> NodeConfig {
+        NodeConfig {
+            node_id: "test".into(),
+            listen_addr: "0.0.0.0:8080".into(),
+            public_url: None,
+            max_vram_mb: 0,
+            max_sysmem_mb: 0,
+            max_instances_per_node: 1,
+            metrics_path: ".".into(),
+            default_model: "m".into(),
+            model_defaults: defaults(),
+            llama_cpp_ports: ports,
+            llama_cpp: LlamaCppConfig {
+                repo_url: "".into(),
+                repo_path: "".into(),
+                build_path: "".into(),
+                binary_path: "".into(),
+                branch: "".into(),
+                build_args: vec![],
+                build_command_args: vec![],
+                auto_update_interval_seconds: 0,
+                enabled: false,
+                keep_builds: 3,
+            },
+            cluster: ClusterConfig {
+                enabled: false,
+                peers: vec![],
+                gossip_interval_seconds: 1,
+                max_concurrent_gossip: 16,
+                discovery: Default::default(),
+                noise: Default::default(),
+                circuit_breaker: Default::default(),
+                version_mismatch_action: "warn".to_string(),
+            },
+            http: HttpConfig {
+                request_body_limit_bytes: 0,
+                idle_timeout_seconds: 0,
+                body_read_timeout_ms: 30_000,
+                protocol_detect_timeout_ms: 10_000,
+            },
+            auth: None,
+            server_tls: None,
+            cluster_tls: None,
+            shutdown_grace_period_seconds: 30,
+            max_hops: 10,
+            logging: None,
+            max_total_queue_entries: 0,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_absent_port_config() {
+        // Omitting llama_cpp_ports (OS-assigned ephemeral ports) is valid.
+        assert!(config_with_ports(None).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_empty_ports_with_valid_range() {
+        // Common shape: empty explicit list plus a valid range.
+        let ports = LlamaCppPorts {
+            ports: Some(vec![]),
+            ranges: Some(vec![PortRange {
+                start: 8200,
+                end: 8299,
+            }]),
+        };
+        assert!(config_with_ports(Some(ports)).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_explicit_ports_only() {
+        let ports = LlamaCppPorts {
+            ports: Some(vec![8200, 8201]),
+            ranges: None,
+        };
+        assert!(config_with_ports(Some(ports)).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_inverted_port_range() {
+        let ports = LlamaCppPorts {
+            ports: None,
+            ranges: Some(vec![PortRange {
+                start: 8299,
+                end: 8200,
+            }]),
+        };
+        assert!(config_with_ports(Some(ports)).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_inverted_range_even_with_other_ports() {
+        // An inverted range is a typo worth flagging even when other ports exist.
+        let ports = LlamaCppPorts {
+            ports: Some(vec![8200]),
+            ranges: Some(vec![PortRange {
+                start: 8299,
+                end: 8250,
+            }]),
+        };
+        assert!(config_with_ports(Some(ports)).validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_port_config_with_no_usable_ports() {
+        // Configured but empty: no explicit ports and no ranges.
+        let empty = LlamaCppPorts {
+            ports: Some(vec![]),
+            ranges: Some(vec![]),
+        };
+        assert!(config_with_ports(Some(empty)).validate().is_err());
+        let none_none = LlamaCppPorts {
+            ports: None,
+            ranges: None,
+        };
+        assert!(config_with_ports(Some(none_none)).validate().is_err());
     }
 
     #[test]
