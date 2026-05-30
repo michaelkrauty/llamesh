@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.3] - 2026-05-30
+
+### Fixed
+
+- Cluster gossip settings are now validated at startup when cluster mode is
+  enabled. `gossip_interval_seconds` (a required field with no default) and
+  `max_concurrent_gossip` previously deserialized cleanly even when set to `0`,
+  but both break the gossip loop at runtime: a `0` interval makes
+  `tokio::time::interval` panic (`"interval period must be non-zero"`), killing
+  the gossip task so the node silently never advertises itself or polls peers;
+  a `0` `max_concurrent_gossip` leaves the gossip semaphore with no permits, so
+  every outbound gossip attempt times out and is skipped. `NodeConfig::validate()`
+  now rejects either value being `0` while `cluster.enabled` is true, failing
+  fast with a message that names the offending setting, instead of surfacing the
+  misconfiguration as a runtime panic or a silent mesh dropout. The checks are
+  gated on `cluster.enabled` because the gossip loop — and these fields — are
+  unused when cluster mode is off. Startup-only, consistent with the other node
+  config validations (node config is not hot-reloaded).
+
 ## [1.8.2] - 2026-05-30
 
 ### Fixed
