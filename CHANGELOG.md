@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-05-29
+
+### Fixed
+
+- Peer version-mismatch logging is now edge-triggered instead of repeating on
+  every gossip round. `process_gossip_message` runs once per inbound gossip
+  (every `gossip_interval_seconds` per peer), and previously emitted a `WARN`
+  whenever a peer's version differed from the local node's — so a single
+  version-skewed peer produced one identical warning per gossip interval for the
+  entire duration of the skew (for example, throughout a rolling upgrade). The
+  node now logs a peer's version skew only when that peer's version is first seen
+  or changes, and clears the record once the peer's version matches again so a
+  later mismatch is reported afresh. Both the `warn` and `reject_*`
+  `version_mismatch_action` paths are deduplicated. The dedup state is tracked
+  locally and is not part of the gossip wire format, so peer metadata exchanged
+  between nodes is unchanged.
+
 ## [1.6.0] - 2026-05-29
 
 ### Added
