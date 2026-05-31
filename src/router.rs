@@ -1027,9 +1027,13 @@ pub async fn route_request(
                     }
                 }
                 Err(e) => {
-                    // Guard handles dec_current_requests
-                    state.metrics.inc_errors();
-                    hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    // Guard handles dec_current_requests. Error counters are NOT
+                    // bumped eagerly here: a local failure may still be served by a
+                    // peer below (peer fallback). They are incremented only when the
+                    // client ultimately receives an error — based on the response
+                    // status returned to the client on the fallback path below, or on
+                    // the fall-through error-return paths after the fallback attempt —
+                    // so a request a peer serves successfully is not counted.
 
                     // If local spawning failed repeatedly, try forwarding to a peer
                     // before returning an error to the client.
@@ -1090,13 +1094,33 @@ pub async fn route_request(
 
                                     guard.complete();
 
-                                    return Ok(peer_response_to_client(
+                                    let client_response = peer_response_to_client(
                                         resp,
                                         response_streaming,
                                         cleanup_fut,
                                         tokens_counter,
                                     )
-                                    .await);
+                                    .await;
+
+                                    // Count an error iff the client ultimately
+                                    // receives an error response. `client_status` is
+                                    // the peer's status passed through as-is, except
+                                    // that a non-streaming body-read failure is turned
+                                    // into a 502 by `peer_response_to_client`, which
+                                    // this captures. A request the peer serves
+                                    // successfully is not counted (counting it was the
+                                    // over-count bug); a mid-stream failure after a
+                                    // success status is not counted, consistent with
+                                    // the local and direct-forward paths.
+                                    let client_status = client_response.status();
+                                    if client_status.is_client_error()
+                                        || client_status.is_server_error()
+                                    {
+                                        state.metrics.inc_errors();
+                                        hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                    }
+
+                                    return Ok(client_response);
                                 }
                                 Err(peer_err) => {
                                     // peer_forward_guard drops on fall-through,
@@ -1112,6 +1136,15 @@ pub async fn route_request(
                             }
                         }
                     }
+
+                    // Reached only when no peer returned a response (no peer
+                    // available, or the fallback request itself failed): the request
+                    // is returning an error to the client, so count it now. Responses
+                    // the fallback peer did return are counted above based on their
+                    // client-facing status, so each failed request is counted exactly
+                    // once.
+                    state.metrics.inc_errors();
+                    hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
 
                     match e {
                         NodeError::SpawnFailuresExhausted => Err(AppError::service_unavailable(
