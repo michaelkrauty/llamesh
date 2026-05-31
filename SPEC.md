@@ -437,7 +437,10 @@ Per node, metrics snapshots are stored as JSON files at the path specified by `m
     "effective_sysmem_mb": 8192,
     "device_vram_used_mb": 24576,
     "device_vram_total_mb": 81920,
-    "gpu_telemetry_available": true
+    "gpu_telemetry_available": true,
+    "active_instances": 3,
+    "max_vram_mb": 71680,
+    "max_sysmem_mb": 131072
   },
   "hashes": {
     "<sha256-of-launch-args>": {
