@@ -1028,11 +1028,12 @@ pub async fn route_request(
                 }
                 Err(e) => {
                     // Guard handles dec_current_requests. Error counters are NOT
-                    // bumped here: a local failure may still be served by a peer
-                    // below (peer fallback), in which case the request succeeds
-                    // and must not be counted as an error. The counters are
-                    // incremented only on the actual error-return paths, after
-                    // the fallback attempt.
+                    // bumped eagerly here: a local failure may still be served by a
+                    // peer below (peer fallback). They are incremented only when the
+                    // client ultimately receives an error — on the peer error-status
+                    // path below, or on the fall-through error-return paths after the
+                    // fallback attempt — so a request a peer serves successfully is
+                    // not counted as an error.
 
                     // If local spawning failed repeatedly, try forwarding to a peer
                     // before returning an error to the client.
@@ -1069,6 +1070,18 @@ pub async fn route_request(
                                         PeerResponse::Noise { status, .. } => *status,
                                     };
                                     record_peer_status(&state, &peer.node_id, status).await;
+
+                                    // The peer returned a response, which is
+                                    // forwarded to the client as-is. If it is an
+                                    // error status the client receives an error, so
+                                    // count it (matching how the fall-through error
+                                    // paths below are counted). A successful peer
+                                    // response must NOT be counted — counting it was
+                                    // the over-count bug this change fixes.
+                                    if status.is_client_error() || status.is_server_error() {
+                                        state.metrics.inc_errors();
+                                        hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                    }
 
                                     let tokens_counter = Arc::new(AtomicU64::new(0));
                                     let tokens_for_cleanup = tokens_counter.clone();
@@ -1116,8 +1129,11 @@ pub async fn route_request(
                         }
                     }
 
-                    // No peer served the request: it is returning an error to the
-                    // client, so count it now (exactly once per failed request).
+                    // Reached only when no peer returned a response (no peer
+                    // available, or the fallback request itself failed): the request
+                    // is returning an error to the client, so count it now. Peer
+                    // responses with an error status are already counted above, so
+                    // each failed request is counted exactly once.
                     state.metrics.inc_errors();
                     hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
 
