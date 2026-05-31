@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.1] - 2026-05-31
+
+### Fixed
+
+- A request that fails to start an instance locally but is then successfully
+  served by a peer (the spawn-failure peer-fallback path) is no longer counted as
+  an error. When local `get_instance_for_model` returned `SpawnFailuresExhausted`,
+  the error counters — the global `proxy_errors_total` and the per-model
+  `proxy_hash_errors_total` — were incremented eagerly, *before* the peer fallback
+  was attempted. If a peer then served the request and the client received a
+  successful response, the request was still recorded as an error. The increments
+  now happen only on the actual error-return paths (after the fallback attempt),
+  so a request served by a peer is not miscounted. This prevents inflated error
+  rates — and the false-positive error-rate alerts they cause — on a node whose
+  local spawns are failing while peers continue to serve the model. Error
+  counting is unchanged for requests that genuinely fail (no peer served them):
+  every such path still increments exactly once.
+
 ## [1.10.0] - 2026-05-30
 
 ### Added

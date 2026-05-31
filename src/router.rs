@@ -1027,9 +1027,12 @@ pub async fn route_request(
                     }
                 }
                 Err(e) => {
-                    // Guard handles dec_current_requests
-                    state.metrics.inc_errors();
-                    hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    // Guard handles dec_current_requests. Error counters are NOT
+                    // bumped here: a local failure may still be served by a peer
+                    // below (peer fallback), in which case the request succeeds
+                    // and must not be counted as an error. The counters are
+                    // incremented only on the actual error-return paths, after
+                    // the fallback attempt.
 
                     // If local spawning failed repeatedly, try forwarding to a peer
                     // before returning an error to the client.
@@ -1112,6 +1115,11 @@ pub async fn route_request(
                             }
                         }
                     }
+
+                    // No peer served the request: it is returning an error to the
+                    // client, so count it now (exactly once per failed request).
+                    state.metrics.inc_errors();
+                    hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
 
                     match e {
                         NodeError::SpawnFailuresExhausted => Err(AppError::service_unavailable(
