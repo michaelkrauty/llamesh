@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-05-30
+
+### Added
+
+- `GET /metrics` now exposes `proxy_node_max_vram_mb` and
+  `proxy_node_max_sysmem_mb`, gauges reporting this node's configured VRAM and
+  system-memory admission guardrails (`max_vram_mb` / `max_sysmem_mb`). Admission
+  spawns a new instance only while `effective + required <= max_*`, so the
+  configured maximum is the denominator for any "how close am I to the
+  guardrail" calculation. Previously `/metrics` exposed the numerator
+  (`proxy_node_effective_vram_mb` / `proxy_node_effective_sysmem_mb`) but not the
+  limit, so operators could not compute guardrail utilization
+  (`proxy_node_effective_vram_mb / proxy_node_max_vram_mb`) or headroom in PromQL
+  without hard-coding the configured value into every query and alert. The limit
+  is also distinct from `proxy_node_device_vram_total_mb` (physical device VRAM):
+  the guardrail is typically set below physical capacity to leave headroom, so
+  the device total cannot substitute for it. These limits were already surfaced
+  per node in `/cluster/nodes` (`max_vram`, `max_sysmem`); this adds them to the
+  Prometheus scrape surface. The same two values are added to the
+  `node_resources` object in the `/metrics/json` snapshot. The gauges are
+  refreshed from node config on every scrape (the metrics handler recomputes the
+  resource snapshot before rendering). This is additive and
+  backward-compatible: the new `node_resources.max_vram_mb` /
+  `node_resources.max_sysmem_mb` snapshot fields are `#[serde(default)]`, so
+  metrics snapshots written by older versions still load and historical counters
+  are preserved across the upgrade.
+
 ## [1.9.0] - 2026-05-30
 
 ### Added

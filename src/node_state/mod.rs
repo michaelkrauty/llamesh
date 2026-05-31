@@ -788,6 +788,8 @@ impl NodeState {
                 device_vram_total_mb: snapshot.device_vram_total_mb,
                 gpu_telemetry_available: snapshot.gpu_telemetry_available,
                 active_instances: snapshot.active_instances,
+                max_vram_mb: self.config.max_vram_mb,
+                max_sysmem_mb: self.config.max_sysmem_mb,
             });
     }
 

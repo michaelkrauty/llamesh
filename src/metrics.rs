@@ -104,6 +104,17 @@ pub struct Metrics {
     /// (spawned and not yet evicted), matching `active_instances` in
     /// `/cluster/nodes`.
     pub node_active_instances: AtomicU64,
+    /// Configured VRAM admission guardrail in MB (`max_vram_mb` from node
+    /// config), mirrored here so the limit is scrapeable alongside the
+    /// effective-usage gauges. Admission spawns a new instance only while
+    /// `effective_vram + required <= max_vram_mb`, so this is the denominator
+    /// for guardrail utilization (`effective / max`) and headroom
+    /// (`max - effective`). It is a static config value, refreshed on every
+    /// resource snapshot.
+    pub node_max_vram_mb: AtomicU64,
+    /// Configured system-memory admission guardrail in MB (`max_sysmem_mb` from
+    /// node config). The system-memory counterpart to `node_max_vram_mb`.
+    pub node_max_sysmem_mb: AtomicU64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +154,15 @@ pub struct NodeResourceMetricsSnapshot {
     /// keeps snapshots written by older versions (without this field) loadable.
     #[serde(default)]
     pub active_instances: u64,
+    /// Configured VRAM admission guardrail in MB (`max_vram_mb` from node
+    /// config). `#[serde(default)]` keeps snapshots written by older versions
+    /// (without this field) loadable.
+    #[serde(default)]
+    pub max_vram_mb: u64,
+    /// Configured system-memory admission guardrail in MB (`max_sysmem_mb` from
+    /// node config). `#[serde(default)]` keeps older snapshots loadable.
+    #[serde(default)]
+    pub max_sysmem_mb: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -229,6 +249,8 @@ impl Metrics {
             node_device_vram_total_mb: AtomicU64::new(0),
             node_gpu_telemetry_available: AtomicBool::new(false),
             node_active_instances: AtomicU64::new(0),
+            node_max_vram_mb: AtomicU64::new(0),
+            node_max_sysmem_mb: AtomicU64::new(0),
         }
     }
 
@@ -330,6 +352,10 @@ impl Metrics {
             .store(snapshot.gpu_telemetry_available, Ordering::Relaxed);
         self.node_active_instances
             .store(snapshot.active_instances, Ordering::Relaxed);
+        self.node_max_vram_mb
+            .store(snapshot.max_vram_mb, Ordering::Relaxed);
+        self.node_max_sysmem_mb
+            .store(snapshot.max_sysmem_mb, Ordering::Relaxed);
     }
 
     /// Check if we have any memory data for a given args_hash (for cold start detection).
@@ -415,6 +441,8 @@ impl Metrics {
                 device_vram_total_mb: self.node_device_vram_total_mb.load(Ordering::Relaxed),
                 gpu_telemetry_available: self.node_gpu_telemetry_available.load(Ordering::Relaxed),
                 active_instances: self.node_active_instances.load(Ordering::Relaxed),
+                max_vram_mb: self.node_max_vram_mb.load(Ordering::Relaxed),
+                max_sysmem_mb: self.node_max_sysmem_mb.load(Ordering::Relaxed),
             },
         }
     }
@@ -535,6 +563,18 @@ pub async fn render_prometheus_with_circuit_breaker(
     out.push_str(&format!(
         "proxy_node_active_instances {}\n",
         metrics.node_active_instances.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_node_max_vram_mb Configured VRAM admission guardrail in MB (max_vram_mb); a new instance is spawned only while effective VRAM plus its estimated usage stays within this limit.\n");
+    out.push_str("# TYPE proxy_node_max_vram_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_max_vram_mb {}\n",
+        metrics.node_max_vram_mb.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_node_max_sysmem_mb Configured system-memory admission guardrail in MB (max_sysmem_mb).\n");
+    out.push_str("# TYPE proxy_node_max_sysmem_mb gauge\n");
+    out.push_str(&format!(
+        "proxy_node_max_sysmem_mb {}\n",
+        metrics.node_max_sysmem_mb.load(Ordering::Relaxed)
     ));
 
     // Queue fairness metrics
@@ -731,6 +771,8 @@ mod tests {
             device_vram_total_mb: 24000,
             gpu_telemetry_available: true,
             active_instances: 2,
+            max_vram_mb: 23500,
+            max_sysmem_mb: 185000,
         });
 
         let snapshot = metrics
@@ -754,6 +796,8 @@ mod tests {
         assert_eq!(snapshot.node_resources.external_vram_mb, 500);
         assert!(snapshot.node_resources.gpu_telemetry_available);
         assert_eq!(snapshot.node_resources.active_instances, 2);
+        assert_eq!(snapshot.node_resources.max_vram_mb, 23500);
+        assert_eq!(snapshot.node_resources.max_sysmem_mb, 185000);
     }
 
     #[tokio::test]
@@ -770,6 +814,8 @@ mod tests {
             device_vram_total_mb: 1000,
             gpu_telemetry_available: true,
             active_instances: 3,
+            max_vram_mb: 900,
+            max_sysmem_mb: 4096,
         });
 
         let hm = metrics.get_hash_metrics("abc123").await;
@@ -783,6 +829,8 @@ mod tests {
         assert!(output.contains("proxy_node_external_vram_mb 50"));
         assert!(output.contains("proxy_node_gpu_telemetry_available 1"));
         assert!(output.contains("proxy_node_active_instances 3"));
+        assert!(output.contains("proxy_node_max_vram_mb 900"));
+        assert!(output.contains("proxy_node_max_sysmem_mb 4096"));
         assert!(output.contains("proxy_hash_requests_total{hash=\"abc123\""));
         assert!(output.contains("names=\"gpt\\\"cool\\\"\""));
     }
@@ -818,9 +866,10 @@ mod tests {
 
     #[test]
     fn snapshot_without_active_instances_field_still_loads() {
-        // A node_resources object written by a pre-1.9.0 version has no
-        // `active_instances` field. `#[serde(default)]` on that field must keep
-        // the snapshot loadable so an in-place upgrade preserves persisted
+        // A node_resources object written by an older version lacks the fields
+        // added since (`active_instances`, and the `max_vram_mb`/`max_sysmem_mb`
+        // guardrail limits). `#[serde(default)]` on each of those fields must
+        // keep the snapshot loadable so an in-place upgrade preserves persisted
         // counters (e.g. requests_total) instead of resetting them via the
         // parse-error fallback in `Metrics::load`. This JSON mirrors the
         // node_resources shape written by older releases.
@@ -847,6 +896,8 @@ mod tests {
             serde_json::from_str(json).expect("pre-1.9.0 snapshot must still deserialize");
         assert_eq!(snapshot.requests_total, 1_421_955);
         assert_eq!(snapshot.node_resources.active_instances, 0);
+        assert_eq!(snapshot.node_resources.max_vram_mb, 0);
+        assert_eq!(snapshot.node_resources.max_sysmem_mb, 0);
     }
 
     #[tokio::test]
