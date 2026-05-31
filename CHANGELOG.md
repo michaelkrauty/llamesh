@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.2] - 2026-05-31
+
+### Security
+
+- API key authentication now compares the presented key against the configured
+  keys in **constant time**, matching how the cluster handshake token is already
+  verified (`noise::handshake::verify_token`). The previous check used
+  `Vec::contains` — a short-circuiting `==` on `String` — whose running time
+  depends on how many leading bytes of the candidate match a configured key.
+  Comparing a bearer secret this way is a timing side channel (low severity in
+  practice, since exploiting it requires measuring response timing remotely,
+  across TLS) and was inconsistent with the constant-time token comparison used
+  for inter-node authentication. The comparison now runs over every configured
+  key without short-circuiting and uses a byte-wise constant-time equality, so a
+  partial match is not distinguishable from a full mismatch by response timing.
+  No behavior or configuration change: valid keys authorize and invalid keys are
+  rejected exactly as before, and no new dependency is introduced.
+
 ## [1.10.1] - 2026-05-31
 
 ### Fixed

@@ -17,6 +17,11 @@ pub struct PeerIdentity {
 /// Check API key authentication against the provided config and headers.
 /// Returns Ok(()) if authentication succeeds or is not required.
 /// Returns Err("Unauthorized") if authentication fails.
+///
+/// The presented key is compared against the configured keys in constant time
+/// (see [`allowed_key_matches`]), matching how the cluster handshake token is
+/// verified, so a partial match is not distinguishable from a full mismatch by
+/// response timing.
 pub fn check_api_key_auth(
     auth_config: Option<&AuthConfig>,
     headers: &HeaderMap,
@@ -25,7 +30,7 @@ pub fn check_api_key_auth(
         if config.enabled {
             let api_key = config.get_header_value(headers);
             let authorized = match api_key {
-                Some(key) => config.allowed_keys.contains(&key.to_string()),
+                Some(key) => allowed_key_matches(&config.allowed_keys, key),
                 None => false,
             };
             if !authorized {
@@ -34,6 +39,38 @@ pub fn check_api_key_auth(
         }
     }
     Ok(())
+}
+
+/// Compare two byte strings in constant time.
+///
+/// Returns early when the lengths differ — the length of a configured key is
+/// not treated as secret — but when the lengths match, every byte is compared
+/// with no short-circuit, so the running time does not reveal how many leading
+/// bytes of a candidate match a real key. Mirrors the constant-time token
+/// comparison used for the cluster handshake (`noise::handshake::verify_token`).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Return whether `candidate` matches any configured API key, comparing in
+/// constant time. Every configured key is checked — the loop does not stop at
+/// the first match — so that neither which key matched nor how many keys were
+/// examined is exposed through response timing.
+fn allowed_key_matches(allowed_keys: &[String], candidate: &str) -> bool {
+    let mut authorized = false;
+    for key in allowed_keys {
+        // Bitwise `|=` (not `||`) so every key is always compared; short-circuit
+        // evaluation here would reintroduce a timing side channel.
+        authorized |= constant_time_eq(key.as_bytes(), candidate.as_bytes());
+    }
+    authorized
 }
 
 pub fn extract_peer_identity(certs: &[rustls::pki_types::CertificateDer<'_>]) -> PeerIdentity {
@@ -256,6 +293,52 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", "key2".parse().unwrap());
         assert!(check_api_key_auth(Some(&config), &headers).is_ok());
+    }
+
+    #[test]
+    fn test_auth_last_allowed_key_matches() {
+        // The match is on the last configured key; the constant-time check must
+        // not stop early at an earlier non-match.
+        let config = make_auth_config(true, "Authorization", vec!["key1", "key2", "key3"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", "key3".parse().unwrap());
+        assert!(check_api_key_auth(Some(&config), &headers).is_ok());
+    }
+
+    #[test]
+    fn test_auth_one_byte_off_rejected() {
+        let config = make_auth_config(true, "Authorization", vec!["Bearer sk-test123"]);
+        let mut headers = HeaderMap::new();
+        // Identical length, only the final byte differs.
+        headers.insert("Authorization", "Bearer sk-test124".parse().unwrap());
+        assert_eq!(
+            check_api_key_auth(Some(&config), &headers),
+            Err("Unauthorized")
+        );
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"sk-secret", b"sk-secret"));
+        assert!(constant_time_eq(b"", b""));
+        // One byte off, same length.
+        assert!(!constant_time_eq(b"sk-secret", b"sk-secreT"));
+        // Length mismatches.
+        assert!(!constant_time_eq(b"sk-secret", b"sk-secre"));
+        assert!(!constant_time_eq(b"sk-secret", b"sk-secret-extra"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn test_allowed_key_matches() {
+        let keys = vec!["key1".to_string(), "key2".to_string(), "key3".to_string()];
+        assert!(allowed_key_matches(&keys, "key1"));
+        assert!(allowed_key_matches(&keys, "key3"));
+        assert!(!allowed_key_matches(&keys, "key4"));
+        // Prefix of a real key: rejected (length differs).
+        assert!(!allowed_key_matches(&keys, "key"));
+        // No keys configured: nothing matches.
+        assert!(!allowed_key_matches(&[], "anything"));
     }
 
     #[test]
