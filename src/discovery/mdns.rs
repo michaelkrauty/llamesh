@@ -100,7 +100,7 @@ impl MdnsDiscovery {
         receiver: mdns_sd::Receiver<ServiceEvent>,
         peers: Arc<RwLock<HashSet<DiscoveredPeer>>>,
         shutdown_flag: Arc<RwLock<bool>>,
-        _service_type: &str,
+        service_type: &str,
     ) {
         loop {
             if *shutdown_flag.read() {
@@ -139,8 +139,14 @@ impl MdnsDiscovery {
                         }
                     }
                     ServiceEvent::ServiceRemoved(_, fullname) => {
-                        // Remove peer when service goes away
-                        peers.write().retain(|p| !fullname.contains(&p.node_id));
+                        // Remove the peer whose service departed. Match the
+                        // resolved instance label exactly rather than testing
+                        // whether a peer's node_id appears anywhere in the full
+                        // name — a substring test evicts unrelated peers (see
+                        // peer_matches_removed_service).
+                        peers.write().retain(|p| {
+                            !peer_matches_removed_service(&p.node_id, &fullname, service_type)
+                        });
                         tracing::debug!(fullname = %fullname, "mDNS service removed");
                     }
                     _ => {}
@@ -164,5 +170,133 @@ impl MdnsDiscovery {
     pub fn shutdown(self) {
         *self.shutdown_flag.write() = true;
         // Daemon is dropped, which unregisters the service
+    }
+}
+
+/// Decide whether a peer corresponds to the mDNS service reported by a
+/// `ServiceRemoved` event.
+///
+/// `ServiceRemoved` carries the departing service's full name, which has the
+/// form `<node_id>.<service_type>` (e.g. `node1._llama-mesh._tcp.local.`). We
+/// recover the instance label (the `node_id`) by stripping the service-type
+/// suffix and compare it to the peer's `node_id` exactly. A full-name match is
+/// also accepted, to cover peers discovered without a `node_id` TXT record —
+/// those fall back to the full name as their id (see the `ServiceResolved`
+/// arm).
+///
+/// Matching exactly — rather than testing `fullname.contains(node_id)` — avoids
+/// evicting an unrelated, still-alive peer whose `node_id` merely appears as a
+/// substring of the departing service's full name: e.g. `node` when `node1`
+/// departs, or a node named `tcp`/`local` whose id is part of the service type
+/// present in every full name.
+fn peer_matches_removed_service(node_id: &str, fullname: &str, service_type: &str) -> bool {
+    let node_id = node_id.trim_end_matches('.');
+    let fullname = fullname.trim_end_matches('.');
+    let service_type = service_type.trim_end_matches('.');
+
+    let instance = fullname
+        .strip_suffix(service_type)
+        .map_or(fullname, |label| label.trim_end_matches('.'));
+
+    !node_id.is_empty() && (node_id == instance || node_id == fullname)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_matches_removed_service;
+    use crate::discovery::DiscoveredPeer;
+    use std::collections::HashSet;
+
+    const SERVICE_TYPE: &str = "_llama-mesh._tcp.local.";
+    const FULLNAME: &str = "node1._llama-mesh._tcp.local.";
+
+    fn peer(node_id: &str) -> DiscoveredPeer {
+        DiscoveredPeer {
+            node_id: node_id.to_string(),
+            cluster_addr: format!("{node_id}:8080"),
+            public_key: None,
+        }
+    }
+
+    #[test]
+    fn matches_exact_departing_node() {
+        assert!(peer_matches_removed_service(
+            "node1",
+            FULLNAME,
+            SERVICE_TYPE
+        ));
+    }
+
+    #[test]
+    fn does_not_match_node_id_substring_of_departing_node() {
+        // "node" is a substring of the departing "node1"; the old
+        // `fullname.contains(node_id)` check wrongly evicted it.
+        assert!(!peer_matches_removed_service(
+            "node",
+            FULLNAME,
+            SERVICE_TYPE
+        ));
+    }
+
+    #[test]
+    fn does_not_match_node_id_substring_of_service_type() {
+        // A node whose id appears inside the service type would be evicted on
+        // *every* departure under the old substring check.
+        for victim in ["tcp", "local", "llama", "mesh", "_tcp"] {
+            assert!(
+                !peer_matches_removed_service(victim, FULLNAME, SERVICE_TYPE),
+                "{victim} must not match an unrelated departure"
+            );
+        }
+    }
+
+    #[test]
+    fn matches_fullname_fallback_id() {
+        // Peers discovered without a node_id TXT record fall back to using the
+        // full name as their id; a removal must still match them.
+        assert!(peer_matches_removed_service(
+            FULLNAME,
+            FULLNAME,
+            SERVICE_TYPE
+        ));
+    }
+
+    #[test]
+    fn tolerates_missing_trailing_dot() {
+        assert!(peer_matches_removed_service(
+            "node1",
+            "node1._llama-mesh._tcp.local",
+            "_llama-mesh._tcp.local"
+        ));
+    }
+
+    #[test]
+    fn empty_node_id_never_matches() {
+        assert!(!peer_matches_removed_service("", FULLNAME, SERVICE_TYPE));
+    }
+
+    #[test]
+    fn retain_evicts_only_the_departing_peer() {
+        // End-to-end check of the `ServiceRemoved` retain over a peer set with
+        // substring-colliding ids. Under the old substring check, "node1",
+        // "node", and "tcp" would all be removed; only "node1" should be.
+        let mut peers: HashSet<DiscoveredPeer> = HashSet::new();
+        peers.insert(peer("node1")); // the departing peer
+        peers.insert(peer("node")); // substring of "node1"
+        peers.insert(peer("tcp")); // substring of the service type
+        peers.insert(peer("other")); // unrelated
+
+        peers.retain(|p| !peer_matches_removed_service(&p.node_id, FULLNAME, SERVICE_TYPE));
+
+        let remaining: HashSet<&str> = peers.iter().map(|p| p.node_id.as_str()).collect();
+        assert_eq!(
+            remaining.len(),
+            3,
+            "only the departing peer should be removed"
+        );
+        assert!(remaining.contains("node"));
+        assert!(remaining.contains("tcp"));
+        assert!(remaining.contains("other"));
+        assert!(!remaining.contains("node1"));
     }
 }
