@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.3] - 2026-05-31
+
+### Fixed
+
+- mDNS peer removal no longer evicts the wrong peer. When a peer's mDNS service
+  departed, the `ServiceRemoved` handler removed peers with
+  `fullname.contains(node_id)` — a **substring** test against the departing
+  service's full name (`<node_id>.<service_type>`, e.g.
+  `node1._llama-mesh._tcp.local.`). Because the match was a substring rather
+  than the exact instance label, a single departure could drop unrelated,
+  still-alive peers: a node whose id is a substring of the departing node's id
+  (e.g. `node` when `node1` leaves), or — worse — a node whose id appears inside
+  the service type carried by **every** full name (e.g. a node named `tcp` or
+  `local`), which would then be evicted on every departure. The handler now
+  recovers the departing instance's `node_id` by stripping the service-type
+  suffix and matches peers exactly (a full-name match is also accepted, covering
+  peers discovered without a `node_id` TXT record). Only the peer whose service
+  actually departed is removed. This affects clusters using mDNS discovery
+  (enabled by default); explicit configured peers were never matched by this
+  path and are unaffected.
+
 ## [1.10.2] - 2026-05-31
 
 ### Security
