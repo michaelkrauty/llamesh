@@ -8,7 +8,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -558,12 +558,46 @@ const COMMAND_OUTPUT_TAIL_LINES: usize = 40;
 /// Retained output lines longer than this are truncated, keeping error
 /// messages (and the `last_build_error` API field) bounded.
 const COMMAND_OUTPUT_MAX_LINE_LEN: usize = 400;
+/// Hard cap on bytes buffered for a single output line. Bytes beyond this
+/// (up to the next newline) are consumed and discarded, so a child emitting
+/// an enormous newline-free line cannot grow the buffer without bound.
+const COMMAND_OUTPUT_MAX_LINE_BYTES: usize = 8192;
+
+/// Reads up to and including the next `\n` from `reader`, appending at most
+/// `cap` bytes to `buf`. The remainder of an over-long line is consumed and
+/// discarded, bounding memory regardless of what the child writes. Returns
+/// `Ok(false)` on EOF with nothing read.
+async fn read_line_capped<R>(reader: &mut R, buf: &mut Vec<u8>, cap: usize) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read_any);
+        }
+        read_any = true;
+        let (chunk_len, found_newline) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (available.len(), false),
+        };
+        let take = chunk_len.min(cap.saturating_sub(buf.len()));
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(chunk_len);
+        if found_newline {
+            return Ok(true);
+        }
+    }
+}
 
 /// Reads lines from a child process stream, echoing each to the parent's
 /// stdout/stderr (so build output keeps appearing in the supervisor log, as
 /// it did with inherited stdio) while retaining a bounded tail of recent
 /// lines for error reporting. Reads raw bytes rather than UTF-8 lines so a
-/// stray invalid byte can't stop the pump mid-stream.
+/// stray invalid byte can't stop the pump mid-stream, and echoes through
+/// tokio's async stdout/stderr so a stalled log sink cannot block runtime
+/// worker threads.
 fn pump_output<R>(
     reader: R,
     to_stderr: bool,
@@ -575,21 +609,34 @@ where
     tokio::spawn(async move {
         let mut reader = BufReader::new(reader);
         let mut buf = Vec::new();
+        let mut out = tokio::io::stdout();
+        let mut err = tokio::io::stderr();
+        let mut echo_ok = true;
         loop {
             buf.clear();
-            match reader.read_until(b'\n', &mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
-            }
-            let line = String::from_utf8_lossy(&buf);
-            let line = line.trim_end_matches(['\r', '\n']);
-            if to_stderr {
-                eprintln!("{line}");
-            } else {
-                println!("{line}");
+            match read_line_capped(&mut reader, &mut buf, COMMAND_OUTPUT_MAX_LINE_BYTES).await {
+                Ok(true) => {}
+                // EOF or read error: stop pumping
+                Ok(false) | Err(_) => break,
             }
 
-            let mut line = line.to_string();
+            // Echo with newline framing preserved even for truncated lines.
+            if echo_ok {
+                if !buf.ends_with(b"\n") {
+                    buf.push(b'\n');
+                }
+                let res = if to_stderr {
+                    err.write_all(&buf).await
+                } else {
+                    out.write_all(&buf).await
+                };
+                // If the parent's stdio is gone, keep draining the pipe so
+                // the child doesn't block, but stop attempting to echo.
+                echo_ok = res.is_ok();
+            }
+
+            let line = String::from_utf8_lossy(&buf);
+            let mut line = line.trim_end_matches(['\r', '\n']).to_string();
             if line.len() > COMMAND_OUTPUT_MAX_LINE_LEN {
                 let mut cut = COMMAND_OUTPUT_MAX_LINE_LEN;
                 while !line.is_char_boundary(cut) {
@@ -603,6 +650,13 @@ where
                 tail.pop_front();
             }
             tail.push_back(line);
+        }
+        if echo_ok {
+            let _ = if to_stderr {
+                err.flush().await
+            } else {
+                out.flush().await
+            };
         }
     })
 }
@@ -625,9 +679,16 @@ async fn run_command(cmd: &mut Command) -> Result<()> {
     let status = child.wait().await?;
 
     // After the child exits the pumps drain to EOF almost immediately; the
-    // timeout guards against a grandchild process holding the pipes open.
-    for pump in pumps {
-        let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    // timeout guards against a grandchild process holding the pipes open. On
+    // timeout the pump is aborted so it can't linger and echo a grandchild's
+    // output into the supervisor log long after the build step finished.
+    for mut pump in pumps {
+        if tokio::time::timeout(Duration::from_secs(5), &mut pump)
+            .await
+            .is_err()
+        {
+            pump.abort();
+        }
     }
 
     if !status.success() {
@@ -1056,5 +1117,49 @@ fi
             long_line.len()
         );
         assert!(long_line.ends_with('…'), "missing truncation marker");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_bounds_newline_free_output() {
+        // A child emitting a huge line with no newline must not grow the
+        // capture buffer without bound; the tail entry is still truncated.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 1000000 /dev/zero | tr '\\0' 'y'; exit 1");
+        let err = run_command(&mut cmd).await.unwrap_err().to_string();
+        let long_line = err
+            .lines()
+            .find(|l| l.starts_with('y'))
+            .expect("captured line present");
+        assert!(
+            long_line.chars().filter(|&c| c == 'y').count() == COMMAND_OUTPUT_MAX_LINE_LEN,
+            "line not truncated to limit"
+        );
+        assert!(long_line.ends_with('…'), "missing truncation marker");
+    }
+
+    #[tokio::test]
+    async fn test_read_line_capped() {
+        let data: Vec<u8> = [b"short\n".to_vec(), vec![b'z'; 20000], b"\nnext\n".to_vec()].concat();
+        let mut reader = BufReader::new(data.as_slice());
+        let cap = COMMAND_OUTPUT_MAX_LINE_BYTES;
+
+        let mut buf = Vec::new();
+        assert!(read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+        assert_eq!(buf, b"short\n");
+
+        // Over-long line: capped at `cap` bytes, remainder discarded
+        buf.clear();
+        assert!(read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+        assert_eq!(buf.len(), cap);
+        assert!(buf.iter().all(|&b| b == b'z'));
+
+        // The next line is read intact — the overflow didn't bleed into it
+        buf.clear();
+        assert!(read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+        assert_eq!(buf, b"next\n");
+
+        buf.clear();
+        assert!(!read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
     }
 }
