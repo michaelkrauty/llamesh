@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (40 lines, long lines truncated) that is included in the error along with the
   exit status. Successful builds behave exactly as before. (#65)
 
+## [1.10.3] - 2026-05-31
+
 ### Fixed
 
 - mDNS peer removal no longer evicts the wrong peer. When a peer's mDNS service
