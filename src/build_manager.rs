@@ -1,11 +1,14 @@
 use crate::config::LlamaCppConfig;
 use anyhow::{anyhow, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -550,10 +553,158 @@ impl BuildManager {
     }
 }
 
+/// Number of trailing output lines retained for error reporting.
+const COMMAND_OUTPUT_TAIL_LINES: usize = 40;
+/// Retained output lines longer than this are truncated, keeping error
+/// messages (and the `last_build_error` API field) bounded.
+const COMMAND_OUTPUT_MAX_LINE_LEN: usize = 400;
+/// Hard cap on bytes buffered for a single output line. Bytes beyond this
+/// (up to the next newline) are consumed and discarded, so a child emitting
+/// an enormous newline-free line cannot grow the buffer without bound.
+const COMMAND_OUTPUT_MAX_LINE_BYTES: usize = 8192;
+
+/// Reads up to and including the next `\n` from `reader`, appending at most
+/// `cap` bytes to `buf`. The remainder of an over-long line is consumed and
+/// discarded, bounding memory regardless of what the child writes. Returns
+/// `Ok(false)` on EOF with nothing read.
+async fn read_line_capped<R>(reader: &mut R, buf: &mut Vec<u8>, cap: usize) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read_any);
+        }
+        read_any = true;
+        let (chunk_len, found_newline) = match available.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (available.len(), false),
+        };
+        let take = chunk_len.min(cap.saturating_sub(buf.len()));
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(chunk_len);
+        if found_newline {
+            return Ok(true);
+        }
+    }
+}
+
+/// Reads lines from a child process stream, echoing each to the parent's
+/// stdout/stderr (so build output keeps appearing in the supervisor log, as
+/// it did with inherited stdio) while retaining a bounded tail of recent
+/// lines for error reporting. Reads raw bytes rather than UTF-8 lines so a
+/// stray invalid byte can't stop the pump mid-stream, and echoes through
+/// tokio's async stdout/stderr so a stalled log sink cannot block runtime
+/// worker threads.
+fn pump_output<R>(
+    reader: R,
+    to_stderr: bool,
+    tail: Arc<Mutex<VecDeque<String>>>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::new();
+        let mut out = tokio::io::stdout();
+        let mut err = tokio::io::stderr();
+        let mut echo_ok = true;
+        loop {
+            buf.clear();
+            match read_line_capped(&mut reader, &mut buf, COMMAND_OUTPUT_MAX_LINE_BYTES).await {
+                Ok(true) => {}
+                // EOF or read error: stop pumping
+                Ok(false) | Err(_) => break,
+            }
+
+            // Echo with newline framing preserved even for truncated lines.
+            if echo_ok {
+                if !buf.ends_with(b"\n") {
+                    buf.push(b'\n');
+                }
+                let res = if to_stderr {
+                    err.write_all(&buf).await
+                } else {
+                    out.write_all(&buf).await
+                };
+                // If the parent's stdio is gone, keep draining the pipe so
+                // the child doesn't block, but stop attempting to echo.
+                echo_ok = res.is_ok();
+            }
+
+            let line = String::from_utf8_lossy(&buf);
+            let mut line = line.trim_end_matches(['\r', '\n']).to_string();
+            if line.len() > COMMAND_OUTPUT_MAX_LINE_LEN {
+                let mut cut = COMMAND_OUTPUT_MAX_LINE_LEN;
+                while !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                line.truncate(cut);
+                line.push('…');
+            }
+            let mut tail = tail.lock();
+            if tail.len() == COMMAND_OUTPUT_TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+        }
+        if echo_ok {
+            let _ = if to_stderr {
+                err.flush().await
+            } else {
+                out.flush().await
+            };
+        }
+    })
+}
+
 async fn run_command(cmd: &mut Command) -> Result<()> {
-    let status = cmd.status().await?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("Failed to spawn command: {cmd:?}: {e}"))?;
+
+    let tail = Arc::new(Mutex::new(VecDeque::new()));
+    let mut pumps = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        pumps.push(pump_output(stdout, false, tail.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        pumps.push(pump_output(stderr, true, tail.clone()));
+    }
+
+    let status = child.wait().await?;
+
+    // After the child exits the pumps drain to EOF almost immediately; the
+    // timeout guards against a grandchild process holding the pipes open. On
+    // timeout the pump is aborted so it can't linger and echo a grandchild's
+    // output into the supervisor log long after the build step finished.
+    for mut pump in pumps {
+        if tokio::time::timeout(Duration::from_secs(5), &mut pump)
+            .await
+            .is_err()
+        {
+            pump.abort();
+        }
+    }
+
     if !status.success() {
-        return Err(anyhow!("Command failed: {cmd:?}"));
+        let tail = tail.lock();
+        let output = if tail.is_empty() {
+            "no output captured".to_string()
+        } else {
+            format!(
+                "last output:\n{}",
+                tail.iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        return Err(anyhow!("Command failed ({status}): {cmd:?}; {output}"));
     }
     Ok(())
 }
@@ -907,5 +1058,108 @@ fi
         let status = bm.build_status();
         assert!(status.last_build_error.is_none());
         assert!(status.last_build_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_run_command_success() {
+        run_command(&mut Command::new("true")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_run_command_failure_includes_status_and_output() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo configuring; echo 'CMake Error: CUDA Toolkit not found' >&2; exit 3");
+        let err = run_command(&mut cmd).await.unwrap_err().to_string();
+        assert!(err.contains("exit status: 3"), "missing status: {err}");
+        assert!(
+            err.contains("CMake Error: CUDA Toolkit not found"),
+            "missing stderr line: {err}"
+        );
+        assert!(err.contains("configuring"), "missing stdout line: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_failure_without_output() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("exit 7");
+        let err = run_command(&mut cmd).await.unwrap_err().to_string();
+        assert!(err.contains("exit status: 7"), "missing status: {err}");
+        assert!(err.contains("no output captured"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_failure_output_tail_is_bounded() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("i=1; while [ $i -le 200 ]; do echo line-$i; i=$((i+1)); done; exit 1");
+        let err = run_command(&mut cmd).await.unwrap_err().to_string();
+        // Only the last COMMAND_OUTPUT_TAIL_LINES (40) lines are kept: 161..=200
+        assert!(err.contains("line-200"), "{err}");
+        assert!(err.contains("line-161\n"), "{err}");
+        assert!(!err.contains("line-160\n"), "{err}");
+        assert!(!err.contains("line-1\n"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_failure_truncates_long_lines() {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf 'x%.0s' $(seq 1 1000); echo; exit 1");
+        let err = run_command(&mut cmd).await.unwrap_err().to_string();
+        let long_line = err
+            .lines()
+            .find(|l| l.starts_with('x'))
+            .expect("truncated output line present");
+        assert!(
+            long_line.chars().filter(|&c| c == 'x').count() == COMMAND_OUTPUT_MAX_LINE_LEN,
+            "line not truncated to limit: {} chars",
+            long_line.len()
+        );
+        assert!(long_line.ends_with('…'), "missing truncation marker");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_bounds_newline_free_output() {
+        // A child emitting a huge line with no newline must not grow the
+        // capture buffer without bound; the tail entry is still truncated.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("head -c 1000000 /dev/zero | tr '\\0' 'y'; exit 1");
+        let err = run_command(&mut cmd).await.unwrap_err().to_string();
+        let long_line = err
+            .lines()
+            .find(|l| l.starts_with('y'))
+            .expect("captured line present");
+        assert!(
+            long_line.chars().filter(|&c| c == 'y').count() == COMMAND_OUTPUT_MAX_LINE_LEN,
+            "line not truncated to limit"
+        );
+        assert!(long_line.ends_with('…'), "missing truncation marker");
+    }
+
+    #[tokio::test]
+    async fn test_read_line_capped() {
+        let data: Vec<u8> = [b"short\n".to_vec(), vec![b'z'; 20000], b"\nnext\n".to_vec()].concat();
+        let mut reader = BufReader::new(data.as_slice());
+        let cap = COMMAND_OUTPUT_MAX_LINE_BYTES;
+
+        let mut buf = Vec::new();
+        assert!(read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+        assert_eq!(buf, b"short\n");
+
+        // Over-long line: capped at `cap` bytes, remainder discarded
+        buf.clear();
+        assert!(read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+        assert_eq!(buf.len(), cap);
+        assert!(buf.iter().all(|&b| b == b'z'));
+
+        // The next line is read intact — the overflow didn't bleed into it
+        buf.clear();
+        assert!(read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+        assert_eq!(buf, b"next\n");
+
+        buf.clear();
+        assert!(!read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
     }
 }

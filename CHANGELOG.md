@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.4] - 2026-06-11
+
+### Fixed
+
+- Build command failures now include the failure reason. When a command in the
+  llama.cpp build pipeline failed (`git clone`/`fetch`/`checkout`, `cmake`
+  configure, `cmake --build`), the error logged with the `llama_build_failure`
+  event — and surfaced as `last_build_error` in the build status API — contained
+  only the command line, with no exit status and none of the process output. The
+  actual cause (for example a CMake configure error or a transient `git fetch`
+  network failure) was visible only in the parent process's raw stdout/stderr
+  stream, requiring manual correlation with supervisor logs to diagnose.
+  `run_command` now captures the child's stdout and stderr, streams each line
+  through to the parent's stdout/stderr as before, and retains a bounded tail
+  (40 lines, long lines truncated) that is included in the error along with the
+  exit status. Successful builds behave exactly as before. (#65)
+
 ## [1.10.3] - 2026-05-31
 
 ### Fixed
