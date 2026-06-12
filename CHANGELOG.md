@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.8] - 2026-06-12
+
+### Changed
+
+- Cleared the codebase's standing static-analysis debt; `cargo fmt --check`
+  and `cargo clippy` now pass with no findings. `attempt_peer_forward` takes
+  the `PeerRequest` it previously assembled internally instead of nine loose
+  parameters (the repository's only clippy warning), and a stale formatting
+  drift in the connection module was reformatted. No behavior change. (#73)
+
 ## [1.10.7] - 2026-06-12
 
 ### Fixed

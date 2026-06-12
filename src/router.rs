@@ -194,29 +194,11 @@ enum ForwardOutcome {
 /// pass-through to the client.
 async fn attempt_peer_forward(
     state: &NodeState,
-    peer_id: &str,
-    peer_address: &str,
-    method: &Method,
-    path_and_query: &str,
-    headers: HeaderMap,
-    body: Bytes,
-    timeout_ms: u64,
+    request: PeerRequest<'_>,
     response_streaming: bool,
 ) -> ForwardOutcome {
-    let resp = match send_peer_request(
-        state,
-        PeerRequest {
-            peer_id,
-            peer_address,
-            method: method.clone(),
-            path_and_query,
-            headers,
-            body,
-            timeout_ms,
-        },
-    )
-    .await
-    {
+    let peer_id = request.peer_id;
+    let resp = match send_peer_request(state, request).await {
         Ok(resp) => resp,
         Err(e) => return ForwardOutcome::Transport(e),
     };
@@ -674,13 +656,15 @@ pub async fn route_request(
 
                 let outcome = attempt_peer_forward(
                     &state,
-                    &peer.node_id,
-                    &peer.address,
-                    &parts.method,
-                    &path_and_query,
-                    forward_headers.clone(),
-                    forward_body.clone(),
-                    timeout_ms,
+                    PeerRequest {
+                        peer_id: &peer.node_id,
+                        peer_address: &peer.address,
+                        method: parts.method.clone(),
+                        path_and_query: &path_and_query,
+                        headers: forward_headers.clone(),
+                        body: forward_body.clone(),
+                        timeout_ms,
+                    },
                     response_streaming,
                 )
                 .await;
@@ -1212,13 +1196,15 @@ pub async fn route_request(
 
                 let outcome = attempt_peer_forward(
                     &state,
-                    &current_node.node_id,
-                    &current_node.address,
-                    &parts.method,
-                    &path_and_query,
-                    forward_headers.clone(),
-                    forward_body.clone(),
-                    timeout_ms,
+                    PeerRequest {
+                        peer_id: &current_node.node_id,
+                        peer_address: &current_node.address,
+                        method: parts.method.clone(),
+                        path_and_query: &path_and_query,
+                        headers: forward_headers.clone(),
+                        body: forward_body.clone(),
+                        timeout_ms,
+                    },
                     response_streaming,
                 )
                 .await;
