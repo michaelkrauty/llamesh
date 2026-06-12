@@ -1537,7 +1537,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
 name = "llamesh"
-version = "1.11.2"
+version = "1.12.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1553,6 +1553,7 @@ dependencies = [
  "hex",
  "hmac",
  "hostname",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2270,6 +2271,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

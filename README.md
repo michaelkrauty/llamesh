@@ -6,7 +6,7 @@ Point any OpenAI-compatible client at llamesh and it handles the rest: spinning 
 
 ## Features
 
-- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
+- **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, over HTTP/1.1 or cleartext HTTP/2 (h2c)
 - **Automatic instance management** — on-demand spawn, idle eviction, health monitoring
 - **Multi-node mesh** — zero-config LAN discovery (mDNS) or explicit WAN peers, encrypted with Noise Protocol
 - **Model profiles** — configure multiple profiles per model (e.g. `fast` vs `quality`) with different llama-server args

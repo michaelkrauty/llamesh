@@ -18,7 +18,7 @@ use axum::{
     Extension, Json, Router,
 };
 use http_body_util::BodyExt;
-use hyper_util::rt::TokioTimer;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
@@ -439,8 +439,19 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
                         }
                     }
                     DetectedProtocol::Http | DetectedProtocol::Http2 => {
-                        // Plain HTTP connection
-                        handle_http_connection(tcp_stream, remote_addr, app, http_config).await;
+                        // Plain HTTP connection. An `Http2` detection means the
+                        // client sent the HTTP/2 connection preface (`PRI `),
+                        // i.e. prior-knowledge cleartext HTTP/2 (h2c), and must
+                        // be served by the HTTP/2 stack.
+                        let use_http2 = matches!(protocol, DetectedProtocol::Http2);
+                        handle_http_connection(
+                            tcp_stream,
+                            remote_addr,
+                            app,
+                            http_config,
+                            use_http2,
+                        )
+                        .await;
                     }
                     DetectedProtocol::Noise => {
                         // Noise Protocol - cluster traffic
@@ -501,7 +512,14 @@ async fn handle_tls_connection(
         }
     };
 
-    serve_http_connection(hyper_util::rt::TokioIo::new(wrapper), service, http_config).await;
+    // No ALPN protocols are advertised, so TLS clients negotiate HTTP/1.1.
+    serve_http_connection(
+        hyper_util::rt::TokioIo::new(wrapper),
+        service,
+        http_config,
+        false,
+    )
+    .await;
 }
 
 /// Handle a plain HTTP connection (API traffic)
@@ -510,6 +528,7 @@ async fn handle_http_connection(
     remote_addr: SocketAddr,
     app: Router<()>,
     http_config: crate::config::HttpConfig,
+    use_http2: bool,
 ) {
     let conn_handle = ConnectionHandle::new(tcp_stream.as_raw_fd());
     let app = app.layer(Extension(conn_handle));
@@ -527,13 +546,22 @@ async fn handle_http_connection(
         hyper_util::rt::TokioIo::new(tcp_stream),
         service,
         http_config,
+        use_http2,
     )
     .await;
 }
 
-/// Serve HTTP over any IO type
-async fn serve_http_connection<I, S>(io: I, service: S, http_config: crate::config::HttpConfig)
-where
+/// Serve HTTP over any IO type.
+///
+/// `use_http2` selects the HTTP/2 connection stack for prior-knowledge
+/// cleartext HTTP/2 (h2c) connections; otherwise the connection is served as
+/// HTTP/1.1.
+async fn serve_http_connection<I, S>(
+    io: I,
+    service: S,
+    http_config: crate::config::HttpConfig,
+    use_http2: bool,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     S: tower::Service<
             axum::http::Request<axum::body::Body>,
@@ -544,6 +572,13 @@ where
         + 'static,
     S::Future: Send,
 {
+    let idle_secs = http_config.idle_timeout_seconds.max(30);
+
+    if use_http2 {
+        serve_h2c_connection(io, service, idle_secs).await;
+        return;
+    }
+
     let hyper_service =
         hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
             let mut service = service.clone();
@@ -556,11 +591,202 @@ where
 
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.timer(TokioTimer::new());
-    let idle_secs = http_config.idle_timeout_seconds.max(30);
     builder.header_read_timeout(Duration::from_secs(idle_secs));
 
     if let Err(err) = builder.serve_connection(io, hyper_service).await {
         tracing::debug!("Connection error: {}", err);
+    }
+}
+
+/// How often the h2c idle watchdog wakes to inspect connection activity.
+const H2C_WATCHDOG_TICK: Duration = Duration::from_secs(5);
+
+/// How long after the watchdog requests a graceful shutdown before the
+/// connection is dropped outright. This is what bounds connections whose
+/// HTTP/2 handshake never completes (e.g. a client that sent the preface
+/// prefix and then stalled): hyper only records a pending shutdown while
+/// handshaking, so such a connection never finishes on its own.
+const H2C_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+
+/// Per-connection activity tracking for h2c connections, driving the idle
+/// watchdog in [`serve_h2c_connection`].
+struct H2cActivity {
+    /// Streams whose request is in flight or whose response body is still
+    /// being sent. Counted from request arrival until the response body
+    /// completes (or the stream is cancelled and hyper drops it).
+    active_streams: std::sync::atomic::AtomicUsize,
+    /// Milliseconds since `created` of the most recent activity.
+    last_activity_ms: std::sync::atomic::AtomicU64,
+    created: std::time::Instant,
+}
+
+impl H2cActivity {
+    fn new() -> Self {
+        Self {
+            active_streams: std::sync::atomic::AtomicUsize::new(0),
+            last_activity_ms: std::sync::atomic::AtomicU64::new(0),
+            created: std::time::Instant::now(),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_activity_ms.store(
+            self.created.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn active_streams(&self) -> usize {
+        self.active_streams
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn idle_for(&self) -> Duration {
+        let now_ms = self.created.elapsed().as_millis() as u64;
+        let last_ms = self
+            .last_activity_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Duration::from_millis(now_ms.saturating_sub(last_ms))
+    }
+}
+
+/// RAII guard counting one active stream on an h2c connection. Dropping it
+/// (response body complete, or stream cancelled and dropped by hyper) restarts
+/// the connection's idle countdown.
+struct H2cStreamGuard(Arc<H2cActivity>);
+
+impl H2cStreamGuard {
+    fn new(activity: Arc<H2cActivity>) -> Self {
+        activity
+            .active_streams
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(activity)
+    }
+}
+
+impl Drop for H2cStreamGuard {
+    fn drop(&mut self) {
+        self.0
+            .active_streams
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.touch();
+    }
+}
+
+/// Response body wrapper that holds the stream's activity guard until the body
+/// completes (or is dropped on cancellation) and refreshes the connection's
+/// activity stamp on every frame, so long-lived streams (e.g. SSE) are never
+/// considered idle.
+struct H2cTrackedBody {
+    inner: Body,
+    guard: H2cStreamGuard,
+}
+
+impl http_body::Body for H2cTrackedBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let result = http_body::Body::poll_frame(Pin::new(&mut self.inner), cx);
+        if matches!(result, Poll::Ready(Some(Ok(_)))) {
+            self.guard.0.touch();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(&self.inner)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.inner)
+    }
+}
+
+/// Serve a prior-knowledge cleartext HTTP/2 (h2c) connection.
+///
+/// HTTP/2 has no equivalent of the HTTP/1 header read timeout, so connection
+/// lifetime is bounded by two mechanisms:
+///
+/// - Ping-based keep-alive (a PING after `idle_secs` without frames, closed on
+///   hyper's default 20s ack timeout) reaps dead peers, including ones with
+///   active streams.
+/// - An idle watchdog: once the connection has no active streams and has been
+///   idle for `idle_secs`, it is shut down gracefully (GOAWAY; in-flight
+///   streams, had any just started, still complete). A connection that cannot
+///   finish a graceful shutdown — notably one whose handshake never completed
+///   because the client stalled mid-preface — is dropped outright after
+///   [`H2C_SHUTDOWN_GRACE`].
+async fn serve_h2c_connection<I, S>(io: I, service: S, idle_secs: u64)
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: tower::Service<
+            axum::http::Request<axum::body::Body>,
+            Response = axum::response::Response,
+            Error = std::convert::Infallible,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    let activity = Arc::new(H2cActivity::new());
+
+    let svc_activity = activity.clone();
+    let hyper_service =
+        hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let mut service = service.clone();
+            let activity = svc_activity.clone();
+            async move {
+                activity.touch();
+                let guard = H2cStreamGuard::new(activity);
+                let (parts, body) = req.into_parts();
+                let req = Request::from_parts(parts, axum::body::Body::new(body));
+                let response = service.call(req).await?;
+                Ok::<_, std::convert::Infallible>(
+                    response.map(|body| H2cTrackedBody { inner: body, guard }),
+                )
+            }
+        });
+
+    let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+    builder.timer(TokioTimer::new());
+    builder.keep_alive_interval(Some(Duration::from_secs(idle_secs)));
+
+    let conn = builder.serve_connection(io, hyper_service);
+    tokio::pin!(conn);
+
+    let idle = Duration::from_secs(idle_secs);
+    let mut shutdown_requested_at: Option<std::time::Instant> = None;
+    loop {
+        tokio::select! {
+            result = conn.as_mut() => {
+                if let Err(err) = result {
+                    tracing::debug!("Connection error: {}", err);
+                }
+                break;
+            }
+            _ = tokio::time::sleep(H2C_WATCHDOG_TICK) => {
+                if activity.active_streams() > 0 {
+                    continue;
+                }
+                match shutdown_requested_at {
+                    None if activity.idle_for() >= idle => {
+                        conn.as_mut().graceful_shutdown();
+                        shutdown_requested_at = Some(std::time::Instant::now());
+                    }
+                    Some(at) if at.elapsed() >= H2C_SHUTDOWN_GRACE => {
+                        tracing::debug!(
+                            "Dropping h2c connection that did not complete graceful shutdown"
+                        );
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 

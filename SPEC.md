@@ -70,7 +70,7 @@ src/
 ├─ circuit_breaker.rs — Per-peer circuit breaker (Closed/Open/HalfOpen with exponential backoff)
 ├─ metrics.rs         — Prometheus metrics, JSON snapshots, per-args-hash tracking
 ├─ memory_sampler.rs  — Real-time VRAM (NVML) and system memory (procfs) sampling
-├─ protocol_detect.rs — Single-port multiplexing: TLS vs HTTP vs Noise protocol detection
+├─ protocol_detect.rs — Single-port multiplexing: TLS vs HTTP/1.1 vs HTTP/2 (h2c) vs Noise protocol detection
 ├─ noise/
 │  ├─ mod.rs          — Noise Protocol context and error types
 │  ├─ handshake.rs    — Noise_XX handshake with HMAC token verification
@@ -1146,7 +1146,7 @@ The proxy uses the Noise Protocol Framework (`Noise_XX_25519_ChaChaPoly_SHA256`)
 * **HMAC-SHA256 cluster token**: Shared secret proves cluster membership during handshake.
 * **TOFU (Trust-On-First-Use)**: SSH-style peer trust model. New peer keys are automatically accepted on first connection.
 * **Key pinning**: Enterprise deployments can explicitly pin allowed node public keys via `allowed_keys`, effectively disabling TOFU.
-* **Single-port multiplexing**: Protocol detection (`protocol_detect.rs`) distinguishes TLS, HTTP, and Noise connections on the same port. No separate port needed for inter-node traffic.
+* **Single-port multiplexing**: Protocol detection (`protocol_detect.rs`) distinguishes TLS, HTTP/1.1, prior-knowledge cleartext HTTP/2 (h2c), and Noise connections on the same port. No separate port needed for inter-node traffic. h2c connections are served by the HTTP/2 stack; their lifetime is bounded by ping-based keep-alive plus an idle watchdog that gracefully shuts down (GOAWAY) connections with no active streams for `http.idle_timeout_seconds` and drops connections that cannot complete a graceful shutdown (e.g. a stalled handshake). TLS does not advertise ALPN, so TLS clients negotiate HTTP/1.1.
 
 Secrets are stored in `~/.llama-mesh/` with strict permissions (mode 600 for files, mode 700 for directory):
 - `cluster_token` — Auto-generated shared secret, must be copied to other nodes.
