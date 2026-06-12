@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.5] - 2026-06-12
+
+### Fixed
+
+- The initial llama.cpp build at startup is now retried with backoff on
+  failure. Previously the startup build was attempted exactly once; when a
+  node booted before its network or DNS was fully up, a transient `git fetch`
+  failure left the node reporting an `unknown` llama.cpp version — and running
+  without any update check — until the next scheduled update check, which with
+  the common daily interval could be a whole day away. The build is now
+  retried over roughly the first twenty minutes after startup (delays of 10s,
+  30s, 1m, 2m, 5m, and 10m), which comfortably covers boot-time network
+  bring-up. The rebuild lock is released between attempts so the manual
+  rebuild endpoint remains usable, and the retry loop stops early if a
+  concurrent rebuild (for example one triggered via the API) succeeds in the
+  meantime, since redundantly re-running the build would re-signal a binary
+  swap and needlessly drain freshly spawned instances. (#67)
+
 ## [1.10.4] - 2026-06-11
 
 ### Fixed
