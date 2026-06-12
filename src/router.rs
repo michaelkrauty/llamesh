@@ -453,10 +453,10 @@ pub async fn list_models(
     let mut seen_ids = HashSet::new();
     let owned_by = state.config.node_id.clone();
 
-    // Used to withhold persisted parsed params recorded under a different
-    // llama.cpp binary than the one currently live.
-    let llama_cpp_version = state.build_manager.get_version().await;
-    let llama_cpp_version = (llama_cpp_version != "unknown").then_some(llama_cpp_version);
+    // Used to withhold parsed params (persisted, or from a lingering old
+    // instance) recorded under a different llama.cpp binary than the one new
+    // instances would currently be spawned from.
+    let llama_cpp_version = state.current_llama_cpp_version().await;
 
     let cookbook = state.cookbook.read().await;
     for model in &cookbook.models {
@@ -488,10 +488,11 @@ pub async fn list_models(
                     (0.0, None)
                 };
 
-            // Parsed model params: prefer a running instance (freshest), fall
-            // back to the params persisted from the last instance startup.
+            // Parsed model params: prefer a running, still-current instance
+            // (freshest), fall back to the params persisted from the last
+            // instance startup.
             let parsed_params = state
-                .get_parsed_params_for_model(&model.name, &profile.id)
+                .get_parsed_params_for_model(&model.name, &profile.id, llama_cpp_version.as_deref())
                 .await
                 .or(persisted_params);
 
