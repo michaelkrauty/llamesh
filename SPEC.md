@@ -1075,6 +1075,10 @@ Each node is responsible for its local `llama.cpp`.
 When a new binary is ready:
 
 * The symlink swap signals `binary_swap_notify`, which triggers instance draining.
+* No-op checks are recognized: when the verified binary for the current commit
+  is already what the symlink resolves to, no swap is performed or signaled,
+  so running instances are not drained (per-commit build directories are
+  immutable, so an identical resolved path implies an identical binary).
 * **Version-aware drain**: All existing instances are marked as draining (they stop accepting new requests but continue serving in-flight requests).
 * New requests spawn fresh instances using the new binary.
 * Drained instances are terminated when their in-flight request count hits 0.

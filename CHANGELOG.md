@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.6] - 2026-06-12
+
+### Fixed
+
+- A rebuild check that finds nothing to change no longer drains running
+  instances. When `update_and_build` verified an already-built binary for the
+  current commit, it unconditionally re-pointed the symlink and signaled a
+  binary swap — even when the symlink already pointed at exactly that binary.
+  Since every swap signal drains all running instances (they stop accepting
+  new requests and are recycled onto the "new" binary), the scheduled update
+  check evicted warm instances on every interval where upstream had no new
+  commits, forcing pointless model reloads. The swap (and its drain) is now
+  skipped when the live symlink already resolves to the verified binary.
+  Builds land in immutable per-commit directories, so an identical resolved
+  path means running instances already use exactly that binary; the
+  rebuild-after-failed-verification path is unaffected and still signals a
+  swap, since it replaces the binary content in place. (#69)
+
 ## [1.10.5] - 2026-06-12
 
 ### Fixed

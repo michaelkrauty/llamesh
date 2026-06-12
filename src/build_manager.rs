@@ -300,6 +300,21 @@ impl BuildManager {
                 commit_hash
             );
             if self.verify_binary(&actual_binary_path).await.is_ok() {
+                // If the live symlink already points at this binary there is
+                // nothing to swap: signaling a swap anyway would drain every
+                // running instance for a binary change that never happened
+                // (the common case for the scheduled update check when
+                // upstream has no new commits, and for every restart).
+                // Builds land in immutable per-commit directories, so an
+                // identical resolved path means running instances already
+                // use exactly this binary. A rebuild into the same directory
+                // (the verification-failure path below) does not take this
+                // branch and still signals a swap.
+                if self.symlink_already_current(&actual_binary_path).await {
+                    info!("Existing binary verified and already live. Skipping binary swap.");
+                    self.record_running_version(&commit_hash);
+                    return Ok(());
+                }
                 info!("Existing binary verified. Switching symlink.");
                 self.update_symlink(&actual_binary_path).await?;
                 self.record_running_version(&commit_hash);
@@ -459,6 +474,22 @@ impl BuildManager {
                 Err(anyhow!("Binary verification failed to execute"))
             }
         }
+    }
+
+    /// Returns true when the configured binary path already resolves to the
+    /// same file as `target`. Any failure to resolve either side (missing
+    /// link, dangling target, non-symlink fallback installs) returns false,
+    /// in which case the caller proceeds with a normal swap — the check only
+    /// ever skips work, never a needed swap.
+    async fn symlink_already_current(&self, target: &Path) -> bool {
+        let link_path = Path::new(&self.config.binary_path);
+        let (Ok(resolved_link), Ok(resolved_target)) = (
+            tokio::fs::canonicalize(link_path).await,
+            tokio::fs::canonicalize(target).await,
+        ) else {
+            return false;
+        };
+        resolved_link == resolved_target
     }
 
     async fn update_symlink(&self, target: &Path) -> Result<()> {
@@ -837,8 +868,77 @@ fi
         assert!(status.last_build_error.is_none());
         assert!(status.last_build_at.is_some());
 
+        // 6. Re-run with the same commit: the verified binary is already
+        // live, so no new swap may be signaled — a swap would needlessly
+        // drain running instances. (This run takes the verify-existing fast
+        // path, so the mock cmake is not needed again.)
+        let gen_after_first = bm.binary_generation();
+        assert!(gen_after_first >= 1);
+        let result = bm.update_and_build().await;
+        assert!(result.is_ok());
+        assert_eq!(
+            bm.binary_generation(),
+            gen_after_first,
+            "same-commit no-op rebuild must not signal a binary swap"
+        );
+
+        // 7. If the symlink points somewhere else, the same situation must
+        // swap (and signal) again.
+        tokio::fs::remove_file(&binary_path).await.unwrap();
+        std::os::unix::fs::symlink(&cmake_path, &binary_path).unwrap();
+        let result = bm.update_and_build().await;
+        assert!(result.is_ok());
+        assert_eq!(
+            bm.binary_generation(),
+            gen_after_first + 1,
+            "stale symlink must be re-pointed and the swap signaled"
+        );
+        let resolved = tokio::fs::canonicalize(&binary_path).await.unwrap();
+        assert!(resolved.ends_with("bin/llama-server"));
+
         // Cleanup
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn symlink_already_current_detects_live_and_stale_links() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "llamesh-symlink-test-{}",
+            ulid::Ulid::new().to_string()
+        ));
+        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let target = temp_dir.join("target-bin");
+        tokio::fs::write(&target, "x").await.unwrap();
+        let other = temp_dir.join("other-bin");
+        tokio::fs::write(&other, "y").await.unwrap();
+        let link = temp_dir.join("link");
+
+        let config = crate::config::LlamaCppConfig {
+            repo_url: "".into(),
+            repo_path: "".into(),
+            build_path: "".into(),
+            binary_path: link.to_string_lossy().to_string(),
+            branch: "".into(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: false,
+            keep_builds: 3,
+        };
+        let bm = BuildManager::new(config);
+
+        // No link exists yet.
+        assert!(!bm.symlink_already_current(&target).await);
+
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(bm.symlink_already_current(&target).await);
+        assert!(!bm.symlink_already_current(&other).await);
+
+        // Dangling link (target removed) must not count as current.
+        tokio::fs::remove_file(&target).await.unwrap();
+        assert!(!bm.symlink_already_current(&target).await);
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 
     #[test]
