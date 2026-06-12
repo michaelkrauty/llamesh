@@ -175,10 +175,11 @@ Use `__` (double underscore) for nested fields: `LLAMESH_CLUSTER__ENABLED=true`.
 | `POST /v1/chat/completions` | Chat completions (streaming supported) |
 | `POST /v1/completions` | Text completions (streaming supported) |
 | `POST /v1/embeddings` | Embeddings (requires `--embedding` profile) |
-| `POST /v1/rerank` | Reranking (requires `--reranking` profile) |
+| `POST /v1/rerank` | Reranking (requires `--reranking` profile; aliases: `/v1/reranking`, `/rerank`) |
 | `GET /v1/models` | List available models |
-| `GET /healthz` | Health check |
+| `GET /healthz` | Health check (alias: `/health`) |
 | `GET /readyz` | Readiness check |
+| `GET /version` | Proxy version |
 | `GET /metrics` | Prometheus metrics |
 | `GET /metrics/json` | JSON metrics snapshot |
 | `GET /cluster/nodes` | Cluster state |
