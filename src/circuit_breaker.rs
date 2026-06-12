@@ -39,9 +39,15 @@ pub struct PeerCircuit {
     /// Creation instant; epoch for `last_probe_ms`.
     created: Instant,
     /// Milliseconds since `created` of the most recently admitted probe
-    /// (0 = never). Atomic so the read-lock-only sync gate can claim probes
-    /// without taking the circuits write lock.
+    /// (0 = never). Paces probe admission. Atomic so the read-lock-only sync
+    /// gate can claim probes without taking the circuits write lock.
     last_probe_ms: AtomicU64,
+    /// True while a claimed probe's result is outstanding. Attribution
+    /// ticket: only results that consume it count as probe outcomes, so
+    /// late responses from pre-open requests (or unadmitted gossip sends)
+    /// cannot drive recovery. Kept separate from `last_probe_ms` so
+    /// consuming the ticket does not reset probe pacing.
+    probe_pending: std::sync::atomic::AtomicBool,
 }
 
 impl Default for PeerCircuit {
@@ -55,6 +61,7 @@ impl Default for PeerCircuit {
             consecutive_opens: 0,
             created: Instant::now(),
             last_probe_ms: AtomicU64::new(0),
+            probe_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -69,25 +76,40 @@ impl PeerCircuit {
         // distinguishable from "never probed".
         let now_ms = (self.created.elapsed().as_millis() as u64).max(1);
         if interval_ms == 0 {
-            // Gating disabled: every dispatch is admitted — but the claim is
-            // still stamped, since result attribution (probe vs stale
-            // pre-open response) depends on it.
+            // Gating disabled: every dispatch is admitted — but the
+            // attribution ticket is still issued, since classifying results
+            // (probe vs stale pre-open response) depends on it.
             self.last_probe_ms.store(now_ms, Ordering::Relaxed);
+            self.probe_pending.store(true, Ordering::Relaxed);
             return true;
         }
         let last = self.last_probe_ms.load(Ordering::Relaxed);
         if last != 0 && now_ms.saturating_sub(last) < interval_ms {
             return false;
         }
-        // CAS so concurrent claimants admit exactly one probe.
-        self.last_probe_ms
+        // CAS so concurrent claimants admit exactly one probe per interval.
+        if self
+            .last_probe_ms
             .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
+        {
+            self.probe_pending.store(true, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Consume the outstanding probe ticket, if any. Pacing is unaffected:
+    /// the next probe still waits for the interval from the last admission.
+    fn consume_probe_claim(&self) -> bool {
+        self.probe_pending.swap(false, Ordering::Relaxed)
     }
 
     /// Forget probe history (on state transitions that reset counters).
     fn reset_probe(&self) {
         self.last_probe_ms.store(0, Ordering::Relaxed);
+        self.probe_pending.store(false, Ordering::Relaxed);
     }
 }
 
@@ -299,6 +321,11 @@ impl CircuitBreaker {
 
         match circuit.state {
             CircuitState::HalfOpen => {
+                // Only results from claimed probes count toward recovery;
+                // stale pre-open responses carry no ticket.
+                if !circuit.consume_probe_claim() {
+                    return false;
+                }
                 circuit.success_count += 1;
                 if circuit.success_count >= self.config.success_threshold {
                     // Transition to closed
@@ -330,20 +357,22 @@ impl CircuitBreaker {
                 // sent before the circuit opened can arrive after the backoff
                 // elapsed, and must not recover a peer nobody has re-probed.
                 let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                if circuit.last_state_change.elapsed() >= backoff
-                    && circuit.last_probe_ms.swap(0, Ordering::Relaxed) != 0
-                {
+                if circuit.last_state_change.elapsed() >= backoff && circuit.consume_probe_claim() {
                     circuit.last_state_change = Instant::now();
                     circuit.success_count = 1;
                     if circuit.success_count >= self.config.success_threshold {
                         circuit.state = CircuitState::Closed;
                         circuit.failure_count = 0;
                         circuit.consecutive_opens = 0;
+                        circuit.reset_probe();
                         tracing::info!(
                             peer_id = %peer_id,
                             "Circuit breaker closed after successful recovery"
                         );
                     } else {
+                        // Probe pacing (last_probe_ms) deliberately persists
+                        // through this transition: the next half-open probe
+                        // still waits out the configured interval.
                         circuit.state = CircuitState::HalfOpen;
                         tracing::info!(
                             peer_id = %peer_id,
@@ -406,12 +435,11 @@ impl CircuitBreaker {
                 // failures — slow requests sent before the circuit opened —
                 // from escalating a window nobody has re-probed.
                 let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                if circuit.last_state_change.elapsed() >= backoff
-                    && circuit.last_probe_ms.swap(0, Ordering::Relaxed) != 0
-                {
+                if circuit.last_state_change.elapsed() >= backoff && circuit.consume_probe_claim() {
                     circuit.last_state_change = Instant::now();
                     circuit.consecutive_opens += 1;
                     circuit.success_count = 0;
+                    circuit.reset_probe();
                     tracing::warn!(
                         peer_id = %peer_id,
                         consecutive_opens = circuit.consecutive_opens,
@@ -540,7 +568,8 @@ mod tests {
         let config = CircuitBreakerConfig {
             failure_threshold: 2,
             success_threshold: 2,
-            open_duration_base_ms: 1, // 1ms for fast test
+            open_duration_base_ms: 1,       // 1ms for fast test
+            half_open_probe_interval_ms: 0, // every probe admitted
             ..Default::default()
         };
         let cb = CircuitBreaker::new(config);
@@ -552,12 +581,13 @@ mod tests {
 
         // Wait for backoff and trigger half-open
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(cb.should_allow("peer-1").await); // Transitions to HalfOpen
+        assert!(cb.should_allow("peer-1").await); // Transitions to HalfOpen, claims probe
         assert_eq!(cb.get_state("peer-1").await, CircuitState::HalfOpen);
 
-        // Successes in half-open close the circuit
+        // Claimed-probe successes in half-open close the circuit
         cb.record_success("peer-1").await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::HalfOpen);
+        assert!(cb.should_allow("peer-1").await); // claim the next probe
         cb.record_success("peer-1").await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::Closed);
     }
@@ -648,6 +678,7 @@ mod tests {
 
         assert!(cb.record_success("p").await); // successful probe → half-open
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
+        assert!(cb.try_claim_dispatch_sync("p")); // next probe claimed
         assert!(cb.record_success("p").await); // second success → closed
         assert_eq!(cb.get_state("p").await, CircuitState::Closed);
     }
@@ -705,7 +736,7 @@ mod tests {
     async fn probe_gating_limits_dispatch_claims_per_interval() {
         let config = CircuitBreakerConfig {
             failure_threshold: 1,
-            success_threshold: 2,
+            success_threshold: 1,
             open_duration_base_ms: 1,
             half_open_probe_interval_ms: 60_000,
             ..Default::default()
@@ -723,12 +754,39 @@ mod tests {
         assert!(!cb.try_claim_dispatch_sync("p")); // backlog herd denied
         assert!(!cb.try_claim_dispatch_sync("p"));
 
-        // Recovery through probe successes reopens unrestricted traffic.
-        assert!(cb.record_success("p").await);
+        // The probe's success closes the circuit and reopens unrestricted
+        // traffic.
         assert!(cb.record_success("p").await);
         assert_eq!(cb.get_state("p").await, CircuitState::Closed);
         assert!(cb.try_claim_dispatch_sync("p"));
         assert!(cb.try_claim_dispatch_sync("p"));
+    }
+
+    #[tokio::test]
+    async fn probe_pacing_persists_across_half_open_transition() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            open_duration_base_ms: 1,
+            half_open_probe_interval_ms: 60_000,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(config);
+        cb.record_failure("p").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(cb.try_claim_dispatch_sync("p"));
+        assert!(cb.record_success("p").await); // probe success → half-open
+        assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
+
+        // The interval still paces half-open probes after the transition: a
+        // woken backlog cannot immediately claim the next probe.
+        assert!(!cb.try_claim_dispatch_sync("p"));
+
+        // And a stale success without a claimed probe does not advance
+        // recovery in half-open either.
+        assert!(!cb.record_success("p").await);
+        assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
     }
 
     #[tokio::test]

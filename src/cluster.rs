@@ -135,8 +135,11 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
             // cluster's standing health probe. Claim the recovery probe slot
             // when one is available so a gossip success while the circuit is
             // open is attributed as a recovery probe result; without traffic,
-            // this is what closes the circuit after a peer comes back.
-            let _ = circuit_breaker.try_claim_dispatch_sync(&cb_key);
+            // this is what closes the circuit after a peer comes back. When
+            // the claim is denied (a routed request's probe is in flight),
+            // this round's result is NOT recorded — recording it would
+            // consume the in-flight probe's attribution ticket.
+            let gossip_probe_claimed = circuit_breaker.try_claim_dispatch_sync(&cb_key);
 
             // Spawn each gossip request to avoid head-of-line blocking in the loop
             tokio::spawn(async move {
@@ -176,11 +179,15 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                         }
                                     }
                                     if (200..300).contains(&status) {
-                                        if circuit_breaker.record_success(&cb_key).await {
+                                        if gossip_probe_claimed
+                                            && circuit_breaker.record_success(&cb_key).await
+                                        {
                                             capacity_notify.notify_waiters();
                                         }
                                     } else {
-                                        circuit_breaker.record_failure(&cb_key).await;
+                                        if gossip_probe_claimed {
+                                            circuit_breaker.record_failure(&cb_key).await;
+                                        }
                                         debug!(
                                             "Failed to gossip to {} over Noise: HTTP {}",
                                             peer_url, status
@@ -188,13 +195,17 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                     }
                                 }
                                 Err(e) => {
-                                    circuit_breaker.record_failure(&cb_key).await;
+                                    if gossip_probe_claimed {
+                                        circuit_breaker.record_failure(&cb_key).await;
+                                    }
                                     debug!("Failed to gossip to {} over Noise: {}", peer_url, e);
                                 }
                             }
                         }
                         Err(e) => {
-                            circuit_breaker.record_failure(&cb_key).await;
+                            if gossip_probe_claimed {
+                                circuit_breaker.record_failure(&cb_key).await;
+                            }
                             debug!("Failed to serialize gossip for {}: {}", peer_url, e);
                         }
                     }
@@ -208,12 +219,16 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                             }
                         }
                         Ok(resp) => {
-                            circuit_breaker.record_failure(&cb_key).await;
+                            if gossip_probe_claimed {
+                                circuit_breaker.record_failure(&cb_key).await;
+                            }
                             debug!("Failed to gossip to {}: HTTP {}", url, resp.status());
                         }
                         Err(e) => {
                             // Record failure - circuit breaker handles escalation and logging
-                            circuit_breaker.record_failure(&cb_key).await;
+                            if gossip_probe_claimed {
+                                circuit_breaker.record_failure(&cb_key).await;
+                            }
                             debug!("Failed to gossip to {}: {}", url, e);
                         }
                     }

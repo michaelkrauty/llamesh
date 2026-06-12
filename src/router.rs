@@ -748,7 +748,25 @@ pub async fn route_request(
                             "Peer circuit recovering and probe slot taken; waiting to retry"
                         );
                         drop(peer_forward_guard);
-                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+                        // A denied probe slot frees by time passing, not only
+                        // by capacity events — re-check at the next probe
+                        // deadline even if nothing notifies.
+                        let probe_deadline = Duration::from_millis(
+                            state
+                                .config
+                                .cluster
+                                .circuit_breaker
+                                .half_open_probe_interval_ms
+                                .max(250),
+                        );
+                        if let Ok(res) = tokio::time::timeout(
+                            probe_deadline,
+                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
+                        )
+                        .await
+                        {
+                            res?;
+                        }
                         continue;
                     }
                     ForwardOutcome::Transport(e) => {
@@ -1233,6 +1251,7 @@ pub async fn route_request(
                 )
                 .await;
 
+                let mut probe_wait_deadline: Option<Duration> = None;
                 match outcome {
                     ForwardOutcome::StreamingSurface(resp) => {
                         let tokens_counter = Arc::new(AtomicU64::new(0));
@@ -1312,6 +1331,16 @@ pub async fn route_request(
                             "Peer circuit recovering and probe slot taken; waiting to retry"
                         );
                         drop(peer_forward_guard);
+                        // A denied probe slot frees by time passing; bound
+                        // the wait below by the next probe deadline.
+                        probe_wait_deadline = Some(Duration::from_millis(
+                            state
+                                .config
+                                .cluster
+                                .circuit_breaker
+                                .half_open_probe_interval_ms
+                                .max(250),
+                        ));
                     }
                     ForwardOutcome::Transport(e) => {
                         state
@@ -1332,7 +1361,24 @@ pub async fn route_request(
 
                 // Wait for cluster state to change (capacity freed, peer
                 // recovered, gossip update, drain finished) before retrying.
-                wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+                // Probe-denied attempts additionally wake at the next probe
+                // deadline, since a probe slot frees by time passing.
+                match probe_wait_deadline {
+                    Some(deadline) => {
+                        if let Ok(res) = tokio::time::timeout(
+                            deadline,
+                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
+                        )
+                        .await
+                        {
+                            res?;
+                        }
+                    }
+                    None => {
+                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle)
+                            .await?;
+                    }
+                }
 
                 if state.draining.load(Ordering::Relaxed) {
                     state.metrics.inc_errors();
