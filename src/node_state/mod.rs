@@ -643,7 +643,11 @@ impl NodeState {
     /// Find a peer that supports a model (case-insensitive).
     /// Used when local cookbook doesn't have the model but a peer might.
     /// Returns the PeerState of the best candidate peer, if any.
-    pub async fn find_peer_for_model(&self, model_name: &str) -> Option<PeerState> {
+    pub async fn find_peer_for_model(
+        &self,
+        model_name: &str,
+        exclude_peer: Option<&str>,
+    ) -> Option<PeerState> {
         let peers = self.peers.read().await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -675,6 +679,11 @@ impl NodeState {
             }
             // Skip peers with open circuit breaker
             if !self.circuit_breaker.should_allow_sync(&peer.node_id) {
+                continue;
+            }
+            // Skip a peer the caller just failed to claim a recovery probe
+            // for, so the retry can reach a different healthy peer.
+            if exclude_peer == Some(peer.node_id.as_str()) {
                 continue;
             }
             // Check if peer supports this model (case-insensitive)
@@ -2633,6 +2642,7 @@ impl NodeState {
         model_name: &str,
         profile: &Profile,
         prefer_local: bool,
+        exclude_peer: Option<&str>,
     ) -> Option<PeerState> {
         let mut candidates = Vec::new();
         let requested_profile = profile.id.clone();
@@ -2691,6 +2701,11 @@ impl NodeState {
                     peer_id = %peer.node_id,
                     "Skipping peer due to open circuit breaker"
                 );
+                continue;
+            }
+            // Skip a peer the caller just failed to claim a recovery probe
+            // for, so the retry can reach a different healthy peer.
+            if exclude_peer == Some(peer.node_id.as_str()) {
                 continue;
             }
 
@@ -3688,7 +3703,7 @@ mod tests {
         // 1. Initially no peers, and local cookbook is empty.
         let profile = sample_profile();
         let result = state
-            .select_best_node("remote-model", &profile, false)
+            .select_best_node("remote-model", &profile, false, None)
             .await;
         // Should be None because we don't support it and we have no peers.
         assert!(result.is_none());
@@ -3732,7 +3747,7 @@ mod tests {
 
         // 3. Now select_best_node should find the peer
         let result = state
-            .select_best_node("remote-model", &profile, false)
+            .select_best_node("remote-model", &profile, false, None)
             .await;
         assert!(result.is_some());
         let picked = result.unwrap();

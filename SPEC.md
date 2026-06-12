@@ -206,6 +206,7 @@ cluster:
     success_threshold: 2                 # Successes needed to close circuit
     open_duration_base_ms: 5000          # Base backoff (doubles each time circuit opens)
     open_duration_max_ms: 60000          # Maximum backoff cap
+    half_open_probe_interval_ms: 1000    # Min interval between recovery probes (0 = no gating)
 
   # Action when peer llama.cpp version differs (default: "warn")
   version_mismatch_action: "warn"
