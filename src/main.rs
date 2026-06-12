@@ -26,16 +26,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
-/// True once any successful build has been recorded (the initial build, a
-/// scheduled update, or a manual rebuild via the API). Used by the initial
-/// build's retry loop to stop once the goal is met: re-running a build after
-/// one already succeeded would re-signal a binary swap for the same commit
-/// and needlessly drain freshly spawned instances.
-fn build_already_succeeded(bm: &build_manager::BuildManager) -> bool {
-    let status = bm.build_status();
-    status.last_build_error.is_none() && status.last_build_at.is_some()
-}
-
 /// Backoff schedule for the initial llama.cpp build. Covers roughly the
 /// first twenty minutes after startup, long enough for boot-time DNS and
 /// network bring-up; after that the scheduled update check takes over.
@@ -323,13 +313,25 @@ async fn main() -> anyhow::Result<()> {
         let lock = node_state.rebuild_lock.clone();
         tokio::spawn(
             async move {
+                // Every successful build — initial, scheduled, or manual —
+                // bumps the binary generation when the symlink is swapped.
+                // A generation above the one observed here is a durable
+                // "another path already succeeded" marker for cancelling the
+                // retry loop: unlike the recorded build error/timestamp, it
+                // cannot be reset by a rebuild that fails afterwards. Once
+                // any build has succeeded this loop's goal is met; later
+                // failures are the scheduled update check's concern, and
+                // redundantly re-running the build here would re-signal a
+                // binary swap for the same commit and needlessly drain
+                // freshly spawned instances.
+                let startup_generation = bm.binary_generation();
                 let outcome = util::retry_with_backoff(
                     "initial llama.cpp build",
                     INITIAL_BUILD_RETRY_DELAYS,
                     // Stop retrying if another path (e.g. the manual rebuild
-                    // endpoint) recorded a successful build while this loop
+                    // endpoint) completed a successful build while this loop
                     // was sleeping.
-                    || !build_already_succeeded(&bm),
+                    || bm.binary_generation() == startup_generation,
                     // The rebuild lock is held only while an attempt runs —
                     // never across backoff sleeps — so the manual rebuild
                     // endpoint stays usable between attempts.
@@ -341,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
                             // Re-check after acquiring the lock: a concurrent
                             // rebuild may have succeeded while this attempt
                             // waited for it.
-                            if build_already_succeeded(&bm) {
+                            if bm.binary_generation() > startup_generation {
                                 tracing::debug!(
                                     "Skipping initial build attempt; a concurrent rebuild already succeeded"
                                 );
