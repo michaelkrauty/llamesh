@@ -2242,9 +2242,37 @@ impl NodeState {
                     // Trigger instant gossip so peers learn about new model availability
                     gossip_trigger.notify_one();
 
+                    let spare_slots = if max_concurrent == 0 {
+                        usize::MAX
+                    } else {
+                        max_concurrent.saturating_sub(inst.in_flight_requests)
+                    };
+                    let instance_id = inst.id.clone();
+                    let pid = inst.get_pid();
+                    // LOCK_ORDER: release the instance lock (4) before
+                    // notify_queue acquires `queues` (2).
+                    drop(inst);
+
+                    // Wake queued waiters for this model:profile, up to the
+                    // ready instance's spare concurrency — and before the
+                    // cold-start sampling sleep below, so waiters near their
+                    // queue timeout are not held up by it. Requests that
+                    // queued while this spawn was in flight (gated by the
+                    // spawn reservation) would otherwise sleep until some
+                    // unrelated slot-release event, even though the instance
+                    // is ready with free slots. Woken waiters re-check
+                    // capacity themselves, so this can only ever wake too
+                    // many (they re-queue), never admit too many.
+                    let mut woken = 0usize;
+                    while woken < spare_slots
+                        && ready_state.notify_queue(&ready_model, &ready_profile).await
+                    {
+                        woken += 1;
+                    }
+
                     if is_cold {
                         // Cold start: sample memory after ready and store learned value
-                        if let Some(pid) = inst.get_pid() {
+                        if let Some(pid) = pid {
                             // Wait a moment for memory to stabilize after model load
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                             let (vram, sysmem) = memory_sampler.sample(pid);
@@ -2252,7 +2280,7 @@ impl NodeState {
                                 let hash_metrics = metrics.get_hash_metrics(&args_hash_clone).await;
                                 hash_metrics.observe_memory(vram, sysmem);
                                 info!(
-                                    instance_id = %inst.id,
+                                    instance_id = %instance_id,
                                     args_hash = %args_hash_clone,
                                     vram_mb = vram,
                                     sysmem_mb = sysmem,
@@ -2260,29 +2288,6 @@ impl NodeState {
                                 );
                             }
                         }
-                    }
-
-                    // Wake queued waiters for this model:profile, up to the
-                    // ready instance's spare concurrency. Requests that
-                    // queued while this spawn was in flight (gated by the
-                    // spawn reservation) would otherwise sleep until some
-                    // unrelated slot-release event, even though the instance
-                    // is ready with free slots. Woken waiters re-check
-                    // capacity themselves, so this can only ever wake too
-                    // many (they re-queue), never admit too many.
-                    let spare_slots = if max_concurrent == 0 {
-                        usize::MAX
-                    } else {
-                        max_concurrent.saturating_sub(inst.in_flight_requests)
-                    };
-                    // LOCK_ORDER: release the instance lock (4) before
-                    // notify_queue acquires `queues` (2).
-                    drop(inst);
-                    let mut woken = 0usize;
-                    while woken < spare_slots
-                        && ready_state.notify_queue(&ready_model, &ready_profile).await
-                    {
-                        woken += 1;
                     }
                 }
             });
@@ -3868,9 +3873,27 @@ mod tests {
         config.max_vram_mb = 1_000_000;
         config.max_sysmem_mb = 1_000_000;
         config.cluster.enabled = false;
-        // Any spawnable binary works: try_get_or_spawn only needs the exec to
-        // succeed; readiness is handled by a background task afterwards.
-        config.llama_cpp.binary_path = "/bin/true".into();
+        // The spawned process must stay alive past the assertions: a process
+        // that exits immediately fails the background readiness check, whose
+        // failure path runs an eviction pass that could remove the instance
+        // from the map before the assertions run. Use a script that ignores
+        // the llama-server args and sleeps.
+        let fake_server = std::env::temp_dir().join(format!(
+            "llamesh-fake-server-{}",
+            ulid::Ulid::new().to_string()
+        ));
+        tokio::fs::write(&fake_server, "#!/bin/sh\nsleep 300\n")
+            .await
+            .unwrap();
+        let mut perms = tokio::fs::metadata(&fake_server)
+            .await
+            .unwrap()
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        tokio::fs::set_permissions(&fake_server, perms)
+            .await
+            .unwrap();
+        config.llama_cpp.binary_path = fake_server.to_string_lossy().to_string();
         let build_manager = BuildManager::new(config.llama_cpp.clone());
         let state = Arc::new(
             NodeState::new(config, Cookbook { models: vec![] }, build_manager)
@@ -3893,9 +3916,10 @@ mod tests {
         );
         assert_eq!(state.spawn_reservations.profile_count("test:default"), 0);
 
-        // Cleanup: stop the child if it is still around.
+        // Cleanup: stop the child and remove the fake server script.
         let inst = inst.read().await;
         let _ = inst.stop().await;
+        let _ = tokio::fs::remove_file(&fake_server).await;
     }
 
     #[tokio::test]
