@@ -2035,7 +2035,7 @@ impl NodeState {
                 // Check if this is a cold start (no learned memory for this args_hash)
                 let is_cold_start = !self.metrics.has_memory_data(&args_hash).await;
 
-                let new_instance = Instance::new(
+                let mut new_instance = Instance::new(
                     instance_id.clone(),
                     model_name.to_string(),
                     profile.id.clone(),
@@ -2044,6 +2044,15 @@ impl NodeState {
                     args_hash.clone(),
                     is_cold_start,
                 );
+                if reserve_slot {
+                    // Claim the spawning request's slot before the instance
+                    // is shared: once it is in the map, concurrent requests
+                    // (including ready-time woken waiters) can attach and
+                    // increment the count, and a late `= 1` assignment would
+                    // overwrite their increments, undercounting active
+                    // requests for the rest of the instance's life.
+                    new_instance.in_flight_requests = 1;
+                }
                 let inst_arc = Arc::new(RwLock::new(new_instance));
 
                 // Try to spawn BEFORE inserting into map to avoid race condition
@@ -2179,6 +2188,22 @@ impl NodeState {
                     error!("Instance {} failed to become ready: {}", inst.id, e);
                     inst.clear_startup_log();
                     let _ = inst.stop().await;
+                    // LOCK_ORDER: release the instance lock (4) before the
+                    // eviction pass acquires `instances` (1).
+                    drop(inst);
+
+                    // The stopped instance still occupies its map slot — and
+                    // its model:profile capacity count — until an eviction
+                    // pass removes it. Requests that queued behind this spawn
+                    // (gated by its reservation) would wait up to a full
+                    // periodic eviction tick before retrying; run a pass now
+                    // so they are woken immediately (check_idle_instances
+                    // removes dead instances and ends with
+                    // notify_all_queues). Same precedent as the immediate
+                    // pass after a cookbook reload.
+                    if let Err(e) = ready_state.check_idle_instances().await {
+                        error!("Eviction pass after failed startup failed: {}", e);
+                    }
                 } else {
                     // Parse model params from startup log now that instance is ready
                     inst.parse_and_store_startup_params();
@@ -2199,13 +2224,6 @@ impl NodeState {
                     // Trigger instant gossip so peers learn about new model availability
                     gossip_trigger.notify_one();
 
-                    // Wake one queued waiter for this model:profile. A request
-                    // that queued while this spawn was in flight (gated by
-                    // the spawn reservation) would otherwise sleep until some
-                    // unrelated slot-release event, even though the instance
-                    // is now ready and may have spare concurrency slots.
-                    ready_state.notify_queue(&ready_model, &ready_profile).await;
-
                     if is_cold {
                         // Cold start: sample memory after ready and store learned value
                         if let Some(pid) = inst.get_pid() {
@@ -2225,14 +2243,31 @@ impl NodeState {
                             }
                         }
                     }
+
+                    // Wake queued waiters for this model:profile, up to the
+                    // ready instance's spare concurrency. Requests that
+                    // queued while this spawn was in flight (gated by the
+                    // spawn reservation) would otherwise sleep until some
+                    // unrelated slot-release event, even though the instance
+                    // is ready with free slots. Woken waiters re-check
+                    // capacity themselves, so this can only ever wake too
+                    // many (they re-queue), never admit too many.
+                    let spare_slots = if max_concurrent == 0 {
+                        usize::MAX
+                    } else {
+                        max_concurrent.saturating_sub(inst.in_flight_requests)
+                    };
+                    // LOCK_ORDER: release the instance lock (4) before
+                    // notify_queue acquires `queues` (2).
+                    drop(inst);
+                    let mut woken = 0usize;
+                    while woken < spare_slots
+                        && ready_state.notify_queue(&ready_model, &ready_profile).await
+                    {
+                        woken += 1;
+                    }
                 }
             });
-
-            if reserve_slot {
-                let mut inst_write = inst_arc.write().await;
-                inst_write.in_flight_requests = 1;
-                inst_write.last_activity = std::time::Instant::now();
-            }
 
             info!(
                 event = "instance_spawn",
