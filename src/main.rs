@@ -26,6 +26,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+/// True once any successful build has been recorded (the initial build, a
+/// scheduled update, or a manual rebuild via the API). Used by the initial
+/// build's retry loop to stop once the goal is met: re-running a build after
+/// one already succeeded would re-signal a binary swap for the same commit
+/// and needlessly drain freshly spawned instances.
+fn build_already_succeeded(bm: &build_manager::BuildManager) -> bool {
+    let status = bm.build_status();
+    status.last_build_error.is_none() && status.last_build_at.is_some()
+}
+
 /// Backoff schedule for the initial llama.cpp build. Covers roughly the
 /// first twenty minutes after startup, long enough for boot-time DNS and
 /// network bring-up; after that the scheduled update check takes over.
@@ -318,12 +328,8 @@ async fn main() -> anyhow::Result<()> {
                     INITIAL_BUILD_RETRY_DELAYS,
                     // Stop retrying if another path (e.g. the manual rebuild
                     // endpoint) recorded a successful build while this loop
-                    // was sleeping: re-running the build would re-signal a
-                    // binary swap and needlessly drain fresh instances.
-                    || {
-                        let status = bm.build_status();
-                        !(status.last_build_error.is_none() && status.last_build_at.is_some())
-                    },
+                    // was sleeping.
+                    || !build_already_succeeded(&bm),
                     // The rebuild lock is held only while an attempt runs —
                     // never across backoff sleeps — so the manual rebuild
                     // endpoint stays usable between attempts.
@@ -332,6 +338,15 @@ async fn main() -> anyhow::Result<()> {
                         let lock = lock.clone();
                         async move {
                             let _permit = lock.lock().await;
+                            // Re-check after acquiring the lock: a concurrent
+                            // rebuild may have succeeded while this attempt
+                            // waited for it.
+                            if build_already_succeeded(&bm) {
+                                tracing::debug!(
+                                    "Skipping initial build attempt; a concurrent rebuild already succeeded"
+                                );
+                                return Ok(());
+                            }
                             bm.update_and_build().await
                         }
                     },
