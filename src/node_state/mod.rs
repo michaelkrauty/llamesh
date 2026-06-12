@@ -764,6 +764,14 @@ impl NodeState {
         (snapshot.effective_vram_mb, snapshot.effective_sysmem_mb)
     }
 
+    /// Current total queued requests across all model queues, matching
+    /// `total_queue_length` in `/cluster/nodes`.
+    pub async fn total_queue_length(&self) -> u64 {
+        // LOCK_ORDER: queues (2)
+        let queues = self.queues.read().await;
+        queues.values().map(|q| q.len() as u64).sum()
+    }
+
     async fn calculate_resource_snapshot_for_instances(
         &self,
         instances: &HashMap<String, Arc<RwLock<Instance>>>,
@@ -1317,6 +1325,8 @@ impl NodeState {
                         let total: usize = queues.values().map(|q| q.len()).sum();
                         if total >= self.config.max_total_queue_entries {
                             info!(event = "queue_drop", reason = "global_limit", model = %model_name, total = total);
+                            self.metrics
+                                .record_queue_drop(crate::metrics::QueueDropReason::GlobalLimit);
                             return Err(NodeError::QueueFull);
                         }
                     }
@@ -1334,6 +1344,8 @@ impl NodeState {
                     // 0 = unlimited queue size
                     if max_queue > 0 && queue.len() >= max_queue {
                         info!(event = "queue_drop", reason = "full", model = %model_name);
+                        self.metrics
+                            .record_queue_drop(crate::metrics::QueueDropReason::Full);
                         return Err(NodeError::QueueFull);
                     }
                     queue_token = self.pending_token_counter.fetch_add(1, Ordering::SeqCst);
@@ -1360,6 +1372,8 @@ impl NodeState {
                         let elapsed = loop_start.elapsed();
                         if elapsed >= timeout {
                             info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                            self.metrics
+                                .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
                             self.remove_queue_entry(&key, queue_token).await;
                             self.remove_pending_token(model_name, &profile.id, queue_token)
                                 .await;
@@ -1370,6 +1384,8 @@ impl NodeState {
                             Ok(result) => result,
                             Err(_) => {
                                 info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                                self.metrics
+                                    .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
                                 self.remove_queue_entry(&key, queue_token).await;
                                 self.remove_pending_token(model_name, &profile.id, queue_token)
                                     .await;
@@ -1585,6 +1601,9 @@ impl NodeState {
                                 let total: usize = queues.values().map(|q| q.len()).sum();
                                 if total >= self.config.max_total_queue_entries {
                                     info!(event = "queue_drop", reason = "global_limit", model = %model_name, total = total);
+                                    self.metrics.record_queue_drop(
+                                        crate::metrics::QueueDropReason::GlobalLimit,
+                                    );
                                     return Err(NodeError::QueueFull);
                                 }
                             }
@@ -1603,6 +1622,8 @@ impl NodeState {
                             // 0 = unlimited queue size
                             if max_queue > 0 && queue.len() >= max_queue {
                                 info!(event = "queue_drop", reason = "full", model = %model_name);
+                                self.metrics
+                                    .record_queue_drop(crate::metrics::QueueDropReason::Full);
                                 return Err(NodeError::QueueFull);
                             }
                             queue_token = self.pending_token_counter.fetch_add(1, Ordering::SeqCst);
@@ -1671,6 +1692,9 @@ impl NodeState {
                                 let elapsed = loop_start.elapsed();
                                 if elapsed >= timeout {
                                     info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                                    self.metrics.record_queue_drop(
+                                        crate::metrics::QueueDropReason::Timeout,
+                                    );
                                     self.remove_queue_entry(&key, queue_token).await;
                                     self.remove_pending_token(model_name, &profile.id, queue_token)
                                         .await;
@@ -1681,6 +1705,9 @@ impl NodeState {
                                     Ok(result) => result,
                                     Err(_) => {
                                         info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                                        self.metrics.record_queue_drop(
+                                            crate::metrics::QueueDropReason::Timeout,
+                                        );
                                         self.remove_queue_entry(&key, queue_token).await;
                                         self.remove_pending_token(
                                             model_name,

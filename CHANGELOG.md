@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-06-12
+
+### Added
+
+- Queue observability on the metrics surface. `proxy_queue_length` reports
+  the current number of requests waiting across all model queues (the same
+  value as `total_queue_length` in `/cluster/nodes`, previously not
+  scrapeable), refreshed at scrape time. `proxy_queue_drops_total{reason}`
+  counts requests dropped from queues by reason — `full` (per-model
+  `max_queue_size_per_model` reached), `timeout` (queue wait exceeded its
+  limit), and `global_limit` (node-wide `max_total_queue_entries` reached) —
+  mirroring the existing `queue_drop` log events, which previously were the
+  only record of client-visible queue rejections. The drop counters are
+  cumulative and persist across restarts; both metrics also appear in
+  `/metrics/json`. (#77)
+
 ## [1.10.9] - 2026-06-12
 
 ### Fixed
