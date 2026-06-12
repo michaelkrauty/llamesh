@@ -281,9 +281,26 @@ pub struct HashMetricsSnapshot {
     pub sample_count: u64,
     /// Parsed model params from the most recent instance startup, with the
     /// llama.cpp version they were observed under.
-    /// `#[serde(default)]` keeps snapshots written by older versions loadable.
-    #[serde(default)]
+    /// `#[serde(default)]` keeps snapshots written by older versions loadable,
+    /// and the lenient deserializer drops (rather than fails on) a value whose
+    /// shape doesn't match — a parse error here would otherwise discard the
+    /// entire snapshot, silently resetting every persisted counter.
+    #[serde(default, deserialize_with = "lenient_parsed_params")]
     pub parsed_model_params: Option<PersistedParsedParams>,
+}
+
+/// Deserialize `parsed_model_params`, tolerating unknown shapes.
+///
+/// Learned data is valuable but reconstructible; the surrounding counters are
+/// not. If this field ever drifts in shape (as opposed to being absent, which
+/// `default` already handles), losing just the params is strictly better than
+/// `Metrics::load` discarding the whole snapshot.
+fn lenient_parsed_params<'de, D>(deserializer: D) -> Result<Option<PersistedParsedParams>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or(None))
 }
 
 impl Metrics {
@@ -1211,6 +1228,30 @@ mod tests {
             serde_json::from_str(legacy).expect("legacy hash snapshot should deserialize");
         assert!(snapshot.parsed_model_params.is_none());
         assert_eq!(snapshot.requests_total, 3);
+    }
+
+    #[test]
+    fn test_hash_snapshot_tolerates_malformed_parsed_params() {
+        // A present-but-wrong-shape `parsed_model_params` (e.g. written by a
+        // build where the field had a different layout) must NOT fail the
+        // parse: that would discard the entire snapshot and silently reset
+        // every persisted counter. The params are dropped, the counters kept.
+        let drifted = r#"{
+            "display_names": ["m:default"],
+            "requests_total": 1428315,
+            "errors_total": 16406,
+            "tokens_generated_total": 30,
+            "avg_latency_ms": 10.0,
+            "peak_vram_mb": 1000,
+            "peak_sysmem_mb": 2000,
+            "sample_count": 2,
+            "parsed_model_params": {"n_ctx": 4096, "n_slots": 4}
+        }"#;
+        let snapshot: HashMetricsSnapshot = serde_json::from_str(drifted)
+            .expect("shape drift in parsed params must not discard the snapshot");
+        assert!(snapshot.parsed_model_params.is_none());
+        assert_eq!(snapshot.requests_total, 1428315);
+        assert_eq!(snapshot.errors_total, 16406);
     }
 
     #[tokio::test]
