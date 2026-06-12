@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.2] - 2026-06-12
+
+### Documentation
+
+- Added `SECURITY.md` (security model summary, private vulnerability
+  reporting via GitHub, supported versions, scope) and `CONTRIBUTING.md`
+  (build and test instructions, quality gates, pull request and versioning
+  conventions, persistence-compatibility rules). README links both.
+  Private vulnerability reporting is enabled on the repository. (#81)
+
 ## [1.11.1] - 2026-06-12
 
 ### Fixed
