@@ -1084,6 +1084,12 @@ On build failure:
 * Log error and keep using old binary.
 * Expose status in metrics and admin endpoints.
 * Build status (`is_building`, `last_build_error`, `last_build_at`) is exposed in the metrics JSON and admin endpoints.
+* The initial build at startup is retried with backoff over roughly the first
+  twenty minutes (10s, 30s, 1m, 2m, 5m, 10m) to ride out boot-time network/DNS
+  bring-up; the rebuild lock is released between attempts, and the retry loop
+  stops early if a concurrent (e.g. manually triggered) rebuild succeeds.
+  Scheduled and manual rebuild failures are not retried — the next scheduled
+  check covers them.
 
 Manual control:
 

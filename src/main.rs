@@ -23,7 +23,20 @@ use clap::Parser;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, warn};
+
+/// Backoff schedule for the initial llama.cpp build. Covers roughly the
+/// first twenty minutes after startup, long enough for boot-time DNS and
+/// network bring-up; after that the scheduled update check takes over.
+const INITIAL_BUILD_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+    Duration::from_secs(600),
+];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -289,15 +302,56 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initial build - runs in background so server can start immediately
-    // If a binary already exists, requests are served using it until the build completes
+    // If a binary already exists, requests are served using it until the build completes.
+    //
+    // Failures here are retried with backoff: at boot the network/DNS is often
+    // not up yet when the service starts, and without retries a transient
+    // `git fetch` failure would leave the node reporting an unknown llama.cpp
+    // version until the next scheduled update check (commonly a day away).
     {
         let bm = node_state.build_manager.clone();
         let lock = node_state.rebuild_lock.clone();
         tokio::spawn(
             async move {
-                let _permit = lock.lock().await;
-                if let Err(e) = bm.update_and_build().await {
-                    tracing::error!(event = "llama_build_failure", error = %e, "Initial llama.cpp build failed");
+                let outcome = util::retry_with_backoff(
+                    "initial llama.cpp build",
+                    INITIAL_BUILD_RETRY_DELAYS,
+                    // Stop retrying if another path (e.g. the manual rebuild
+                    // endpoint) recorded a successful build while this loop
+                    // was sleeping: re-running the build would re-signal a
+                    // binary swap and needlessly drain fresh instances.
+                    || {
+                        let status = bm.build_status();
+                        !(status.last_build_error.is_none() && status.last_build_at.is_some())
+                    },
+                    // The rebuild lock is held only while an attempt runs —
+                    // never across backoff sleeps — so the manual rebuild
+                    // endpoint stays usable between attempts.
+                    || {
+                        let bm = bm.clone();
+                        let lock = lock.clone();
+                        async move {
+                            let _permit = lock.lock().await;
+                            bm.update_and_build().await
+                        }
+                    },
+                )
+                .await;
+                match outcome {
+                    util::RetryOutcome::Success(()) => {}
+                    util::RetryOutcome::Aborted(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "Initial llama.cpp build retries stopped; a concurrent rebuild already succeeded"
+                        );
+                    }
+                    util::RetryOutcome::Exhausted(e) => {
+                        tracing::error!(
+                            event = "llama_build_failure",
+                            error = %e,
+                            "Initial llama.cpp build failed after all retries; next scheduled update check will try again"
+                        );
+                    }
                 }
             }
             .instrument(span.clone()),
