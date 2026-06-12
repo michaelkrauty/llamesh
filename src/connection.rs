@@ -139,7 +139,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "poll_client_disconnect should have resolved");
+        assert!(
+            result.is_ok(),
+            "poll_client_disconnect should have resolved"
+        );
     }
 
     #[test]
