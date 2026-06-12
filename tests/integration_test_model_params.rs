@@ -50,12 +50,19 @@ async fn test_parsed_params_survive_instance_eviction() {
     let mock_script = setup_mock_script(&root, "params").await;
     let config_path = root.join("tests/config_params.yaml");
     let cookbook_path = root.join("tests/cookbook_params.yaml");
+    let metrics_path = root.join("tests/metrics_params.json");
     let proxy_bin = llamesh_binary(&root);
+
+    // This test asserts on the empty-state behavior, so a metrics snapshot
+    // persisted by a previous run must not leak in (the test config points
+    // metrics_path at this dedicated file rather than the default).
+    let _ = tokio::fs::remove_file(&metrics_path).await;
 
     let config_content = format!(
         r#"
 node_id: "test-node-params"
 listen_addr: "127.0.0.1:9205"
+metrics_path: "./tests/metrics_params.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
@@ -175,4 +182,6 @@ models:
     let _ = tokio::fs::remove_file(&config_path).await;
     let _ = tokio::fs::remove_file(&cookbook_path).await;
     let _ = tokio::fs::remove_file(&mock_script).await;
+    let _ = tokio::fs::remove_file(&metrics_path).await;
+    let _ = tokio::fs::remove_file(metrics_path.with_extension("tmp")).await;
 }

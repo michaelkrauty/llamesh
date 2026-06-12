@@ -453,6 +453,11 @@ pub async fn list_models(
     let mut seen_ids = HashSet::new();
     let owned_by = state.config.node_id.clone();
 
+    // Used to withhold persisted parsed params recorded under a different
+    // llama.cpp binary than the one currently live.
+    let llama_cpp_version = state.build_manager.get_version().await;
+    let llama_cpp_version = (llama_cpp_version != "unknown").then_some(llama_cpp_version);
+
     let cookbook = state.cookbook.read().await;
     for model in &cookbook.models {
         if !model.enabled {
@@ -477,7 +482,7 @@ pub async fn list_models(
                     let hash_metrics = state.metrics.get_hash_metrics(&args_hash).await;
                     (
                         hash_metrics.tokens_per_second(),
-                        hash_metrics.get_parsed_params(),
+                        hash_metrics.get_parsed_params(llama_cpp_version.as_deref()),
                     )
                 } else {
                     (0.0, None)

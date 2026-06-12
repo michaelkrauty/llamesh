@@ -16,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is running. The params are captured when an instance becomes ready and
   persisted per `args_hash` in the metrics snapshot — surviving instance
   eviction and proxy restarts — with a running instance's values taking
-  precedence. Previously the metadata reverted to `null` the moment an
-  instance was evicted, which with short idle timeouts meant it was almost
-  never visible. The persisted entry also appears in `/metrics/json` hash
-  entries. (#85)
+  precedence. The llama.cpp version is recorded alongside, and params
+  observed under a different binary than the one currently live are
+  withheld (the same launch args can resolve to different effective values
+  on another build). Previously the metadata reverted to `null` the moment
+  an instance was evicted, which with short idle timeouts meant it was
+  almost never visible. The persisted entry also appears in `/metrics/json`
+  hash entries. (#85)
 
 ### Changed
 

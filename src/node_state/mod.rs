@@ -2316,13 +2316,18 @@ impl NodeState {
 
                     // Persist the parsed params on the hash's metrics entry so
                     // /v1/models can report them after this instance is gone
-                    // (and across restarts, via the metrics snapshot).
+                    // (and across restarts, via the metrics snapshot). The
+                    // llama.cpp version is recorded alongside so values from a
+                    // different binary are not served after an upgrade.
                     if let Some(params) = inst.get_parsed_params() {
+                        let llama_cpp_version = ready_state.build_manager.get_version().await;
+                        let llama_cpp_version =
+                            (llama_cpp_version != "unknown").then_some(llama_cpp_version);
                         ready_state
                             .metrics
                             .get_hash_metrics(&inst.args_hash)
                             .await
-                            .set_parsed_params(params);
+                            .set_parsed_params(params, llama_cpp_version);
                     }
 
                     // Set eviction tenure — instance cannot be drained by competitors until this expires
