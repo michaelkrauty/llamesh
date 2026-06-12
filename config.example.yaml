@@ -181,6 +181,10 @@ cluster:
     open_duration_base_ms: 5000
     # Max backoff duration in ms with exponential backoff (default: 60000)
     open_duration_max_ms: 60000
+    # Minimum interval in ms between recovery probes once an open circuit's
+    # backoff has elapsed; limits traffic to a recovering peer until the
+    # circuit closes. 0 disables probe gating. (default: 1000)
+    half_open_probe_interval_ms: 1000
 
 # -----------------------------------------------------------------------------
 # HTTP Server Settings

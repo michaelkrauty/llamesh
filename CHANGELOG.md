@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-06-12
+
+### Fixed
+
+- The circuit breaker now recovers — and keeps blocking — through the code
+  paths production actually exercises. Its recovery transitions lived only in
+  an async entry point that no request path calls; the real gate is the
+  synchronous peer-candidate check, which never transitions state. As a
+  result an opened circuit stopped blocking permanently once its first
+  backoff window elapsed (failures while open never restarted the window or
+  escalated the backoff, so a still-down peer was retried by every request),
+  and never closed again either (successes while open were discarded, leaving
+  the circuit reported as open in metrics indefinitely and the backoff
+  escalation counter never reset). "Open with backoff elapsed" is now treated
+  as the recovery probe phase: the synchronous gate admits at most one probe
+  per `cluster.circuit_breaker.half_open_probe_interval_ms` (default 1000ms,
+  0 disables gating — this also implements the previously unenforced
+  "limited probes" half-open contract), a success recorded in that phase
+  advances the circuit toward half-open/closed, and a failure restarts the
+  block window with escalated backoff. Results arriving while the backoff is
+  still running are stale responses from requests sent before the circuit
+  opened and leave the state unchanged. (#79)
+
 ## [1.11.0] - 2026-06-12
 
 ### Added
