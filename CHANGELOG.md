@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.7] - 2026-06-12
+
+### Fixed
+
+- Concurrent requests can no longer waste a llama-server spawn racing for the
+  same capacity slot. The capacity checks (per-profile `max_instances` and
+  node-wide `max_instances_per_node`) were enforced again only *after* a new
+  process had been spawned, because the instances lock is released during the
+  slow spawn itself; two concurrent requests for the same profile could both
+  pass the checks, both spawn, and the loser killed its just-spawned process
+  at insertion time (`spawn_profile_race_detected`), wasting a process exec
+  and partial model load. Spawns now take an in-flight capacity reservation
+  while still holding the instances lock, making check-and-reserve atomic:
+  the second contender observes the reservation and queues immediately —
+  before spawning — and is served by the winner's instance as before.
+  Reservations are RAII-released on every failure path (including request
+  cancellation) and handed off when the instance is inserted into the map.
+  The post-spawn race detection remains as defense in depth, but is no longer
+  expected to fire. (#71)
+
 ## [1.10.6] - 2026-06-12
 
 ### Fixed

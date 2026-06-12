@@ -883,8 +883,13 @@ On chosen node (or standalone):
    * Dispatch the request to that instance.
 5. If no instance has capacity and total instances < `max_instances` for that profile and resource guardrails allow:
 
+   * Reserve the capacity slot (per-profile and node-wide) before releasing the
+     instances lock to spawn: in-flight spawn reservations count toward the
+     capacity checks, so a concurrent contender queues instead of spawning a
+     duplicate. Reservations are RAII-released on every failure path and handed
+     off to the instances map on successful insertion.
    * Start a new instance with spawn retry and port rotation (up to 3 retries on OS-level failure).
-   * After spawn, perform post-spawn race detection: if another request raced and consumed capacity, kill the just-spawned process to avoid waste.
+   * After spawn, perform post-spawn race detection as defense in depth: if another request somehow raced and consumed capacity, kill the just-spawned process to avoid waste (with reservations gating admission, this path is not expected to fire).
    * Queue the request until the instance is ready.
 6. If no new instance can be started (due to guardrails or `max_instances` reached):
 
