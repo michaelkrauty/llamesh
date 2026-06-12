@@ -2314,6 +2314,17 @@ impl NodeState {
                     inst.parse_and_store_startup_params();
                     inst.clear_startup_log();
 
+                    // Persist the parsed params on the hash's metrics entry so
+                    // /v1/models can report them after this instance is gone
+                    // (and across restarts, via the metrics snapshot).
+                    if let Some(params) = inst.get_parsed_params() {
+                        ready_state
+                            .metrics
+                            .get_hash_metrics(&inst.args_hash)
+                            .await
+                            .set_parsed_params(params);
+                    }
+
                     // Set eviction tenure — instance cannot be drained by competitors until this expires
                     {
                         let mut evictable = inst.evictable_after.lock();

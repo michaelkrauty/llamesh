@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::process::Stdio;
 use std::sync::atomic::AtomicBool;
@@ -16,7 +16,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Model parameters parsed from llama-server startup log.
 /// This is the ground truth for model capabilities.
-#[derive(Debug, Clone, Default, Serialize)]
+///
+/// `Deserialize` (all fields are `Option`, so missing fields are tolerated)
+/// allows these to be persisted per `args_hash` in the metrics snapshot and
+/// served from `/v1/models` when no instance is running.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ParsedModelParams {
     // Core context/batch
     pub n_ctx_train: Option<u64>,

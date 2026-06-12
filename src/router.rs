@@ -472,17 +472,23 @@ pub async fn list_models(
             let entry_id = id.clone();
 
             // Look up metrics by args_hash
-            let tps = if let Some(args_hash) = state.get_args_hash_for_key(&id).await {
-                let hash_metrics = state.metrics.get_hash_metrics(&args_hash).await;
-                hash_metrics.tokens_per_second()
-            } else {
-                0.0
-            };
+            let (tps, persisted_params) =
+                if let Some(args_hash) = state.get_args_hash_for_key(&id).await {
+                    let hash_metrics = state.metrics.get_hash_metrics(&args_hash).await;
+                    (
+                        hash_metrics.tokens_per_second(),
+                        hash_metrics.get_parsed_params(),
+                    )
+                } else {
+                    (0.0, None)
+                };
 
-            // Get parsed model params from running instance (if any)
+            // Parsed model params: prefer a running instance (freshest), fall
+            // back to the params persisted from the last instance startup.
             let parsed_params = state
                 .get_parsed_params_for_model(&model.name, &profile.id)
-                .await;
+                .await
+                .or(persisted_params);
 
             let metadata = json!({
                 "model": model.name.as_str(),

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-06-12
+
+### Added
+
+- `/v1/models` now reports `parsed_model_params` (effective context window,
+  trained context length, slot count, architecture, …) even when no instance
+  is running. The params are captured when an instance becomes ready and
+  persisted per `args_hash` in the metrics snapshot — surviving instance
+  eviction and proxy restarts — with a running instance's values taking
+  precedence. Previously the metadata reverted to `null` the moment an
+  instance was evicted, which with short idle timeouts meant it was almost
+  never visible. The persisted entry also appears in `/metrics/json` hash
+  entries. (#85)
+
+### Changed
+
+- The mock llama-server used by integration tests now emits llama-server
+  style startup log lines (`initializing slots, n_slots = …`,
+  `new slot, n_ctx = …`), so tests exercise the real startup-log parsing
+  path.
+
 ## [1.12.0] - 2026-06-12
 
 ### Added

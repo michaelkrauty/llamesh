@@ -23,6 +23,12 @@ pub struct HashMetrics {
 
     // Human-readable names that map to this hash (e.g., "gpt-oss-20b:fast")
     pub display_names: Mutex<HashSet<String>>,
+
+    /// Model parameters parsed from the most recent instance startup for this
+    /// hash. Persisted so `/v1/models` can report them when no instance is
+    /// running. The args hash pins them to the exact launch configuration:
+    /// any cookbook change that affects the params also changes the hash.
+    pub parsed_params: Mutex<Option<crate::instance::ParsedModelParams>>,
 }
 
 impl Default for HashMetrics {
@@ -38,6 +44,7 @@ impl Default for HashMetrics {
             sample_count: AtomicU64::new(0),
             last_memory_update: Mutex::new(String::new()),
             display_names: Mutex::new(HashSet::new()),
+            parsed_params: Mutex::new(None),
         }
     }
 }
@@ -61,6 +68,19 @@ impl HashMetrics {
 
     pub fn add_display_name(&self, name: &str) {
         self.display_names.lock().insert(name.to_string());
+    }
+
+    /// Record the model parameters parsed from an instance startup log.
+    /// The latest parse wins: params come from the running binary, so a
+    /// llama.cpp upgrade can legitimately change them for the same hash.
+    pub fn set_parsed_params(&self, params: crate::instance::ParsedModelParams) {
+        *self.parsed_params.lock() = Some(params);
+    }
+
+    /// Get the persisted model parameters for this hash, if any instance for
+    /// it has ever become ready.
+    pub fn get_parsed_params(&self) -> Option<crate::instance::ParsedModelParams> {
+        self.parsed_params.lock().clone()
     }
 
     /// Get tokens per second based on accumulated metrics.
@@ -219,6 +239,10 @@ pub struct HashMetricsSnapshot {
     pub peak_vram_mb: u64,
     pub peak_sysmem_mb: u64,
     pub sample_count: u64,
+    /// Parsed model params from the most recent instance startup.
+    /// `#[serde(default)]` keeps snapshots written by older versions loadable.
+    #[serde(default)]
+    pub parsed_model_params: Option<crate::instance::ParsedModelParams>,
 }
 
 impl Metrics {
@@ -270,6 +294,7 @@ impl Metrics {
                 sample_count: AtomicU64::new(v.sample_count),
                 last_memory_update: Mutex::new(String::new()),
                 display_names: Mutex::new(v.display_names.into_iter().collect()),
+                parsed_params: Mutex::new(v.parsed_model_params),
             };
             map.insert(hash, Arc::new(hm));
         }
@@ -471,6 +496,7 @@ impl Metrics {
                     peak_vram_mb: v.peak_vram_mb.load(Ordering::Relaxed),
                     peak_sysmem_mb: v.peak_sysmem_mb.load(Ordering::Relaxed),
                     sample_count: v.sample_count.load(Ordering::Relaxed),
+                    parsed_model_params: v.parsed_params.lock().clone(),
                 },
             );
         }
@@ -1057,6 +1083,60 @@ mod tests {
             serde_json::from_str(legacy).expect("legacy snapshot should deserialize");
         assert_eq!(snapshot.version, "");
         assert_eq!(snapshot.requests_total, 7);
+    }
+
+    #[tokio::test]
+    async fn test_parsed_params_survive_snapshot_round_trip() {
+        let metrics = Metrics::new();
+        let params = crate::instance::ParsedModelParams {
+            n_ctx: Some(4096),
+            n_ctx_train: Some(131072),
+            n_slots: Some(4),
+            arch: Some("llama".to_string()),
+            ..Default::default()
+        };
+        metrics
+            .get_hash_metrics("hash-a")
+            .await
+            .set_parsed_params(params);
+
+        let snapshot = metrics
+            .snapshot("node-a".to_string(), "llama".to_string(), None)
+            .await;
+        // Through the exact persistence format (serde), as load() would see it.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored_snapshot: MetricsSnapshot = serde_json::from_str(&json).unwrap();
+        let restored = Metrics::from_snapshot(restored_snapshot);
+
+        let params = restored
+            .get_hash_metrics("hash-a")
+            .await
+            .get_parsed_params()
+            .expect("parsed params should survive the snapshot round trip");
+        assert_eq!(params.n_ctx, Some(4096));
+        assert_eq!(params.n_ctx_train, Some(131072));
+        assert_eq!(params.n_slots, Some(4));
+        assert_eq!(params.arch.as_deref(), Some("llama"));
+    }
+
+    #[test]
+    fn test_hash_snapshot_deserializes_without_parsed_params() {
+        // Hash entries persisted by versions predating `parsed_model_params`
+        // must still load (the field is `#[serde(default)]`).
+        let legacy = r#"{
+            "display_names": ["m:default"],
+            "requests_total": 3,
+            "errors_total": 0,
+            "tokens_generated_total": 30,
+            "avg_latency_ms": 10.0,
+            "peak_vram_mb": 1000,
+            "peak_sysmem_mb": 2000,
+            "sample_count": 2
+        }"#;
+        let snapshot: HashMetricsSnapshot =
+            serde_json::from_str(legacy).expect("legacy hash snapshot should deserialize");
+        assert!(snapshot.parsed_model_params.is_none());
+        assert_eq!(snapshot.requests_total, 3);
     }
 
     #[tokio::test]
