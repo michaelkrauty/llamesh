@@ -45,12 +45,24 @@ impl SpawnReservations {
     /// Call only while holding the `instances` write lock, so that the
     /// capacity check and the reservation form one atomic step with respect
     /// to other spawners.
-    pub fn reserve(self: &Arc<Self>, key: String) -> SpawnReservation {
+    ///
+    /// `on_abandon` runs when the guard is dropped without a prior
+    /// [`SpawnReservation::handoff`] — i.e. the spawn failed or the request
+    /// was cancelled. Concurrent requests may have queued *because of* this
+    /// reservation, and no instance will ever be inserted to wake them, so
+    /// the callback must wake queued waiters (it runs from a synchronous
+    /// `Drop`; spawn a task for async work).
+    pub fn reserve(
+        self: &Arc<Self>,
+        key: String,
+        on_abandon: Option<Box<dyn FnOnce() + Send>>,
+    ) -> SpawnReservation {
         *self.by_profile.lock().entry(key.clone()).or_insert(0) += 1;
         SpawnReservation {
             reservations: self.clone(),
             key,
             released: false,
+            on_abandon,
         }
     }
 
@@ -68,31 +80,47 @@ impl SpawnReservations {
 
 /// RAII guard for one reserved spawn.
 ///
-/// Dropping the guard releases the reservation, which covers every error
-/// path and future cancellation. When the spawned instance has been inserted
-/// into the instances map, call [`SpawnReservation::release`] at the
-/// insertion site (while still holding the `instances` write lock): from that
-/// moment the instance is counted via the map, and keeping the reservation
-/// would double-count it.
+/// When the spawned instance has been inserted into the instances map, call
+/// [`SpawnReservation::handoff`] at the insertion site (while still holding
+/// the `instances` write lock): from that moment the instance is counted via
+/// the map, and keeping the reservation would double-count it.
+///
+/// Dropping the guard without a prior hand-off releases the reservation and
+/// runs the `on_abandon` callback — this covers every error path and future
+/// cancellation, where capacity frees up without an instance ever reaching
+/// the map.
 pub struct SpawnReservation {
     reservations: Arc<SpawnReservations>,
     key: String,
     released: bool,
+    on_abandon: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl SpawnReservation {
-    /// Releases the reservation. Idempotent; `Drop` becomes a no-op after.
-    pub fn release(&mut self) {
-        if !self.released {
-            self.released = true;
-            self.reservations.release_one(&self.key);
+    /// Releases the reservation without running `on_abandon`: the spawned
+    /// instance is now in the instances map and provides the capacity this
+    /// reservation was holding. Idempotent; `Drop` becomes a no-op after.
+    pub fn handoff(&mut self) {
+        self.finish(false);
+    }
+
+    fn finish(&mut self, abandoned: bool) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        self.reservations.release_one(&self.key);
+        if abandoned {
+            if let Some(callback) = self.on_abandon.take() {
+                callback();
+            }
         }
     }
 }
 
 impl Drop for SpawnReservation {
     fn drop(&mut self) {
-        self.release();
+        self.finish(true);
     }
 }
 
@@ -106,7 +134,7 @@ mod tests {
         assert_eq!(reservations.profile_count("m:p"), 0);
         assert_eq!(reservations.node_total(), 0);
 
-        let guard = reservations.reserve("m:p".to_string());
+        let guard = reservations.reserve("m:p".to_string(), None);
         assert_eq!(reservations.profile_count("m:p"), 1);
         assert_eq!(reservations.node_total(), 1);
 
@@ -116,12 +144,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_release_makes_drop_a_no_op() {
+    fn explicit_handoff_makes_drop_a_no_op() {
         let reservations = Arc::new(SpawnReservations::default());
-        let mut guard = reservations.reserve("m:p".to_string());
-        guard.release();
+        let mut guard = reservations.reserve("m:p".to_string(), None);
+        guard.handoff();
         assert_eq!(reservations.profile_count("m:p"), 0);
-        guard.release();
+        guard.handoff();
         assert_eq!(reservations.profile_count("m:p"), 0);
         drop(guard);
         assert_eq!(reservations.profile_count("m:p"), 0);
@@ -129,11 +157,44 @@ mod tests {
     }
 
     #[test]
+    fn on_abandon_runs_on_drop_but_not_on_handoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let reservations = Arc::new(SpawnReservations::default());
+        let abandoned = Arc::new(AtomicUsize::new(0));
+
+        // Dropped without hand-off → callback runs exactly once.
+        let counter = abandoned.clone();
+        let guard = reservations.reserve(
+            "m:p".to_string(),
+            Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        drop(guard);
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        assert_eq!(reservations.profile_count("m:p"), 0);
+
+        // Handed off → callback must NOT run, neither at handoff nor at drop.
+        let counter = abandoned.clone();
+        let mut guard = reservations.reserve(
+            "m:p".to_string(),
+            Some(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })),
+        );
+        guard.handoff();
+        drop(guard);
+        assert_eq!(abandoned.load(Ordering::SeqCst), 1);
+        assert_eq!(reservations.profile_count("m:p"), 0);
+    }
+
+    #[test]
     fn counts_are_per_key_and_stack() {
         let reservations = Arc::new(SpawnReservations::default());
-        let g1 = reservations.reserve("m:a".to_string());
-        let g2 = reservations.reserve("m:a".to_string());
-        let g3 = reservations.reserve("m:b".to_string());
+        let g1 = reservations.reserve("m:a".to_string(), None);
+        let g2 = reservations.reserve("m:a".to_string(), None);
+        let g3 = reservations.reserve("m:b".to_string(), None);
 
         assert_eq!(reservations.profile_count("m:a"), 2);
         assert_eq!(reservations.profile_count("m:b"), 1);

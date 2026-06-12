@@ -24,8 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before spawning — and is served by the winner's instance as before.
   Reservations are RAII-released on every failure path (including request
   cancellation) and handed off when the instance is inserted into the map.
-  The post-spawn race detection remains as defense in depth, but is no longer
-  expected to fire. (#71)
+  Because queued contenders now depend on the in-flight spawn resolving,
+  both resolutions wake them: an abandoned reservation (spawn failure or
+  cancellation) notifies all queues, since capacity freed without any
+  instance reaching the map and no later event would do it; and an instance
+  becoming ready notifies one queued waiter for its model and profile, which
+  may attach to the ready instance's spare concurrency slots instead of
+  sleeping until an unrelated slot-release event. The post-spawn race
+  detection remains as defense in depth, but is no longer expected to
+  fire. (#71)
 
 ## [1.10.6] - 2026-06-12
 

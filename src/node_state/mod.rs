@@ -1978,9 +1978,23 @@ impl NodeState {
             // Reserve the slot before releasing the write lock so concurrent
             // contenders see this in-flight spawn in the checks above. The
             // guard releases on every error/cancellation path; on success it
-            // is released at map insertion, where the instance starts being
-            // counted via the map instead.
-            let mut spawn_reservation = self.spawn_reservations.reserve(profile_key);
+            // is handed off at map insertion, where the instance starts being
+            // counted via the map instead. On abandonment (spawn failure or
+            // request cancellation) capacity frees up without any instance
+            // reaching the map, so no later slot-release or termination event
+            // would ever wake requests that queued because of this
+            // reservation — wake them here. Drop is sync and the queue locks
+            // are async, so the work happens in a spawned task (same pattern
+            // as SlotReleaseGuard).
+            let abandon_state = self.clone();
+            let mut spawn_reservation = self.spawn_reservations.reserve(
+                profile_key,
+                Some(Box::new(move || {
+                    tokio::spawn(async move {
+                        abandon_state.notify_all_queues().await;
+                    });
+                })),
+            );
 
             // Release outer write lock before entering retry loop (will re-acquire as needed)
             drop(instances_map);
@@ -2095,7 +2109,7 @@ impl NodeState {
                         // The instance is now counted via the map; release the
                         // reservation while still holding the lock so the
                         // hand-off is atomic for concurrent capacity checks.
-                        spawn_reservation.release();
+                        spawn_reservation.handoff();
                         drop(instances_map);
                         self.update_peak_memory(model_name, &profile.id).await;
                         // Success - break out of retry loop with args
@@ -2153,6 +2167,9 @@ impl NodeState {
             let model_key = format!("{}:{}", model_name, profile.id);
             let args_hash_clone = args_hash.clone();
             let is_cold = is_cold_start;
+            let ready_state = self.clone();
+            let ready_model = model_name.to_string();
+            let ready_profile = profile.id.clone();
             tokio::spawn(async move {
                 let inst = inst_clone.read().await;
                 if let Err(e) = inst
@@ -2181,6 +2198,13 @@ impl NodeState {
 
                     // Trigger instant gossip so peers learn about new model availability
                     gossip_trigger.notify_one();
+
+                    // Wake one queued waiter for this model:profile. A request
+                    // that queued while this spawn was in flight (gated by
+                    // the spawn reservation) would otherwise sleep until some
+                    // unrelated slot-release event, even though the instance
+                    // is now ready and may have spare concurrency slots.
+                    ready_state.notify_queue(&ready_model, &ready_profile).await;
 
                     if is_cold {
                         // Cold start: sample memory after ready and store learned value
@@ -3721,7 +3745,9 @@ mod tests {
         // Simulate a concurrent request mid-spawn: its capacity checks have
         // passed and its reservation is held, but its instance has not
         // reached the instances map yet.
-        let guard = state.spawn_reservations.reserve("test:default".to_string());
+        let guard = state
+            .spawn_reservations
+            .reserve("test:default".to_string(), None);
 
         let err = state
             .try_get_or_spawn("test", &profile, false, "test", false)
@@ -3770,7 +3796,7 @@ mod tests {
         // slot. It is not in the map, so it cannot be evicted to make room.
         let _guard = state
             .spawn_reservations
-            .reserve("other-model:default".to_string());
+            .reserve("other-model:default".to_string(), None);
 
         let err = state
             .try_get_or_spawn("test", &profile, false, "test", false)
