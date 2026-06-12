@@ -247,11 +247,13 @@ async fn attempt_peer_forward(
     // Pass through streaming successful responses without buffering. A 5xx
     // never opens a stream because the peer commits to its response shape
     // before opening one — error responses are always non-streaming JSON.
-    // The status is recorded at stream handoff; for non-streaming responses
-    // recording waits until the body is buffered, so a body-read failure is
-    // recorded as the probe's failure rather than a premature success.
+    // Streaming successes are recorded WITHOUT the probe ticket: only the
+    // headers have arrived, the stream can still fail mid-body, and a stream
+    // failure is never recorded — so headers alone must not drive a
+    // recovering circuit toward closed. Recovery is carried by non-streaming
+    // probes and the gossip prober instead.
     if response_streaming && status.is_success() {
-        record_peer_status(state, peer_id, status, probe_ticket).await;
+        record_peer_status(state, peer_id, status, false).await;
         return ForwardOutcome::StreamingSurface(resp);
     }
 
@@ -696,7 +698,31 @@ pub async fn route_request(
                         model = %model_to_use,
                         "All peers advertising model are currently unavailable, waiting for cluster capacity"
                     );
-                    wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+                    // During a probe-denial episode (the excluded recovering
+                    // peer may be the only one advertising the model) the
+                    // probe slot frees by time passing, so bound the wait by
+                    // the probe deadline instead of relying on a Notify.
+                    if last_probe_denied.is_some() {
+                        let probe_deadline = Duration::from_millis(
+                            state
+                                .config
+                                .cluster
+                                .circuit_breaker
+                                .half_open_probe_interval_ms
+                                .max(250),
+                        );
+                        if let Ok(res) = tokio::time::timeout(
+                            probe_deadline,
+                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
+                        )
+                        .await
+                        {
+                            res?;
+                        }
+                    } else {
+                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle)
+                            .await?;
+                    }
                     continue;
                 };
 
@@ -1177,7 +1203,16 @@ pub async fn route_request(
                                         PeerResponse::Http(resp) => resp.status(),
                                         PeerResponse::Noise { status, .. } => *status,
                                     };
-                                    record_peer_status(&state, &peer.node_id, status, probe_ticket)
+                                    // Successes are recorded without the
+                                    // probe ticket here: the body has not
+                                    // been read yet (it streams to the
+                                    // client below), so headers alone must
+                                    // not drive recovery. Failure statuses
+                                    // keep the ticket so a failed probe
+                                    // escalates the block window.
+                                    let attribution =
+                                        probe_ticket && peer_status_is_failure(status);
+                                    record_peer_status(&state, &peer.node_id, status, attribution)
                                         .await;
 
                                     let tokens_counter = Arc::new(AtomicU64::new(0));
@@ -1523,7 +1558,30 @@ pub async fn route_request(
                         model = %model_name,
                         "No node available during retry, waiting for cluster capacity"
                     );
-                    wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+                    // During a probe-denial episode the excluded recovering
+                    // peer may be the only candidate; its probe slot frees by
+                    // time passing, so bound the wait by the probe deadline.
+                    if last_probe_denied.is_some() {
+                        let probe_deadline = Duration::from_millis(
+                            state
+                                .config
+                                .cluster
+                                .circuit_breaker
+                                .half_open_probe_interval_ms
+                                .max(250),
+                        );
+                        if let Ok(res) = tokio::time::timeout(
+                            probe_deadline,
+                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
+                        )
+                        .await
+                        {
+                            res?;
+                        }
+                    } else {
+                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle)
+                            .await?;
+                    }
                 };
             }
         }
