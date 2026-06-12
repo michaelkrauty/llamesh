@@ -1,6 +1,6 @@
 [package]
 name = "llamesh"
-version = "1.10.8"
+version = "1.10.9"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"

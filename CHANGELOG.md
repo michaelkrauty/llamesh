@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.9] - 2026-06-12
+
+### Fixed
+
+- Protocol detection no longer misclassifies connections whose first TCP
+  segment carries fewer bytes than the protocol signature needs. Detection
+  peeked the socket once and classified whatever had arrived: a fragmented
+  TLS ClientHello delivering only its first byte (`0x16`) was classified as
+  a Noise handshake, and a lone `P` was classified as HTTP/1.x even when it
+  began an HTTP/2 connection preface (`PRI `). Detection now waits for more
+  bytes whenever the peeked prefix is a proper prefix of more than one
+  signature, still bounded by the existing `protocol_detect_timeout_ms`
+  (clients that stall mid-prefix are closed at the timeout, as before).
+  Unambiguous prefixes are still classified immediately from the first
+  byte. (#75)
+
+### Documentation
+
+- README endpoint table: added `GET /version` and the `/health`,
+  `/v1/reranking`, and `/rerank` aliases.
+
 ## [1.10.8] - 2026-06-12
 
 ### Changed
