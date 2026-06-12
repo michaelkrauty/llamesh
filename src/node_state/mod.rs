@@ -1286,6 +1286,19 @@ impl NodeState {
                     if let Some(mut token) = my_token.take() {
                         token.release().await;
                     }
+                    // A waiter can be woken just before its deadline and hit
+                    // this check on the next iteration, before re-queueing.
+                    // If this request waited in a queue at any point, that is
+                    // a queue timeout exactly like the in-queue expiries
+                    // below — log and count it the same way. (Requests that
+                    // never queued and exhaust the deadline in retry loops
+                    // keep returning QueueTimeout without a queue_drop
+                    // event, as before.)
+                    if queue_start.is_some() {
+                        info!(event = "queue_drop", reason = "timeout", model = %model_name);
+                        self.metrics
+                            .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
+                    }
                     return Err(NodeError::QueueTimeout);
                 }
             }
