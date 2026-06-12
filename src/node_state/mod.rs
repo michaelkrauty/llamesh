@@ -2122,6 +2122,15 @@ impl NodeState {
                 // Check if this is a cold start (no learned memory for this args_hash)
                 let is_cold_start = !self.metrics.has_memory_data(&args_hash).await;
 
+                // Capture the llama.cpp version before the process is spawned:
+                // a rebuild can swap the live binary while this instance is
+                // still loading, and the parsed params persisted at readiness
+                // must be attributed to the binary the process was actually
+                // exec'd from, not whatever is live by then.
+                let llama_cpp_version = self.build_manager.get_version().await;
+                let llama_cpp_version =
+                    (llama_cpp_version != "unknown").then_some(llama_cpp_version);
+
                 let mut new_instance = Instance::new(
                     instance_id.clone(),
                     model_name.to_string(),
@@ -2131,6 +2140,7 @@ impl NodeState {
                     args_hash.clone(),
                     is_cold_start,
                 );
+                new_instance.llama_cpp_version = llama_cpp_version;
                 if reserve_slot {
                     // Claim the spawning request's slot before the instance
                     // is shared: once it is in the map, concurrent requests
@@ -2317,17 +2327,17 @@ impl NodeState {
                     // Persist the parsed params on the hash's metrics entry so
                     // /v1/models can report them after this instance is gone
                     // (and across restarts, via the metrics snapshot). The
-                    // llama.cpp version is recorded alongside so values from a
-                    // different binary are not served after an upgrade.
+                    // llama.cpp version captured at spawn time is recorded
+                    // alongside so values from a different binary are not
+                    // served after an upgrade — reading the version here
+                    // instead would mislabel the params if a rebuild swapped
+                    // the binary while this instance was loading.
                     if let Some(params) = inst.get_parsed_params() {
-                        let llama_cpp_version = ready_state.build_manager.get_version().await;
-                        let llama_cpp_version =
-                            (llama_cpp_version != "unknown").then_some(llama_cpp_version);
                         ready_state
                             .metrics
                             .get_hash_metrics(&inst.args_hash)
                             .await
-                            .set_parsed_params(params, llama_cpp_version);
+                            .set_parsed_params(params, inst.llama_cpp_version.clone());
                     }
 
                     // Set eviction tenure — instance cannot be drained by competitors until this expires

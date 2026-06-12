@@ -246,6 +246,12 @@ pub struct Instance {
     /// Earliest time this instance can be drained for a competing model.
     /// Set to `now() + tenure` when instance reaches Ready.
     pub evictable_after: Mutex<Option<Instant>>,
+    /// llama.cpp version (commit) recorded at spawn time — i.e. of the binary
+    /// this process was exec'd from. Captured before the spawn rather than at
+    /// readiness because a rebuild can swap the live binary while the model is
+    /// still loading; parsed params must be attributed to the binary that
+    /// actually produced them. `None` when no version was recorded.
+    pub llama_cpp_version: Option<String>,
 }
 
 impl Drop for Instance {
@@ -306,6 +312,7 @@ impl Instance {
             is_cold_start,
             draining: AtomicBool::new(false),
             evictable_after: Mutex::new(None),
+            llama_cpp_version: None,
         }
     }
 
