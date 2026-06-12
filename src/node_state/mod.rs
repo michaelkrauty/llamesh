@@ -2120,7 +2120,15 @@ impl NodeState {
                         // hand-off is atomic for concurrent capacity checks.
                         spawn_reservation.handoff();
                         drop(instances_map);
-                        self.update_peak_memory(model_name, &profile.id).await;
+                        // INVARIANT: no awaits between the map insertion above
+                        // and this function's return. The spawning request's
+                        // in_flight slot was pre-claimed on the instance, and
+                        // the SlotReleaseGuard protecting it is only created
+                        // by the caller after we return (in the same poll);
+                        // an await here would open a cancellation window that
+                        // leaks the claimed slot on a mapped instance,
+                        // permanently blocking idle eviction. update_peak_memory
+                        // runs in the readiness task instead.
                         // Success - break out of retry loop with args
                         break (instance_id, port, inst_arc, is_cold_start, args);
                     }
@@ -2180,6 +2188,16 @@ impl NodeState {
             let ready_model = model_name.to_string();
             let ready_profile = profile.id.clone();
             tokio::spawn(async move {
+                // Refresh peak-memory accounting for this model's instances.
+                // Runs here (not inline after insertion) so the spawn path
+                // stays await-free between map insertion and returning the
+                // pre-claimed slot to the caller — see the INVARIANT comment
+                // at the insertion site. LOCK_ORDER: must run before the
+                // instance read guard below (instances is lock 1).
+                ready_state
+                    .update_peak_memory(&ready_model, &ready_profile)
+                    .await;
+
                 let inst = inst_clone.read().await;
                 if let Err(e) = inst
                     .wait_for_ready(startup_timeout, api_key, &http_client)
