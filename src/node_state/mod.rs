@@ -1631,6 +1631,40 @@ impl NodeState {
                             self.needs_eviction.write().await.insert(key.clone());
                         }
 
+                        // Close the lost-wake window for reservation-gated
+                        // blocks: an in-flight spawn whose reservation tipped
+                        // the capacity check above may have been abandoned
+                        // before this request became visible in the queue, in
+                        // which case its abandon notification found nobody to
+                        // wake. Now that we are enqueued, re-check the gate
+                        // and wake the queue's front waiter if it cleared.
+                        if matches!(
+                            e,
+                            NodeError::MaxInstancesProfile | NodeError::MaxInstancesNode
+                        ) {
+                            let gate_cleared = {
+                                let instances_map = self.instances.read().await;
+                                let profile_count = Self::count_profile_instances(
+                                    &instances_map,
+                                    model_name,
+                                    &profile.id,
+                                )
+                                .await;
+                                let max_instances =
+                                    profile.effective_max_instances(&self.config.model_defaults);
+                                let profile_ok = profile_count
+                                    + self.spawn_reservations.profile_count(&key)
+                                    < max_instances;
+                                let node_ok = instances_map.len()
+                                    + self.spawn_reservations.node_total()
+                                    < self.config.max_instances_per_node;
+                                profile_ok && node_ok
+                            };
+                            if gate_cleared {
+                                self.notify_queue(model_name, &profile.id).await;
+                            }
+                        }
+
                         // Wait for queue notification with optional timeout
                         let wait_result = match queue_timeout {
                             Some(timeout) => {
@@ -1991,6 +2025,10 @@ impl NodeState {
                 profile_key,
                 Some(Box::new(move || {
                     tokio::spawn(async move {
+                        // Drains scheduled because this reservation occupied
+                        // node capacity may no longer be needed; re-evaluate
+                        // before waking waiters.
+                        abandon_state.maybe_cancel_drains().await;
                         abandon_state.notify_all_queues().await;
                     });
                 })),

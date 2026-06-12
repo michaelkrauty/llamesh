@@ -31,12 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   becoming ready wakes queued waiters for its model and profile up to its
   spare concurrency slots; and a failed startup triggers an immediate
   eviction pass (which removes the dead instance and notifies all queues)
-  instead of leaving waiters to the next periodic eviction tick. The
-  spawning request's own concurrency slot is also now claimed before the
-  instance is shared, closing a window where a concurrently attaching
-  request's increment could be overwritten and the instance permanently
-  undercounted. The post-spawn race detection remains as defense in depth,
-  but is no longer expected to fire. (#71)
+  instead of leaving waiters to the next periodic eviction tick; and a
+  request that enqueues after being gated by a reservation re-checks the
+  gate once it is visible in the queue, closing the window where an abandon
+  notification fires before the loser has enqueued. The spawning request's
+  own concurrency slot is also now claimed before the instance is shared,
+  closing a window where a concurrently attaching request's increment could
+  be overwritten and the instance permanently undercounted. The post-spawn
+  race detection remains as defense in depth, but is no longer expected to
+  fire. (#71)
 
 ## [1.10.6] - 2026-06-12
 
