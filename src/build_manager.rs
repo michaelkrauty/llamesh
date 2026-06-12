@@ -622,6 +622,22 @@ where
     }
 }
 
+/// Derive the llama.cpp commit from a *resolved* managed-build binary path.
+///
+/// Managed builds live in `<base>-<commit>/bin/llama-server` (the same
+/// `<commit>` that `record_running_version` stores), so the commit can be read
+/// off the path of the executable a process was actually spawned from —
+/// immune to a concurrent symlink swap, and available before the startup
+/// build check has recorded a version. Returns `None` for paths that don't
+/// match the managed-build layout (e.g. hand-supplied binaries).
+pub fn version_from_resolved_binary(path: &std::path::Path) -> Option<String> {
+    let bin_dir = path.parent()?;
+    let build_dir = bin_dir.parent()?.file_name()?.to_str()?;
+    let (_, commit) = build_dir.rsplit_once('-')?;
+    let looks_like_commit = commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit());
+    looks_like_commit.then(|| commit.to_string())
+}
+
 /// Reads lines from a child process stream, echoing each to the parent's
 /// stdout/stderr (so build output keeps appearing in the supervisor log, as
 /// it did with inherited stdio) while retaining a bounded tail of recent
@@ -744,6 +760,45 @@ async fn run_command(cmd: &mut Command) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_version_from_resolved_binary() {
+        let p = std::path::Path::new("/srv/llama.cpp/build-e37abd6b5/bin/llama-server");
+        assert_eq!(
+            version_from_resolved_binary(p).as_deref(),
+            Some("e37abd6b5")
+        );
+
+        // Base name containing dashes: the commit is the suffix after the
+        // last dash.
+        let p = std::path::Path::new("/x/my-build-dir-cd5044661/bin/llama-server");
+        assert_eq!(
+            version_from_resolved_binary(p).as_deref(),
+            Some("cd5044661")
+        );
+
+        // Non-hex or too-short suffixes are not commits.
+        assert_eq!(
+            version_from_resolved_binary(std::path::Path::new(
+                "/opt/llama-builds/bin/llama-server"
+            )),
+            None
+        );
+        assert_eq!(
+            version_from_resolved_binary(std::path::Path::new("/opt/build-v2/bin/llama-server")),
+            None
+        );
+
+        // Hand-supplied binaries without the managed layout.
+        assert_eq!(
+            version_from_resolved_binary(std::path::Path::new("/usr/local/bin/llama-server")),
+            None
+        );
+        assert_eq!(
+            version_from_resolved_binary(std::path::Path::new("llama-server")),
+            None
+        );
+    }
 
     #[tokio::test]
     async fn test_build_manager_flow() {

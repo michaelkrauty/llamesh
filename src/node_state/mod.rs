@@ -2122,14 +2122,22 @@ impl NodeState {
                 // Check if this is a cold start (no learned memory for this args_hash)
                 let is_cold_start = !self.metrics.has_memory_data(&args_hash).await;
 
-                // Capture the llama.cpp version before the process is spawned:
-                // a rebuild can swap the live binary while this instance is
-                // still loading, and the parsed params persisted at readiness
-                // must be attributed to the binary the process was actually
-                // exec'd from, not whatever is live by then.
-                let llama_cpp_version = self.build_manager.get_version().await;
-                let llama_cpp_version =
-                    (llama_cpp_version != "unknown").then_some(llama_cpp_version);
+                // Resolve the binary path once and exec the resolved path, so
+                // a concurrent rebuild's symlink swap cannot split the version
+                // attribution from the binary the process actually runs. The
+                // llama.cpp version is derived from the resolved managed-build
+                // directory name itself (".../<base>-<commit>/bin/..."), which
+                // also attributes correctly during the startup window before
+                // the build check has recorded a version. Unmanaged binaries
+                // (no managed-build layout) yield None.
+                let configured_binary = self.config.llama_cpp.binary_path.clone();
+                let resolved_binary = tokio::fs::canonicalize(&configured_binary)
+                    .await
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(configured_binary);
+                let llama_cpp_version = crate::build_manager::version_from_resolved_binary(
+                    std::path::Path::new(&resolved_binary),
+                );
 
                 let mut new_instance = Instance::new(
                     instance_id.clone(),
@@ -2156,7 +2164,7 @@ impl NodeState {
                 // where is_alive() returns false because child is None
                 let spawn_result = {
                     let inst = inst_arc.read().await;
-                    inst.spawn(&self.config.llama_cpp.binary_path, &args)
+                    inst.spawn(&resolved_binary, &args)
                 };
 
                 match spawn_result {
@@ -2382,6 +2390,12 @@ impl NodeState {
                     {
                         woken += 1;
                     }
+
+                    // Persist immediately rather than waiting for the periodic
+                    // loop: a restart inside the persistence interval would
+                    // otherwise drop the just-recorded parsed params (and this
+                    // instance's display-name/request accounting) on the floor.
+                    ready_state.persist_metrics_snapshot().await;
 
                     if is_cold {
                         // Cold start: sample memory after ready and store learned value
@@ -3109,6 +3123,32 @@ impl NodeState {
         }
     }
 
+    /// Write the metrics snapshot to `metrics_path` (atomic write-then-rename).
+    /// Called by the periodic background loop and immediately after events
+    /// whose data would otherwise be lost to a restart inside the persistence
+    /// interval (e.g. newly recorded parsed model params).
+    pub async fn persist_metrics_snapshot(&self) {
+        let version = self.build_manager.get_version().await;
+        let build_status = self.build_manager.build_status();
+        let snapshot = self
+            .metrics
+            .snapshot(self.config.node_id.clone(), version, Some(build_status))
+            .await;
+        let path = std::path::Path::new(&self.config.metrics_path);
+        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+            // Atomic write: write to temp file then rename
+            let tmp_path = path.with_extension("tmp");
+            if tokio::fs::write(&tmp_path, json).await.is_ok() {
+                if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+                    tracing::warn!(
+                        "Failed to rename metrics file: {}. Metrics file may be stale.",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn run_background_tasks(self: Arc<Self>) {
         info!("Starting background tasks loop");
         loop {
@@ -3124,25 +3164,7 @@ impl NodeState {
             }
 
             // Metrics Persistence
-            let version = self.build_manager.get_version().await;
-            let build_status = self.build_manager.build_status();
-            let snapshot = self
-                .metrics
-                .snapshot(self.config.node_id.clone(), version, Some(build_status))
-                .await;
-            let path = std::path::Path::new(&self.config.metrics_path);
-            if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-                // Atomic write: write to temp file then rename
-                let tmp_path = path.with_extension("tmp");
-                if tokio::fs::write(&tmp_path, json).await.is_ok() {
-                    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
-                        tracing::warn!(
-                            "Failed to rename metrics file: {}. Metrics file may be stale.",
-                            e
-                        );
-                    }
-                }
-            }
+            self.persist_metrics_snapshot().await;
         }
     }
 
