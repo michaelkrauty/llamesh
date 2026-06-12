@@ -137,9 +137,12 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
             // open is attributed as a recovery probe result; without traffic,
             // this is what closes the circuit after a peer comes back. When
             // the claim is denied (a routed request's probe is in flight),
-            // this round's result is NOT recorded — recording it would
-            // consume the in-flight probe's attribution ticket.
-            let gossip_probe_claimed = circuit_breaker.try_claim_dispatch_sync(&cb_key);
+            // this round's result carries no ticket and cannot drive
+            // recovery, but closed-circuit failure counting still works.
+            let gossip_probe_ticket = matches!(
+                circuit_breaker.try_claim_dispatch_sync(&cb_key),
+                crate::circuit_breaker::DispatchDecision::Admit { probe_ticket: true }
+            );
 
             // Spawn each gossip request to avoid head-of-line blocking in the loop
             tokio::spawn(async move {
@@ -179,15 +182,16 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                         }
                                     }
                                     if (200..300).contains(&status) {
-                                        if gossip_probe_claimed
-                                            && circuit_breaker.record_success(&cb_key).await
+                                        if circuit_breaker
+                                            .record_success(&cb_key, gossip_probe_ticket)
+                                            .await
                                         {
                                             capacity_notify.notify_waiters();
                                         }
                                     } else {
-                                        if gossip_probe_claimed {
-                                            circuit_breaker.record_failure(&cb_key).await;
-                                        }
+                                        circuit_breaker
+                                            .record_failure(&cb_key, gossip_probe_ticket)
+                                            .await;
                                         debug!(
                                             "Failed to gossip to {} over Noise: HTTP {}",
                                             peer_url, status
@@ -195,17 +199,17 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                     }
                                 }
                                 Err(e) => {
-                                    if gossip_probe_claimed {
-                                        circuit_breaker.record_failure(&cb_key).await;
-                                    }
+                                    circuit_breaker
+                                        .record_failure(&cb_key, gossip_probe_ticket)
+                                        .await;
                                     debug!("Failed to gossip to {} over Noise: {}", peer_url, e);
                                 }
                             }
                         }
                         Err(e) => {
-                            if gossip_probe_claimed {
-                                circuit_breaker.record_failure(&cb_key).await;
-                            }
+                            circuit_breaker
+                                .record_failure(&cb_key, gossip_probe_ticket)
+                                .await;
                             debug!("Failed to serialize gossip for {}: {}", peer_url, e);
                         }
                     }
@@ -214,22 +218,24 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                         Ok(resp) if resp.status().is_success() => {
                             // Record success - resets failure count, and on a
                             // recovery transition wakes parked routing waiters.
-                            if gossip_probe_claimed && circuit_breaker.record_success(&cb_key).await
+                            if circuit_breaker
+                                .record_success(&cb_key, gossip_probe_ticket)
+                                .await
                             {
                                 capacity_notify.notify_waiters();
                             }
                         }
                         Ok(resp) => {
-                            if gossip_probe_claimed {
-                                circuit_breaker.record_failure(&cb_key).await;
-                            }
+                            circuit_breaker
+                                .record_failure(&cb_key, gossip_probe_ticket)
+                                .await;
                             debug!("Failed to gossip to {}: HTTP {}", url, resp.status());
                         }
                         Err(e) => {
                             // Record failure - circuit breaker handles escalation and logging
-                            if gossip_probe_claimed {
-                                circuit_breaker.record_failure(&cb_key).await;
-                            }
+                            circuit_breaker
+                                .record_failure(&cb_key, gossip_probe_ticket)
+                                .await;
                             debug!("Failed to gossip to {}: {}", url, e);
                         }
                     }

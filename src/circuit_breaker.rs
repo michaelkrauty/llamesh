@@ -27,6 +27,21 @@ pub enum CircuitState {
     HalfOpen,
 }
 
+/// Outcome of a dispatch admission check against a peer's circuit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchDecision {
+    /// Send the request. `probe_ticket` is true when this dispatch is a
+    /// recovery probe for an open/half-open circuit: the caller must pass it
+    /// to `record_success`/`record_failure` so the result is attributed to
+    /// this specific dispatch. Results without a ticket never drive
+    /// recovery, which keeps late responses from requests sent before the
+    /// circuit opened from recovering (or re-blocking) a peer.
+    Admit { probe_ticket: bool },
+    /// Do not send: the circuit is blocking, or the recovery probe slot for
+    /// this interval is already taken.
+    Deny,
+}
+
 /// Per-peer circuit state
 #[derive(Debug)]
 pub struct PeerCircuit {
@@ -42,14 +57,6 @@ pub struct PeerCircuit {
     /// (0 = never). Paces probe admission. Atomic so the read-lock-only sync
     /// gate can claim probes without taking the circuits write lock.
     last_probe_ms: AtomicU64,
-    /// Number of claimed probes whose results are outstanding. Attribution
-    /// tickets: only results that consume one count as probe outcomes, so
-    /// late responses from pre-open requests (or unadmitted gossip sends)
-    /// cannot drive recovery. A count (not a flag) because a probe can
-    /// outlive the probe interval and overlap the next admitted probe; each
-    /// then carries its own ticket. Kept separate from `last_probe_ms` so
-    /// consuming a ticket does not reset probe pacing.
-    pending_probes: AtomicU64,
 }
 
 impl Default for PeerCircuit {
@@ -63,7 +70,6 @@ impl Default for PeerCircuit {
             consecutive_opens: 0,
             created: Instant::now(),
             last_probe_ms: AtomicU64::new(0),
-            pending_probes: AtomicU64::new(0),
         }
     }
 }
@@ -78,11 +84,8 @@ impl PeerCircuit {
         // distinguishable from "never probed".
         let now_ms = (self.created.elapsed().as_millis() as u64).max(1);
         if interval_ms == 0 {
-            // Gating disabled: every dispatch is admitted — but the
-            // attribution ticket is still issued, since classifying results
-            // (probe vs stale pre-open response) depends on it.
+            // Gating disabled: every dispatch is admitted as a probe.
             self.last_probe_ms.store(now_ms, Ordering::Relaxed);
-            self.pending_probes.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let last = self.last_probe_ms.load(Ordering::Relaxed);
@@ -90,30 +93,14 @@ impl PeerCircuit {
             return false;
         }
         // CAS so concurrent claimants admit exactly one probe per interval.
-        if self
-            .last_probe_ms
+        self.last_probe_ms
             .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
-        {
-            self.pending_probes.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
     }
 
-    /// Consume one outstanding probe ticket, if any. Pacing is unaffected:
-    /// the next probe still waits for the interval from the last admission.
-    fn consume_probe_claim(&self) -> bool {
-        self.pending_probes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-            .is_ok()
-    }
-
-    /// Forget probe history (on state transitions that reset counters).
+    /// Forget probe pacing (on state transitions that reset counters).
     fn reset_probe(&self) {
         self.last_probe_ms.store(0, Ordering::Relaxed);
-        self.pending_probes.store(0, Ordering::Relaxed);
     }
 }
 
@@ -277,34 +264,55 @@ impl CircuitBreaker {
     /// point of committing to send (not while filtering candidates, which
     /// would burn the probe slot on peers that are never dispatched to).
     ///
-    /// Closed circuits always admit. Circuits in the recovery phase —
-    /// half-open, or open with backoff elapsed — admit at most one probe per
-    /// `half_open_probe_interval_ms`, so a recovering peer sees a trickle of
-    /// probes instead of the queued backlog. Like `should_allow_sync`, this
-    /// is synchronous and conservatively admits when the lock is contended.
-    pub fn try_claim_dispatch_sync(&self, peer_id: &str) -> bool {
+    /// Closed circuits always admit (without a probe ticket). Circuits in
+    /// the recovery phase — half-open, or open with backoff elapsed — admit
+    /// at most one probe per `half_open_probe_interval_ms` and hand the
+    /// caller the probe ticket for result attribution, so a recovering peer
+    /// sees a trickle of probes instead of the queued backlog. Like
+    /// `should_allow_sync`, this is synchronous and conservatively admits
+    /// when the lock is contended.
+    pub fn try_claim_dispatch_sync(&self, peer_id: &str) -> DispatchDecision {
         if !self.config.enabled {
-            return true;
+            return DispatchDecision::Admit {
+                probe_ticket: false,
+            };
         }
 
         let circuits = match self.circuits.try_read() {
             Ok(guard) => guard,
-            Err(_) => return true,
+            Err(_) => {
+                return DispatchDecision::Admit {
+                    probe_ticket: false,
+                }
+            }
         };
 
         let Some(circuit) = circuits.get(peer_id) else {
-            return true;
+            return DispatchDecision::Admit {
+                probe_ticket: false,
+            };
         };
 
         match circuit.state {
-            CircuitState::Closed => true,
+            CircuitState::Closed => DispatchDecision::Admit {
+                probe_ticket: false,
+            },
             CircuitState::HalfOpen => {
-                circuit.try_claim_probe(self.config.half_open_probe_interval_ms)
+                if circuit.try_claim_probe(self.config.half_open_probe_interval_ms) {
+                    DispatchDecision::Admit { probe_ticket: true }
+                } else {
+                    DispatchDecision::Deny
+                }
             }
             CircuitState::Open => {
                 let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                circuit.last_state_change.elapsed() >= backoff
+                if circuit.last_state_change.elapsed() >= backoff
                     && circuit.try_claim_probe(self.config.half_open_probe_interval_ms)
+                {
+                    DispatchDecision::Admit { probe_ticket: true }
+                } else {
+                    DispatchDecision::Deny
+                }
             }
         }
     }
@@ -315,7 +323,7 @@ impl CircuitBreaker {
     /// (open → half-open, or → closed): callers should wake routing waiters
     /// parked on capacity notifications, which may have filtered this peer
     /// out before it recovered.
-    pub async fn record_success(&self, peer_id: &str) -> bool {
+    pub async fn record_success(&self, peer_id: &str, probe_ticket: bool) -> bool {
         if !self.config.enabled {
             return false;
         }
@@ -325,9 +333,9 @@ impl CircuitBreaker {
 
         match circuit.state {
             CircuitState::HalfOpen => {
-                // Only results from claimed probes count toward recovery;
-                // stale pre-open responses carry no ticket.
-                if !circuit.consume_probe_claim() {
+                // Only results from this dispatch's claimed probe count
+                // toward recovery; stale pre-open responses carry no ticket.
+                if !probe_ticket {
                     return false;
                 }
                 circuit.success_count += 1;
@@ -355,13 +363,12 @@ impl CircuitBreaker {
                 // The production gate cannot transition state under its read
                 // lock, so a success from a dispatched recovery probe arrives
                 // here while the circuit is still Open — drive the transition
-                // now. Attribute the result to a probe only when one was
-                // actually claimed (the swap consumes the claim): with
+                // now. The caller-carried ticket is the attribution: with
                 // unlimited request durations, a slow response from a request
-                // sent before the circuit opened can arrive after the backoff
-                // elapsed, and must not recover a peer nobody has re-probed.
-                let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                if circuit.last_state_change.elapsed() >= backoff && circuit.consume_probe_claim() {
+                // sent before the circuit opened can arrive at any time, and
+                // carries no ticket, so it cannot recover a peer nobody has
+                // re-probed.
+                if probe_ticket {
                     circuit.last_state_change = Instant::now();
                     circuit.success_count = 1;
                     if circuit.success_count >= self.config.success_threshold {
@@ -390,8 +397,9 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a failed request to a peer
-    pub async fn record_failure(&self, peer_id: &str) {
+    /// Record a failed request to a peer. `probe_ticket` carries this
+    /// dispatch's probe attribution, as in `record_success`.
+    pub async fn record_failure(&self, peer_id: &str, probe_ticket: bool) {
         if !self.config.enabled {
             return;
         }
@@ -419,10 +427,10 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                // Only a claimed probe's failure reopens the circuit; a slow
-                // failure from a request sent before the circuit opened must
-                // not re-block a recovering peer.
-                if circuit.consume_probe_claim() {
+                // Only a ticketed probe's failure reopens the circuit; a
+                // slow failure from a request sent before the circuit opened
+                // must not re-block a recovering peer.
+                if probe_ticket {
                     circuit.state = CircuitState::Open;
                     circuit.last_state_change = Instant::now();
                     circuit.consecutive_opens += 1;
@@ -435,15 +443,14 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::Open => {
-                // A failure from a claimed recovery probe restarts the block
+                // A failure from a ticketed recovery probe restarts the block
                 // window with escalated backoff. Without this, the first
                 // backoff expiry permanently un-gates a still-failing peer,
                 // since nothing ever moves `last_state_change` forward again.
-                // The claim requirement (the swap consumes it) keeps stale
-                // failures — slow requests sent before the circuit opened —
-                // from escalating a window nobody has re-probed.
-                let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                if circuit.last_state_change.elapsed() >= backoff && circuit.consume_probe_claim() {
+                // The ticket requirement keeps stale failures — slow
+                // requests sent before the circuit opened — from escalating
+                // a window nobody has re-probed.
+                if probe_ticket {
                     circuit.last_state_change = Instant::now();
                     circuit.consecutive_opens += 1;
                     circuit.success_count = 0;
@@ -512,11 +519,11 @@ mod tests {
         };
         let cb = CircuitBreaker::new(config);
 
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
         assert!(cb.should_allow("peer-1").await); // Still closed
 
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::Open);
         assert!(!cb.should_allow("peer-1").await); // Now blocked
     }
@@ -529,12 +536,12 @@ mod tests {
         };
         let cb = CircuitBreaker::new(config);
 
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
-        cb.record_success("peer-1").await; // Reset
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_success("peer-1", false).await; // Reset
 
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
         assert!(cb.should_allow("peer-1").await); // Still closed (only 2 failures)
     }
 
@@ -547,9 +554,9 @@ mod tests {
         };
         let cb = CircuitBreaker::new(config);
 
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
 
         // Should still allow even after many failures
         assert!(cb.should_allow("peer-1").await);
@@ -583,8 +590,8 @@ mod tests {
         let cb = CircuitBreaker::new(config);
 
         // Open the circuit
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::Open);
 
         // Wait for backoff and trigger half-open
@@ -592,11 +599,11 @@ mod tests {
         assert!(cb.should_allow("peer-1").await); // Transitions to HalfOpen, claims probe
         assert_eq!(cb.get_state("peer-1").await, CircuitState::HalfOpen);
 
-        // Claimed-probe successes in half-open close the circuit
-        cb.record_success("peer-1").await;
+        // Ticketed probe successes in half-open close the circuit
+        cb.record_success("peer-1", true).await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::HalfOpen);
-        assert!(cb.should_allow("peer-1").await); // claim the next probe
-        cb.record_success("peer-1").await;
+        assert!(cb.should_allow("peer-1").await); // admit the next probe
+        cb.record_success("peer-1", true).await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::Closed);
     }
 
@@ -611,8 +618,8 @@ mod tests {
         let cb = CircuitBreaker::new(config);
 
         // Open the circuit
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::Open);
 
         // Wait and transition to half-open
@@ -620,8 +627,8 @@ mod tests {
         cb.should_allow("peer-1").await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::HalfOpen);
 
-        // Failure in half-open reopens circuit
-        cb.record_failure("peer-1").await;
+        // Ticketed probe failure in half-open reopens circuit
+        cb.record_failure("peer-1", true).await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::Open);
     }
 
@@ -634,8 +641,8 @@ mod tests {
         let cb = CircuitBreaker::new(config);
 
         // Open the circuit
-        cb.record_failure("peer-1").await;
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
+        cb.record_failure("peer-1", false).await;
         assert_eq!(cb.get_state("peer-1").await, CircuitState::Open);
 
         // Reset should clear state
@@ -654,7 +661,7 @@ mod tests {
 
         // Create circuits for multiple peers
         cb.should_allow("peer-1").await; // Creates closed circuit
-        cb.record_failure("peer-2").await; // Opens circuit
+        cb.record_failure("peer-2", false).await; // Opens circuit
 
         let states = cb.get_all_states().await;
         assert_eq!(states.get("peer-1"), Some(&CircuitState::Closed));
@@ -675,19 +682,25 @@ mod tests {
         };
         let cb = CircuitBreaker::new(config);
 
-        cb.record_failure("p").await;
-        cb.record_failure("p").await;
+        cb.record_failure("p", false).await;
+        cb.record_failure("p", false).await;
         assert_eq!(cb.get_state("p").await, CircuitState::Open);
         assert!(!cb.should_allow_sync("p"));
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(cb.should_allow_sync("p")); // eligible after backoff
-        assert!(cb.try_claim_dispatch_sync("p")); // probe claimed at dispatch
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit { probe_ticket: true }
+        )); // probe claimed at dispatch
 
-        assert!(cb.record_success("p").await); // successful probe → half-open
+        assert!(cb.record_success("p", true).await); // successful probe → half-open
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
-        assert!(cb.try_claim_dispatch_sync("p")); // next probe claimed
-        assert!(cb.record_success("p").await); // second success → closed
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit { probe_ticket: true }
+        )); // next probe claimed
+        assert!(cb.record_success("p", true).await); // second success → closed
         assert_eq!(cb.get_state("p").await, CircuitState::Closed);
     }
 
@@ -702,16 +715,22 @@ mod tests {
         };
         let cb = CircuitBreaker::new(config);
 
-        cb.record_failure("p").await; // open; backoff 40ms
+        cb.record_failure("p", false).await; // open; backoff 40ms
         assert!(!cb.should_allow_sync("p"));
-        assert!(!cb.try_claim_dispatch_sync("p")); // dispatch denied too
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Deny
+        )); // dispatch denied too
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(cb.should_allow_sync("p")); // eligible
-        assert!(cb.try_claim_dispatch_sync("p")); // probe claimed
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit { probe_ticket: true }
+        )); // probe claimed
 
         // Failed probe must restart the block window with doubled backoff;
         // without it, the first expiry permanently un-gates the peer.
-        cb.record_failure("p").await;
+        cb.record_failure("p", true).await;
         assert_eq!(cb.get_state("p").await, CircuitState::Open);
         assert!(!cb.should_allow_sync("p"));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -728,14 +747,14 @@ mod tests {
             ..Default::default()
         };
         let cb = CircuitBreaker::new(config);
-        cb.record_failure("p").await;
+        cb.record_failure("p", false).await;
         assert_eq!(cb.get_state("p").await, CircuitState::Open);
 
         // Late results from requests sent before the circuit opened must
         // neither recover nor escalate the circuit.
-        cb.record_success("p").await;
+        cb.record_success("p", false).await;
         assert_eq!(cb.get_state("p").await, CircuitState::Open);
-        cb.record_failure("p").await;
+        cb.record_failure("p", false).await;
         assert_eq!(cb.get_state("p").await, CircuitState::Open);
         assert!(!cb.should_allow_sync("p"));
     }
@@ -750,7 +769,7 @@ mod tests {
             ..Default::default()
         };
         let cb = CircuitBreaker::new(config);
-        cb.record_failure("p").await;
+        cb.record_failure("p", false).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         // Eligibility checks (candidate filtering) are read-only and never
@@ -758,16 +777,35 @@ mod tests {
         assert!(cb.should_allow_sync("p"));
         assert!(cb.should_allow_sync("p"));
 
-        assert!(cb.try_claim_dispatch_sync("p")); // first dispatch claims the probe
-        assert!(!cb.try_claim_dispatch_sync("p")); // backlog herd denied
-        assert!(!cb.try_claim_dispatch_sync("p"));
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit { probe_ticket: true }
+        )); // first dispatch claims the probe
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Deny
+        )); // backlog herd denied
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Deny
+        ));
 
         // The probe's success closes the circuit and reopens unrestricted
-        // traffic.
-        assert!(cb.record_success("p").await);
+        // traffic (closed-circuit admissions carry no probe ticket).
+        assert!(cb.record_success("p", true).await);
         assert_eq!(cb.get_state("p").await, CircuitState::Closed);
-        assert!(cb.try_claim_dispatch_sync("p"));
-        assert!(cb.try_claim_dispatch_sync("p"));
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit {
+                probe_ticket: false
+            }
+        ));
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit {
+                probe_ticket: false
+            }
+        ));
     }
 
     #[tokio::test]
@@ -780,22 +818,28 @@ mod tests {
             ..Default::default()
         };
         let cb = CircuitBreaker::new(config);
-        cb.record_failure("p").await;
+        cb.record_failure("p", false).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        assert!(cb.try_claim_dispatch_sync("p"));
-        assert!(cb.record_success("p").await); // probe success → half-open
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit { probe_ticket: true }
+        ));
+        assert!(cb.record_success("p", true).await); // probe success → half-open
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
 
         // The interval still paces half-open probes after the transition: a
         // woken backlog cannot immediately claim the next probe.
-        assert!(!cb.try_claim_dispatch_sync("p"));
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Deny
+        ));
 
         // And stale results without a claimed probe neither advance recovery
         // nor re-block the recovering peer in half-open.
-        assert!(!cb.record_success("p").await);
+        assert!(!cb.record_success("p", false).await);
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
-        cb.record_failure("p").await;
+        cb.record_failure("p", false).await;
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
     }
 
@@ -811,20 +855,23 @@ mod tests {
             ..Default::default()
         };
         let cb = CircuitBreaker::new(config);
-        cb.record_failure("p").await;
+        cb.record_failure("p", false).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        assert!(!cb.record_success("p").await); // stale success: no recovery
+        assert!(!cb.record_success("p", false).await); // stale success: no recovery
         assert_eq!(cb.get_state("p").await, CircuitState::Open);
 
-        cb.record_failure("p").await; // stale failure: no escalation
+        cb.record_failure("p", false).await; // stale failure: no escalation
         assert_eq!(cb.get_state("p").await, CircuitState::Open);
         // Backoff window unchanged (1ms, long elapsed): peer still eligible.
         assert!(cb.should_allow_sync("p"));
 
-        // A claimed probe's success, by contrast, recovers the circuit.
-        assert!(cb.try_claim_dispatch_sync("p"));
-        assert!(cb.record_success("p").await);
+        // A ticketed probe's success, by contrast, recovers the circuit.
+        assert!(matches!(
+            cb.try_claim_dispatch_sync("p"),
+            DispatchDecision::Admit { probe_ticket: true }
+        ));
+        assert!(cb.record_success("p", true).await);
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
     }
 
@@ -844,7 +891,7 @@ mod tests {
         };
         let cb = CircuitBreaker::new(config);
 
-        cb.record_failure("peer-1").await;
+        cb.record_failure("peer-1", false).await;
         assert!(!cb.should_allow_sync("peer-1")); // Blocked
     }
 

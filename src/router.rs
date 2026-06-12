@@ -129,10 +129,22 @@ fn peer_status_is_failure(status: StatusCode) -> bool {
         || status == StatusCode::FORBIDDEN
 }
 
-async fn record_peer_status(state: &NodeState, peer_id: &str, status: StatusCode) {
+async fn record_peer_status(
+    state: &NodeState,
+    peer_id: &str,
+    status: StatusCode,
+    probe_ticket: bool,
+) {
     if peer_status_is_failure(status) {
-        state.circuit_breaker.record_failure(peer_id).await;
-    } else if state.circuit_breaker.record_success(peer_id).await {
+        state
+            .circuit_breaker
+            .record_failure(peer_id, probe_ticket)
+            .await;
+    } else if state
+        .circuit_breaker
+        .record_success(peer_id, probe_ticket)
+        .await
+    {
         // The circuit just advanced toward recovery. Wake routing loops that
         // parked on capacity_notify after filtering this peer out, so they
         // retry (or send the next recovery probe) immediately instead of
@@ -208,25 +220,38 @@ async fn attempt_peer_forward(
     let peer_id = request.peer_id;
     // Circuit-breaker admission happens here, at the commit point, rather
     // than during candidate filtering: filtering scans peers that are never
-    // dispatched to, and must not burn a recovering peer's probe slot.
-    if !state.circuit_breaker.try_claim_dispatch_sync(peer_id) {
-        return ForwardOutcome::ProbeDenied;
-    }
+    // dispatched to, and must not burn a recovering peer's probe slot. The
+    // returned probe ticket attributes THIS dispatch's result; every
+    // success/failure recording below carries it, and the dispatch loops do
+    // not record outcomes themselves.
+    let probe_ticket = match state.circuit_breaker.try_claim_dispatch_sync(peer_id) {
+        crate::circuit_breaker::DispatchDecision::Admit { probe_ticket } => probe_ticket,
+        crate::circuit_breaker::DispatchDecision::Deny => return ForwardOutcome::ProbeDenied,
+    };
     let resp = match send_peer_request(state, request).await {
         Ok(resp) => resp,
-        Err(e) => return ForwardOutcome::Transport(e),
+        Err(e) => {
+            state
+                .circuit_breaker
+                .record_failure(peer_id, probe_ticket)
+                .await;
+            return ForwardOutcome::Transport(e);
+        }
     };
 
     let status = match &resp {
         PeerResponse::Http(r) => r.status(),
         PeerResponse::Noise { status, .. } => *status,
     };
-    record_peer_status(state, peer_id, status).await;
 
     // Pass through streaming successful responses without buffering. A 5xx
     // never opens a stream because the peer commits to its response shape
     // before opening one — error responses are always non-streaming JSON.
+    // The status is recorded at stream handoff; for non-streaming responses
+    // recording waits until the body is buffered, so a body-read failure is
+    // recorded as the probe's failure rather than a premature success.
     if response_streaming && status.is_success() {
+        record_peer_status(state, peer_id, status, probe_ticket).await;
         return ForwardOutcome::StreamingSurface(resp);
     }
 
@@ -238,6 +263,10 @@ async fn attempt_peer_forward(
             let bytes = match r.bytes().await {
                 Ok(b) => b,
                 Err(e) => {
+                    state
+                        .circuit_breaker
+                        .record_failure(peer_id, probe_ticket)
+                        .await;
                     return ForwardOutcome::Transport(AppError::new(
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to read peer response body from {peer_id}: {e}"),
@@ -263,6 +292,10 @@ async fn attempt_peer_forward(
             {
                 Ok(b) => Bytes::from(b),
                 Err(e) => {
+                    state
+                        .circuit_breaker
+                        .record_failure(peer_id, probe_ticket)
+                        .await;
                     return ForwardOutcome::Transport(AppError::new(
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to read Noise peer response body from {peer_id}: {e}"),
@@ -273,6 +306,8 @@ async fn attempt_peer_forward(
             (status, headers, bytes)
         }
     };
+
+    record_peer_status(state, peer_id, status, probe_ticket).await;
 
     if status.is_server_error() && is_healable_error_body(&body_bytes) {
         let reason = serde_json::from_slice::<Value>(&body_bytes)
@@ -621,8 +656,18 @@ pub async fn route_request(
                 build_forward_headers(&parts.headers, current_hops, &request_id);
             let timeout_ms = state.config.model_defaults.max_request_duration_ms;
 
+            // Set when a dispatch was probe-denied: the immediate retry
+            // excludes that peer so a healthy alternative is reached without
+            // waiting out the probe interval. Consumed by the next selection.
+            let mut exclude_peer: Option<String> = None;
+            let mut last_probe_denied: Option<String> = None;
+
             loop {
-                let Some(peer) = state.find_peer_for_model(&model_to_use).await else {
+                let selection_exclude = exclude_peer.take();
+                let Some(peer) = state
+                    .find_peer_for_model(&model_to_use, selection_exclude.as_deref())
+                    .await
+                else {
                     // No peer currently supports this model. Either it really
                     // does not exist anywhere, or every peer that advertises
                     // it is currently filtered (open circuit, draining,
@@ -745,37 +790,48 @@ pub async fn route_request(
                         tracing::debug!(
                             event = "forward_probe_denied",
                             peer = %peer.node_id,
-                            "Peer circuit recovering and probe slot taken; waiting to retry"
+                            "Peer circuit recovering and probe slot taken"
                         );
                         drop(peer_forward_guard);
-                        // A denied probe slot frees by time passing, not only
-                        // by capacity events — re-check at the next probe
-                        // deadline even if nothing notifies.
-                        let probe_deadline = Duration::from_millis(
-                            state
-                                .config
-                                .cluster
-                                .circuit_breaker
-                                .half_open_probe_interval_ms
-                                .max(250),
-                        );
-                        if let Ok(res) = tokio::time::timeout(
-                            probe_deadline,
-                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
-                        )
-                        .await
-                        {
-                            res?;
+                        let repeat =
+                            last_probe_denied.as_deref() == Some(peer.node_id.as_str());
+                        last_probe_denied = Some(peer.node_id.clone());
+                        exclude_peer = Some(peer.node_id.clone());
+                        if repeat {
+                            // Selection keeps landing on this recovering
+                            // peer: park until the next probe deadline. The
+                            // slot frees by time passing, not only by
+                            // capacity events.
+                            let probe_deadline = Duration::from_millis(
+                                state
+                                    .config
+                                    .cluster
+                                    .circuit_breaker
+                                    .half_open_probe_interval_ms
+                                    .max(250),
+                            );
+                            if let Ok(res) = tokio::time::timeout(
+                                probe_deadline,
+                                wait_for_capacity_or_disconnect(
+                                    &state.capacity_notify,
+                                    &conn_handle,
+                                ),
+                            )
+                            .await
+                            {
+                                res?;
+                            }
                         }
+                        // Otherwise retry immediately, excluding this peer,
+                        // so a healthy alternative is reached without delay.
                         continue;
                     }
                     ForwardOutcome::Transport(e) => {
-                        // Already recorded as circuit-breaker failure inside
-                        // send_peer_request? No — record explicitly here. The
+                        // The failure was recorded (with this dispatch's
+                        // probe attribution) inside attempt_peer_forward. The
                         // forwarder retries against any peer that comes back
                         // online (including this one once its circuit
                         // resets).
-                        state.circuit_breaker.record_failure(&peer.node_id).await;
                         warn!(
                             event = "forward_transport_retry",
                             peer = %peer.node_id,
@@ -824,7 +880,7 @@ pub async fn route_request(
         // Cluster-aware routing: wait for capacity if model exists but no node available
         let best_node = loop {
             if let Some(node) = state
-                .select_best_node(&model_name, &profile, prefer_local)
+                .select_best_node(&model_name, &profile, prefer_local, None)
                 .await
             {
                 break node;
@@ -1068,25 +1124,29 @@ pub async fn route_request(
                         // attempt_peer_forward: a recovering peer admits at
                         // most one probe per interval, and this dispatch
                         // bypasses attempt_peer_forward.
-                        let fallback_peer = match state.find_peer_for_model(&model_to_use).await {
-                            Some(peer)
-                                if state
-                                    .circuit_breaker
-                                    .try_claim_dispatch_sync(&peer.node_id) =>
-                            {
-                                Some(peer)
-                            }
+                        let fallback_peer = match state
+                            .find_peer_for_model(&model_to_use, None)
+                            .await
+                        {
                             Some(peer) => {
-                                tracing::debug!(
-                                    event = "forward_probe_denied",
-                                    peer = %peer.node_id,
-                                    "Peer circuit recovering and probe slot taken; skipping spawn-failure fallback"
-                                );
-                                None
+                                match state.circuit_breaker.try_claim_dispatch_sync(&peer.node_id)
+                                {
+                                    crate::circuit_breaker::DispatchDecision::Admit {
+                                        probe_ticket,
+                                    } => Some((peer, probe_ticket)),
+                                    crate::circuit_breaker::DispatchDecision::Deny => {
+                                        tracing::debug!(
+                                            event = "forward_probe_denied",
+                                            peer = %peer.node_id,
+                                            "Peer circuit recovering and probe slot taken; skipping spawn-failure fallback"
+                                        );
+                                        None
+                                    }
+                                }
                             }
                             None => None,
                         };
-                        if let Some(peer) = fallback_peer {
+                        if let Some((peer, probe_ticket)) = fallback_peer {
                             info!(
                                 event = "local_spawn_failed_peer_fallback",
                                 model = %model_name,
@@ -1117,7 +1177,8 @@ pub async fn route_request(
                                         PeerResponse::Http(resp) => resp.status(),
                                         PeerResponse::Noise { status, .. } => *status,
                                     };
-                                    record_peer_status(&state, &peer.node_id, status).await;
+                                    record_peer_status(&state, &peer.node_id, status, probe_ticket)
+                                        .await;
 
                                     let tokens_counter = Arc::new(AtomicU64::new(0));
                                     let tokens_for_cleanup = tokens_counter.clone();
@@ -1173,7 +1234,10 @@ pub async fn route_request(
                                 Err(peer_err) => {
                                     // peer_forward_guard drops on fall-through,
                                     // releasing the counter.
-                                    state.circuit_breaker.record_failure(&peer.node_id).await;
+                                    state
+                                        .circuit_breaker
+                                        .record_failure(&peer.node_id, probe_ticket)
+                                        .await;
                                     warn!(
                                         peer = %peer.node_id,
                                         error = ?peer_err,
@@ -1248,6 +1312,11 @@ pub async fn route_request(
                 build_forward_headers(&parts.headers, current_hops, &request_id);
 
             let mut current_node = best_node;
+            // Set when a dispatch was probe-denied: the immediate re-select
+            // excludes that peer so a healthy alternative is reached without
+            // waiting out the probe interval. Consumed by the next selection.
+            let mut exclude_peer: Option<String> = None;
+            let mut last_probe_denied: Option<String> = None;
             loop {
                 info!(
                     event = "forward_remote",
@@ -1274,6 +1343,7 @@ pub async fn route_request(
                 .await;
 
                 let mut probe_wait_deadline: Option<Duration> = None;
+                let mut skip_wait = false;
                 match outcome {
                     ForwardOutcome::StreamingSurface(resp) => {
                         let tokens_counter = Arc::new(AtomicU64::new(0));
@@ -1350,25 +1420,35 @@ pub async fn route_request(
                         tracing::debug!(
                             event = "forward_probe_denied",
                             peer = %current_node.node_id,
-                            "Peer circuit recovering and probe slot taken; waiting to retry"
+                            "Peer circuit recovering and probe slot taken"
                         );
                         drop(peer_forward_guard);
-                        // A denied probe slot frees by time passing; bound
-                        // the wait below by the next probe deadline.
-                        probe_wait_deadline = Some(Duration::from_millis(
-                            state
-                                .config
-                                .cluster
-                                .circuit_breaker
-                                .half_open_probe_interval_ms
-                                .max(250),
-                        ));
+                        let repeat =
+                            last_probe_denied.as_deref() == Some(current_node.node_id.as_str());
+                        last_probe_denied = Some(current_node.node_id.clone());
+                        exclude_peer = Some(current_node.node_id.clone());
+                        if repeat {
+                            // Selection keeps landing on this recovering
+                            // peer: bound the wait below by the next probe
+                            // deadline, since the slot frees by time passing.
+                            probe_wait_deadline = Some(Duration::from_millis(
+                                state
+                                    .config
+                                    .cluster
+                                    .circuit_breaker
+                                    .half_open_probe_interval_ms
+                                    .max(250),
+                            ));
+                        } else {
+                            // First denial: re-select immediately, excluding
+                            // this peer, so a healthy alternative is reached
+                            // without waiting out the probe interval.
+                            skip_wait = true;
+                        }
                     }
                     ForwardOutcome::Transport(e) => {
-                        state
-                            .circuit_breaker
-                            .record_failure(&current_node.node_id)
-                            .await;
+                        // Failure already recorded inside attempt_peer_forward
+                        // with this dispatch's probe attribution.
                         warn!(
                             event = "forward_transport_retry",
                             peer = %current_node.node_id,
@@ -1384,8 +1464,13 @@ pub async fn route_request(
                 // Wait for cluster state to change (capacity freed, peer
                 // recovered, gossip update, drain finished) before retrying.
                 // Probe-denied attempts additionally wake at the next probe
-                // deadline, since a probe slot frees by time passing.
-                match probe_wait_deadline {
+                // deadline, since a probe slot frees by time passing — or
+                // skip the wait entirely on a first denial, to re-select an
+                // alternative peer immediately.
+                if skip_wait {
+                    // fall through to re-selection
+                } else {
+                    match probe_wait_deadline {
                     Some(deadline) => {
                         if let Ok(res) = tokio::time::timeout(
                             deadline,
@@ -1399,6 +1484,7 @@ pub async fn route_request(
                     None => {
                         wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle)
                             .await?;
+                    }
                     }
                 }
 
@@ -1420,8 +1506,14 @@ pub async fn route_request(
                 // the same peer-or-better via this loop until the peer
                 // actually serves it.
                 current_node = loop {
+                    let selection_exclude = exclude_peer.take();
                     if let Some(node) = state
-                        .select_best_node(&model_name, &profile, prefer_local)
+                        .select_best_node(
+                            &model_name,
+                            &profile,
+                            prefer_local,
+                            selection_exclude.as_deref(),
+                        )
                         .await
                     {
                         break node;
