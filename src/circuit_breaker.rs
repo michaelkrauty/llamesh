@@ -42,12 +42,14 @@ pub struct PeerCircuit {
     /// (0 = never). Paces probe admission. Atomic so the read-lock-only sync
     /// gate can claim probes without taking the circuits write lock.
     last_probe_ms: AtomicU64,
-    /// True while a claimed probe's result is outstanding. Attribution
-    /// ticket: only results that consume it count as probe outcomes, so
+    /// Number of claimed probes whose results are outstanding. Attribution
+    /// tickets: only results that consume one count as probe outcomes, so
     /// late responses from pre-open requests (or unadmitted gossip sends)
-    /// cannot drive recovery. Kept separate from `last_probe_ms` so
-    /// consuming the ticket does not reset probe pacing.
-    probe_pending: std::sync::atomic::AtomicBool,
+    /// cannot drive recovery. A count (not a flag) because a probe can
+    /// outlive the probe interval and overlap the next admitted probe; each
+    /// then carries its own ticket. Kept separate from `last_probe_ms` so
+    /// consuming a ticket does not reset probe pacing.
+    pending_probes: AtomicU64,
 }
 
 impl Default for PeerCircuit {
@@ -61,7 +63,7 @@ impl Default for PeerCircuit {
             consecutive_opens: 0,
             created: Instant::now(),
             last_probe_ms: AtomicU64::new(0),
-            probe_pending: std::sync::atomic::AtomicBool::new(false),
+            pending_probes: AtomicU64::new(0),
         }
     }
 }
@@ -80,7 +82,7 @@ impl PeerCircuit {
             // attribution ticket is still issued, since classifying results
             // (probe vs stale pre-open response) depends on it.
             self.last_probe_ms.store(now_ms, Ordering::Relaxed);
-            self.probe_pending.store(true, Ordering::Relaxed);
+            self.pending_probes.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let last = self.last_probe_ms.load(Ordering::Relaxed);
@@ -93,23 +95,25 @@ impl PeerCircuit {
             .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
-            self.probe_pending.store(true, Ordering::Relaxed);
+            self.pending_probes.fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false
         }
     }
 
-    /// Consume the outstanding probe ticket, if any. Pacing is unaffected:
+    /// Consume one outstanding probe ticket, if any. Pacing is unaffected:
     /// the next probe still waits for the interval from the last admission.
     fn consume_probe_claim(&self) -> bool {
-        self.probe_pending.swap(false, Ordering::Relaxed)
+        self.pending_probes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
     }
 
     /// Forget probe history (on state transitions that reset counters).
     fn reset_probe(&self) {
         self.last_probe_ms.store(0, Ordering::Relaxed);
-        self.probe_pending.store(false, Ordering::Relaxed);
+        self.pending_probes.store(0, Ordering::Relaxed);
     }
 }
 
@@ -415,16 +419,20 @@ impl CircuitBreaker {
                 }
             }
             CircuitState::HalfOpen => {
-                // Any failure in half-open goes back to open
-                circuit.state = CircuitState::Open;
-                circuit.last_state_change = Instant::now();
-                circuit.consecutive_opens += 1;
-                circuit.success_count = 0;
-                circuit.reset_probe();
-                tracing::warn!(
-                    peer_id = %peer_id,
-                    "Circuit breaker reopened after failure in half-open state"
-                );
+                // Only a claimed probe's failure reopens the circuit; a slow
+                // failure from a request sent before the circuit opened must
+                // not re-block a recovering peer.
+                if circuit.consume_probe_claim() {
+                    circuit.state = CircuitState::Open;
+                    circuit.last_state_change = Instant::now();
+                    circuit.consecutive_opens += 1;
+                    circuit.success_count = 0;
+                    circuit.reset_probe();
+                    tracing::warn!(
+                        peer_id = %peer_id,
+                        "Circuit breaker reopened after failure in half-open state"
+                    );
+                }
             }
             CircuitState::Open => {
                 // A failure from a claimed recovery probe restarts the block
@@ -783,9 +791,11 @@ mod tests {
         // woken backlog cannot immediately claim the next probe.
         assert!(!cb.try_claim_dispatch_sync("p"));
 
-        // And a stale success without a claimed probe does not advance
-        // recovery in half-open either.
+        // And stale results without a claimed probe neither advance recovery
+        // nor re-block the recovering peer in half-open.
         assert!(!cb.record_success("p").await);
+        assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
+        cb.record_failure("p").await;
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
     }
 

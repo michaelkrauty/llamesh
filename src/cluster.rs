@@ -214,7 +214,8 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                         Ok(resp) if resp.status().is_success() => {
                             // Record success - resets failure count, and on a
                             // recovery transition wakes parked routing waiters.
-                            if circuit_breaker.record_success(&cb_key).await {
+                            if gossip_probe_claimed && circuit_breaker.record_success(&cb_key).await
+                            {
                                 capacity_notify.notify_waiters();
                             }
                         }

@@ -1064,7 +1064,29 @@ pub async fn route_request(
                     // If local spawning failed repeatedly, try forwarding to a peer
                     // before returning an error to the client.
                     if matches!(e, NodeError::SpawnFailuresExhausted) {
-                        if let Some(peer) = state.find_peer_for_model(&model_to_use).await {
+                        // Same circuit-breaker commit-point admission as
+                        // attempt_peer_forward: a recovering peer admits at
+                        // most one probe per interval, and this dispatch
+                        // bypasses attempt_peer_forward.
+                        let fallback_peer = match state.find_peer_for_model(&model_to_use).await {
+                            Some(peer)
+                                if state
+                                    .circuit_breaker
+                                    .try_claim_dispatch_sync(&peer.node_id) =>
+                            {
+                                Some(peer)
+                            }
+                            Some(peer) => {
+                                tracing::debug!(
+                                    event = "forward_probe_denied",
+                                    peer = %peer.node_id,
+                                    "Peer circuit recovering and probe slot taken; skipping spawn-failure fallback"
+                                );
+                                None
+                            }
+                            None => None,
+                        };
+                        if let Some(peer) = fallback_peer {
                             info!(
                                 event = "local_spawn_failed_peer_fallback",
                                 model = %model_name,
