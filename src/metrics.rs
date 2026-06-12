@@ -75,6 +75,19 @@ impl HashMetrics {
     }
 }
 
+/// Why a request was dropped from a model queue. Mirrors the `reason` field
+/// of `queue_drop` log events and the `reason` label of
+/// `proxy_queue_drops_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueDropReason {
+    /// The per-model queue reached its `max_queue_size_per_model`.
+    Full,
+    /// The request's queue wait exceeded its timeout.
+    Timeout,
+    /// The node-wide `max_total_queue_entries` limit was reached.
+    GlobalLimit,
+}
+
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub requests_total: AtomicU64,
@@ -87,6 +100,20 @@ pub struct Metrics {
     pub queue_wait_total_ms: AtomicU64,
     /// Number of requests that waited in queue
     pub queue_wait_count: AtomicU64,
+    /// Current total queued requests across all model queues, matching
+    /// `total_queue_length` in `/cluster/nodes`. Runtime gauge, refreshed by
+    /// the scrape handlers; starts fresh on restart.
+    pub queue_length: AtomicU64,
+    /// Requests dropped from model queues because the per-model queue was
+    /// full. Cumulative; persisted across restarts.
+    pub queue_drops_full: AtomicU64,
+    /// Requests dropped from model queues because their queue wait timed
+    /// out. Cumulative; persisted across restarts.
+    pub queue_drops_timeout: AtomicU64,
+    /// Requests dropped because the node-wide queue entry limit
+    /// (`max_total_queue_entries`) was reached. Cumulative; persisted across
+    /// restarts.
+    pub queue_drops_global_limit: AtomicU64,
 
     // Per-hash metrics: args_hash -> HashMetrics
     pub hash_metrics: RwLock<HashMap<String, Arc<HashMetrics>>>,
@@ -128,6 +155,21 @@ pub struct MetricsSnapshot {
     pub requests_total: u64,
     pub errors_total: u64,
     pub current_requests: u64,
+    /// Current total queued requests across all model queues. Runtime gauge;
+    /// not restored on load. `#[serde(default)]` keeps snapshots written by
+    /// older versions loadable.
+    #[serde(default)]
+    pub queue_length: u64,
+    /// Requests dropped from model queues by drop reason. Cumulative
+    /// counters, restored on load like `requests_total`/`errors_total`.
+    /// `#[serde(default)]` keeps snapshots written by older versions loadable
+    /// (a missing field must not reset every other counter).
+    #[serde(default)]
+    pub queue_drops_full: u64,
+    #[serde(default)]
+    pub queue_drops_timeout: u64,
+    #[serde(default)]
+    pub queue_drops_global_limit: u64,
     pub hashes: HashMap<String, HashMetricsSnapshot>,
     pub updated_at: String,
     #[serde(default)]
@@ -239,6 +281,10 @@ impl Metrics {
             queue_pending_tokens: AtomicU64::new(0), // Not persisted, starts fresh
             queue_wait_total_ms: AtomicU64::new(0),  // Not persisted, starts fresh
             queue_wait_count: AtomicU64::new(0),     // Not persisted, starts fresh
+            queue_length: AtomicU64::new(0),         // Runtime gauge, starts fresh
+            queue_drops_full: AtomicU64::new(snapshot.queue_drops_full),
+            queue_drops_timeout: AtomicU64::new(snapshot.queue_drops_timeout),
+            queue_drops_global_limit: AtomicU64::new(snapshot.queue_drops_global_limit),
             hash_metrics: RwLock::new(map),
             node_llamesh_vram_mb: AtomicU64::new(0),
             node_llamesh_sysmem_mb: AtomicU64::new(0),
@@ -302,6 +348,21 @@ impl Metrics {
     pub fn observe_queue_wait(&self, ms: u64) {
         self.queue_wait_total_ms.fetch_add(ms, Ordering::Relaxed);
         self.queue_wait_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Refresh the current total queue depth gauge.
+    pub fn set_queue_length(&self, length: u64) {
+        self.queue_length.store(length, Ordering::Relaxed);
+    }
+
+    /// Record a request dropped from a model queue.
+    pub fn record_queue_drop(&self, reason: QueueDropReason) {
+        let counter = match reason {
+            QueueDropReason::Full => &self.queue_drops_full,
+            QueueDropReason::Timeout => &self.queue_drops_timeout,
+            QueueDropReason::GlobalLimit => &self.queue_drops_global_limit,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get or create metrics for a given args_hash.
@@ -421,6 +482,10 @@ impl Metrics {
             requests_total: self.requests_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
             current_requests: self.current_requests.load(Ordering::Relaxed),
+            queue_length: self.queue_length.load(Ordering::Relaxed),
+            queue_drops_full: self.queue_drops_full.load(Ordering::Relaxed),
+            queue_drops_timeout: self.queue_drops_timeout.load(Ordering::Relaxed),
+            queue_drops_global_limit: self.queue_drops_global_limit.load(Ordering::Relaxed),
             hashes,
             updated_at: chrono::Utc::now().to_rfc3339(),
             is_building: build_status
@@ -595,6 +660,26 @@ pub async fn render_prometheus_with_circuit_breaker(
     out.push_str(&format!(
         "proxy_queue_wait_count {}\n",
         metrics.queue_wait_count.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_queue_length Current number of requests waiting in model queues.\n");
+    out.push_str("# TYPE proxy_queue_length gauge\n");
+    out.push_str(&format!(
+        "proxy_queue_length {}\n",
+        metrics.queue_length.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP proxy_queue_drops_total Requests dropped from model queues, by reason.\n");
+    out.push_str("# TYPE proxy_queue_drops_total counter\n");
+    out.push_str(&format!(
+        "proxy_queue_drops_total{{reason=\"full\"}} {}\n",
+        metrics.queue_drops_full.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "proxy_queue_drops_total{{reason=\"timeout\"}} {}\n",
+        metrics.queue_drops_timeout.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "proxy_queue_drops_total{{reason=\"global_limit\"}} {}\n",
+        metrics.queue_drops_global_limit.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP proxy_token_counting_disabled_total Times token counting was disabled.\n");
     out.push_str("# TYPE proxy_token_counting_disabled_total counter\n");
@@ -898,6 +983,48 @@ mod tests {
         assert_eq!(snapshot.node_resources.active_instances, 0);
         assert_eq!(snapshot.node_resources.max_vram_mb, 0);
         assert_eq!(snapshot.node_resources.max_sysmem_mb, 0);
+        // Queue metrics added in 1.11.0 default when absent.
+        assert_eq!(snapshot.queue_length, 0);
+        assert_eq!(snapshot.queue_drops_full, 0);
+        assert_eq!(snapshot.queue_drops_timeout, 0);
+        assert_eq!(snapshot.queue_drops_global_limit, 0);
+    }
+
+    #[tokio::test]
+    async fn queue_drop_counters_round_trip_through_snapshot() {
+        let metrics = Metrics::new();
+        metrics.record_queue_drop(QueueDropReason::Full);
+        metrics.record_queue_drop(QueueDropReason::Timeout);
+        metrics.record_queue_drop(QueueDropReason::Timeout);
+        metrics.record_queue_drop(QueueDropReason::GlobalLimit);
+        metrics.set_queue_length(7);
+
+        let snapshot = metrics.snapshot("n".into(), "v".into(), None).await;
+        assert_eq!(snapshot.queue_drops_full, 1);
+        assert_eq!(snapshot.queue_drops_timeout, 2);
+        assert_eq!(snapshot.queue_drops_global_limit, 1);
+        assert_eq!(snapshot.queue_length, 7);
+
+        // Drop counters are cumulative and survive a restart; the queue depth
+        // is a runtime gauge and starts fresh.
+        let restored = Metrics::from_snapshot(snapshot);
+        assert_eq!(restored.queue_drops_full.load(Ordering::Relaxed), 1);
+        assert_eq!(restored.queue_drops_timeout.load(Ordering::Relaxed), 2);
+        assert_eq!(restored.queue_drops_global_limit.load(Ordering::Relaxed), 1);
+        assert_eq!(restored.queue_length.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn render_includes_queue_length_and_drops() {
+        let metrics = Metrics::new();
+        metrics.set_queue_length(3);
+        metrics.record_queue_drop(QueueDropReason::Timeout);
+
+        let out = render_prometheus_with_circuit_breaker(&metrics, None, "test").await;
+        assert!(out.contains("proxy_queue_length 3\n"));
+        assert!(out.contains("proxy_queue_drops_total{reason=\"full\"} 0\n"));
+        assert!(out.contains("proxy_queue_drops_total{reason=\"timeout\"} 1\n"));
+        assert!(out.contains("proxy_queue_drops_total{reason=\"global_limit\"} 0\n"));
     }
 
     #[tokio::test]

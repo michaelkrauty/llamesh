@@ -40,6 +40,9 @@ async fn metrics_handler(
 ) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     check_auth(&state, &headers)?;
     let _ = state.calculate_resource_snapshot().await;
+    state
+        .metrics
+        .set_queue_length(state.total_queue_length().await);
     let llama_cpp_version = state.build_manager.get_version().await;
     Ok(metrics::render_prometheus_with_circuit_breaker(
         &state.metrics,
@@ -151,6 +154,9 @@ async fn metrics_json_handler(
 ) -> Result<Json<metrics::MetricsSnapshot>, (StatusCode, Json<serde_json::Value>)> {
     check_auth(&state, &headers)?;
     let _ = state.calculate_resource_snapshot().await;
+    state
+        .metrics
+        .set_queue_length(state.total_queue_length().await);
     let version = state.build_manager.get_version().await;
     let build_status = state.build_manager.build_status();
     Ok(Json(
