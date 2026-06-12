@@ -1,10 +1,12 @@
 mod model_index;
 mod peer_state;
 mod port_pool;
+mod spawn_reservations;
 
 pub use model_index::{build_pre_args, get_args_hash_for_key, ModelIndex};
 pub use peer_state::{PeerModelStats, PeerState};
 pub use port_pool::PortPool;
+pub use spawn_reservations::SpawnReservations;
 
 use crate::build_manager::BuildManager;
 use crate::config::{Cookbook, ModelDefaults, NodeConfig, Profile};
@@ -123,6 +125,12 @@ pub struct NodeState {
     /// Notified when cluster capacity changes (instance idle, terminated, peer update).
     /// Used by route_or_wait() to efficiently wait for capacity.
     pub capacity_notify: Arc<Notify>,
+    /// In-flight spawn reservations: spawns that passed capacity checks but
+    /// whose instances are not yet in `instances`. Reserved while holding the
+    /// `instances` write lock (check-and-reserve is atomic); released via
+    /// RAII from any context. Interior mutex is a synchronous leaf lock,
+    /// never held across `await`.
+    pub spawn_reservations: Arc<SpawnReservations>,
     /// Model:profile keys that failed to spawn due to InsufficientResources
     /// and need eviction of existing instances to proceed. Used by the drain
     /// scheduler to decide when to drain an incumbent model.
@@ -465,6 +473,7 @@ impl NodeState {
             discovery,
             circuit_breaker,
             capacity_notify: Arc::new(Notify::new()),
+            spawn_reservations: Arc::new(SpawnReservations::default()),
             needs_eviction: Arc::new(RwLock::new(HashSet::new())),
             gossip_trigger: Arc::new(Notify::new()),
             peer_pending_forwards: Arc::new(RwLock::new(HashMap::new())),
@@ -1622,6 +1631,40 @@ impl NodeState {
                             self.needs_eviction.write().await.insert(key.clone());
                         }
 
+                        // Close the lost-wake window for reservation-gated
+                        // blocks: an in-flight spawn whose reservation tipped
+                        // the capacity check above may have been abandoned
+                        // before this request became visible in the queue, in
+                        // which case its abandon notification found nobody to
+                        // wake. Now that we are enqueued, re-check the gate
+                        // and wake the queue's front waiter if it cleared.
+                        if matches!(
+                            e,
+                            NodeError::MaxInstancesProfile | NodeError::MaxInstancesNode
+                        ) {
+                            let gate_cleared = {
+                                let instances_map = self.instances.read().await;
+                                let profile_count = Self::count_profile_instances(
+                                    &instances_map,
+                                    model_name,
+                                    &profile.id,
+                                )
+                                .await;
+                                let max_instances =
+                                    profile.effective_max_instances(&self.config.model_defaults);
+                                let profile_ok = profile_count
+                                    + self.spawn_reservations.profile_count(&key)
+                                    < max_instances;
+                                let node_ok = instances_map.len()
+                                    + self.spawn_reservations.node_total()
+                                    < self.config.max_instances_per_node;
+                                profile_ok && node_ok
+                            };
+                            if gate_cleared {
+                                self.notify_queue(model_name, &profile.id).await;
+                            }
+                        }
+
                         // Wait for queue notification with optional timeout
                         let wait_result = match queue_timeout {
                             Some(timeout) => {
@@ -1803,11 +1846,18 @@ impl NodeState {
                 // Lost the race or instance started draining — fall through to spawn/queue
             }
 
-            // 3. Check profile max instances
+            // 3. Check profile max instances. In-flight spawn reservations
+            // count toward capacity: a spawn that already passed these checks
+            // but hasn't reached the map yet must block a second contender
+            // here (it queues and is served by the winner's instance) instead
+            // of letting it spawn a duplicate that would be killed at
+            // insertion time.
+            let profile_key = format!("{}:{}", model_name, profile.id);
             let profile_count =
                 Self::count_profile_instances(&instances_map, model_name, &profile.id).await;
+            let reserved_profile = self.spawn_reservations.profile_count(&profile_key);
             let max_instances = profile.effective_max_instances(&self.config.model_defaults);
-            if profile_count >= max_instances {
+            if profile_count + reserved_profile >= max_instances {
                 return Err(NodeError::MaxInstancesProfile);
             }
 
@@ -1823,7 +1873,10 @@ impl NodeState {
                 .pick_victims(&instances_map, required_vram, required_sysmem)
                 .await?;
 
-            let current_instances = instances_map.len();
+            // In-flight spawn reservations occupy node capacity too. They are
+            // not in the map, so they can never be picked as eviction victims
+            // — the eviction math below only frees map entries.
+            let current_instances = instances_map.len() + self.spawn_reservations.node_total();
             let max_node_instances = self.config.max_instances_per_node;
 
             if current_instances + 1 > max_node_instances {
@@ -1955,6 +2008,32 @@ impl NodeState {
                 }
             }
 
+            // All capacity checks passed and we are committed to spawning.
+            // Reserve the slot before releasing the write lock so concurrent
+            // contenders see this in-flight spawn in the checks above. The
+            // guard releases on every error/cancellation path; on success it
+            // is handed off at map insertion, where the instance starts being
+            // counted via the map instead. On abandonment (spawn failure or
+            // request cancellation) capacity frees up without any instance
+            // reaching the map, so no later slot-release or termination event
+            // would ever wake requests that queued because of this
+            // reservation — wake them here. Drop is sync and the queue locks
+            // are async, so the work happens in a spawned task (same pattern
+            // as SlotReleaseGuard).
+            let abandon_state = self.clone();
+            let mut spawn_reservation = self.spawn_reservations.reserve(
+                profile_key,
+                Some(Box::new(move || {
+                    tokio::spawn(async move {
+                        // Drains scheduled because this reservation occupied
+                        // node capacity may no longer be needed; re-evaluate
+                        // before waking waiters.
+                        abandon_state.maybe_cancel_drains().await;
+                        abandon_state.notify_all_queues().await;
+                    });
+                })),
+            );
+
             // Release outer write lock before entering retry loop (will re-acquire as needed)
             drop(instances_map);
 
@@ -1994,7 +2073,7 @@ impl NodeState {
                 // Check if this is a cold start (no learned memory for this args_hash)
                 let is_cold_start = !self.metrics.has_memory_data(&args_hash).await;
 
-                let new_instance = Instance::new(
+                let mut new_instance = Instance::new(
                     instance_id.clone(),
                     model_name.to_string(),
                     profile.id.clone(),
@@ -2003,6 +2082,15 @@ impl NodeState {
                     args_hash.clone(),
                     is_cold_start,
                 );
+                if reserve_slot {
+                    // Claim the spawning request's slot before the instance
+                    // is shared: once it is in the map, concurrent requests
+                    // (including ready-time woken waiters) can attach and
+                    // increment the count, and a late `= 1` assignment would
+                    // overwrite their increments, undercounting active
+                    // requests for the rest of the instance's life.
+                    new_instance.in_flight_requests = 1;
+                }
                 let inst_arc = Arc::new(RwLock::new(new_instance));
 
                 // Try to spawn BEFORE inserting into map to avoid race condition
@@ -2019,6 +2107,10 @@ impl NodeState {
 
                         // Re-check capacity constraints to close the race window between
                         // dropping the lock to spawn and re-acquiring it for insertion.
+                        // These re-checks intentionally count the MAP ONLY (not spawn
+                        // reservations — our own is still held and would self-block).
+                        // With reservations gating admission they should never fire;
+                        // they remain as defense in depth.
                         let current_profile_count =
                             Self::count_profile_instances(&instances_map, model_name, &profile.id)
                                 .await;
@@ -2061,8 +2153,20 @@ impl NodeState {
                         }
 
                         instances_map.insert(instance_id.clone(), inst_arc.clone());
+                        // The instance is now counted via the map; release the
+                        // reservation while still holding the lock so the
+                        // hand-off is atomic for concurrent capacity checks.
+                        spawn_reservation.handoff();
                         drop(instances_map);
-                        self.update_peak_memory(model_name, &profile.id).await;
+                        // INVARIANT: no awaits between the map insertion above
+                        // and this function's return. The spawning request's
+                        // in_flight slot was pre-claimed on the instance, and
+                        // the SlotReleaseGuard protecting it is only created
+                        // by the caller after we return (in the same poll);
+                        // an await here would open a cancellation window that
+                        // leaks the claimed slot on a mapped instance,
+                        // permanently blocking idle eviction. update_peak_memory
+                        // runs in the readiness task instead.
                         // Success - break out of retry loop with args
                         break (instance_id, port, inst_arc, is_cold_start, args);
                     }
@@ -2118,7 +2222,20 @@ impl NodeState {
             let model_key = format!("{}:{}", model_name, profile.id);
             let args_hash_clone = args_hash.clone();
             let is_cold = is_cold_start;
+            let ready_state = self.clone();
+            let ready_model = model_name.to_string();
+            let ready_profile = profile.id.clone();
             tokio::spawn(async move {
+                // Refresh peak-memory accounting for this model's instances.
+                // Runs here (not inline after insertion) so the spawn path
+                // stays await-free between map insertion and returning the
+                // pre-claimed slot to the caller — see the INVARIANT comment
+                // at the insertion site. LOCK_ORDER: must run before the
+                // instance read guard below (instances is lock 1).
+                ready_state
+                    .update_peak_memory(&ready_model, &ready_profile)
+                    .await;
+
                 let inst = inst_clone.read().await;
                 if let Err(e) = inst
                     .wait_for_ready(startup_timeout, api_key, &http_client)
@@ -2127,6 +2244,22 @@ impl NodeState {
                     error!("Instance {} failed to become ready: {}", inst.id, e);
                     inst.clear_startup_log();
                     let _ = inst.stop().await;
+                    // LOCK_ORDER: release the instance lock (4) before the
+                    // eviction pass acquires `instances` (1).
+                    drop(inst);
+
+                    // The stopped instance still occupies its map slot — and
+                    // its model:profile capacity count — until an eviction
+                    // pass removes it. Requests that queued behind this spawn
+                    // (gated by its reservation) would wait up to a full
+                    // periodic eviction tick before retrying; run a pass now
+                    // so they are woken immediately (check_idle_instances
+                    // removes dead instances and ends with
+                    // notify_all_queues). Same precedent as the immediate
+                    // pass after a cookbook reload.
+                    if let Err(e) = ready_state.check_idle_instances().await {
+                        error!("Eviction pass after failed startup failed: {}", e);
+                    }
                 } else {
                     // Parse model params from startup log now that instance is ready
                     inst.parse_and_store_startup_params();
@@ -2147,9 +2280,37 @@ impl NodeState {
                     // Trigger instant gossip so peers learn about new model availability
                     gossip_trigger.notify_one();
 
+                    let spare_slots = if max_concurrent == 0 {
+                        usize::MAX
+                    } else {
+                        max_concurrent.saturating_sub(inst.in_flight_requests)
+                    };
+                    let instance_id = inst.id.clone();
+                    let pid = inst.get_pid();
+                    // LOCK_ORDER: release the instance lock (4) before
+                    // notify_queue acquires `queues` (2).
+                    drop(inst);
+
+                    // Wake queued waiters for this model:profile, up to the
+                    // ready instance's spare concurrency — and before the
+                    // cold-start sampling sleep below, so waiters near their
+                    // queue timeout are not held up by it. Requests that
+                    // queued while this spawn was in flight (gated by the
+                    // spawn reservation) would otherwise sleep until some
+                    // unrelated slot-release event, even though the instance
+                    // is ready with free slots. Woken waiters re-check
+                    // capacity themselves, so this can only ever wake too
+                    // many (they re-queue), never admit too many.
+                    let mut woken = 0usize;
+                    while woken < spare_slots
+                        && ready_state.notify_queue(&ready_model, &ready_profile).await
+                    {
+                        woken += 1;
+                    }
+
                     if is_cold {
                         // Cold start: sample memory after ready and store learned value
-                        if let Some(pid) = inst.get_pid() {
+                        if let Some(pid) = pid {
                             // Wait a moment for memory to stabilize after model load
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                             let (vram, sysmem) = memory_sampler.sample(pid);
@@ -2157,7 +2318,7 @@ impl NodeState {
                                 let hash_metrics = metrics.get_hash_metrics(&args_hash_clone).await;
                                 hash_metrics.observe_memory(vram, sysmem);
                                 info!(
-                                    instance_id = %inst.id,
+                                    instance_id = %instance_id,
                                     args_hash = %args_hash_clone,
                                     vram_mb = vram,
                                     sysmem_mb = sysmem,
@@ -2168,12 +2329,6 @@ impl NodeState {
                     }
                 }
             });
-
-            if reserve_slot {
-                let mut inst_write = inst_arc.write().await;
-                inst_write.in_flight_requests = 1;
-                inst_write.last_activity = std::time::Instant::now();
-            }
 
             info!(
                 event = "instance_spawn",
@@ -3668,6 +3823,141 @@ mod tests {
         drop(pending);
 
         permit.release().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_reservation_blocks_profile_admission_before_spawn() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        config.llama_cpp.binary_path = "/nonexistent/llamesh-test/llama-server".into();
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(
+            NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                .await
+                .unwrap(),
+        );
+        let profile = sample_profile(); // max_instances = 1
+
+        // Simulate a concurrent request mid-spawn: its capacity checks have
+        // passed and its reservation is held, but its instance has not
+        // reached the instances map yet.
+        let guard = state
+            .spawn_reservations
+            .reserve("test:default".to_string(), None);
+
+        let err = state
+            .try_get_or_spawn("test", &profile, false, "test", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, NodeError::MaxInstancesProfile),
+            "in-flight reservation must gate profile admission, got: {err:?}"
+        );
+        assert!(
+            state.instances.read().await.is_empty(),
+            "the losing contender must not have spawned anything"
+        );
+
+        // Once the in-flight spawn resolves (here: released), admission
+        // proceeds past the capacity gate again — and fails much later at
+        // the actual process spawn, since the binary path does not exist.
+        drop(guard);
+        let err = state
+            .try_get_or_spawn("test", &profile, false, "test", false)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, NodeError::MaxInstancesProfile),
+            "a released reservation must not gate admission, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_reservation_counts_toward_node_capacity() {
+        let mut config = minimal_node_config();
+        config.max_vram_mb = 1_000_000;
+        config.max_sysmem_mb = 1_000_000;
+        config.cluster.enabled = false;
+        config.max_instances_per_node = 1;
+        config.llama_cpp.binary_path = "/nonexistent/llamesh-test/llama-server".into();
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(
+            NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                .await
+                .unwrap(),
+        );
+        let profile = sample_profile();
+
+        // A different profile's in-flight spawn occupies the node's only
+        // slot. It is not in the map, so it cannot be evicted to make room.
+        let _guard = state
+            .spawn_reservations
+            .reserve("other-model:default".to_string(), None);
+
+        let err = state
+            .try_get_or_spawn("test", &profile, false, "test", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, NodeError::MaxInstancesNode),
+            "in-flight reservation must count toward node capacity, got: {err:?}"
+        );
+        assert!(state.instances.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_reservation_released_at_insertion_on_successful_spawn() {
+        let mut config = minimal_node_config();
+        config.max_vram_mb = 1_000_000;
+        config.max_sysmem_mb = 1_000_000;
+        config.cluster.enabled = false;
+        // The spawned process must stay alive past the assertions: a process
+        // that exits immediately fails the background readiness check, whose
+        // failure path runs an eviction pass that could remove the instance
+        // from the map before the assertions run. Use a script that ignores
+        // the llama-server args and sleeps.
+        let fake_server = std::env::temp_dir().join(format!(
+            "llamesh-fake-server-{}",
+            ulid::Ulid::new().to_string()
+        ));
+        tokio::fs::write(&fake_server, "#!/bin/sh\nsleep 300\n")
+            .await
+            .unwrap();
+        let mut perms = tokio::fs::metadata(&fake_server)
+            .await
+            .unwrap()
+            .permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        tokio::fs::set_permissions(&fake_server, perms)
+            .await
+            .unwrap();
+        config.llama_cpp.binary_path = fake_server.to_string_lossy().to_string();
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(
+            NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                .await
+                .unwrap(),
+        );
+        let profile = sample_profile();
+
+        let inst = state
+            .try_get_or_spawn("test", &profile, false, "test", false)
+            .await
+            .expect("spawn should succeed with a spawnable binary");
+
+        // The instance is in the map and the reservation has been handed off.
+        assert_eq!(state.instances.read().await.len(), 1);
+        assert_eq!(
+            state.spawn_reservations.node_total(),
+            0,
+            "reservation must be released when the instance is inserted"
+        );
+        assert_eq!(state.spawn_reservations.profile_count("test:default"), 0);
+
+        // Cleanup: stop the child and remove the fake server script.
+        let inst = inst.read().await;
+        let _ = inst.stop().await;
+        let _ = tokio::fs::remove_file(&fake_server).await;
     }
 
     #[tokio::test]

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.7] - 2026-06-12
+
+### Fixed
+
+- Concurrent requests can no longer waste a llama-server spawn racing for the
+  same capacity slot. The capacity checks (per-profile `max_instances` and
+  node-wide `max_instances_per_node`) were enforced again only *after* a new
+  process had been spawned, because the instances lock is released during the
+  slow spawn itself; two concurrent requests for the same profile could both
+  pass the checks, both spawn, and the loser killed its just-spawned process
+  at insertion time (`spawn_profile_race_detected`), wasting a process exec
+  and partial model load. Spawns now take an in-flight capacity reservation
+  while still holding the instances lock, making check-and-reserve atomic:
+  the second contender observes the reservation and queues immediately —
+  before spawning — and is served by the winner's instance as before.
+  Reservations are RAII-released on every failure path (including request
+  cancellation) and handed off when the instance is inserted into the map.
+  Because queued contenders now depend on the in-flight spawn resolving,
+  every resolution wakes them: an abandoned reservation (spawn failure or
+  cancellation) notifies all queues, since capacity freed without any
+  instance reaching the map and no later event would do it; an instance
+  becoming ready wakes queued waiters for its model and profile up to its
+  spare concurrency slots; and a failed startup triggers an immediate
+  eviction pass (which removes the dead instance and notifies all queues)
+  instead of leaving waiters to the next periodic eviction tick; and a
+  request that enqueues after being gated by a reservation re-checks the
+  gate once it is visible in the queue, closing the window where an abandon
+  notification fires before the loser has enqueued. The spawning request's
+  own concurrency slot is also now claimed before the instance is shared,
+  closing a window where a concurrently attaching request's increment could
+  be overwritten and the instance permanently undercounted. The post-spawn
+  race detection remains as defense in depth, but is no longer expected to
+  fire. (#71)
+
 ## [1.10.6] - 2026-06-12
 
 ### Fixed
