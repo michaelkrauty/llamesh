@@ -1553,6 +1553,7 @@ dependencies = [
  "hex",
  "hmac",
  "hostname",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
