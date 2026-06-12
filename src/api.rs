@@ -18,7 +18,7 @@ use axum::{
     Extension, Json, Router,
 };
 use http_body_util::BodyExt;
-use hyper_util::rt::TokioTimer;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
@@ -439,8 +439,19 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
                         }
                     }
                     DetectedProtocol::Http | DetectedProtocol::Http2 => {
-                        // Plain HTTP connection
-                        handle_http_connection(tcp_stream, remote_addr, app, http_config).await;
+                        // Plain HTTP connection. An `Http2` detection means the
+                        // client sent the HTTP/2 connection preface (`PRI `),
+                        // i.e. prior-knowledge cleartext HTTP/2 (h2c), and must
+                        // be served by the HTTP/2 stack.
+                        let use_http2 = matches!(protocol, DetectedProtocol::Http2);
+                        handle_http_connection(
+                            tcp_stream,
+                            remote_addr,
+                            app,
+                            http_config,
+                            use_http2,
+                        )
+                        .await;
                     }
                     DetectedProtocol::Noise => {
                         // Noise Protocol - cluster traffic
@@ -501,7 +512,14 @@ async fn handle_tls_connection(
         }
     };
 
-    serve_http_connection(hyper_util::rt::TokioIo::new(wrapper), service, http_config).await;
+    // No ALPN protocols are advertised, so TLS clients negotiate HTTP/1.1.
+    serve_http_connection(
+        hyper_util::rt::TokioIo::new(wrapper),
+        service,
+        http_config,
+        false,
+    )
+    .await;
 }
 
 /// Handle a plain HTTP connection (API traffic)
@@ -510,6 +528,7 @@ async fn handle_http_connection(
     remote_addr: SocketAddr,
     app: Router<()>,
     http_config: crate::config::HttpConfig,
+    use_http2: bool,
 ) {
     let conn_handle = ConnectionHandle::new(tcp_stream.as_raw_fd());
     let app = app.layer(Extension(conn_handle));
@@ -527,13 +546,22 @@ async fn handle_http_connection(
         hyper_util::rt::TokioIo::new(tcp_stream),
         service,
         http_config,
+        use_http2,
     )
     .await;
 }
 
-/// Serve HTTP over any IO type
-async fn serve_http_connection<I, S>(io: I, service: S, http_config: crate::config::HttpConfig)
-where
+/// Serve HTTP over any IO type.
+///
+/// `use_http2` selects the HTTP/2 connection stack for prior-knowledge
+/// cleartext HTTP/2 (h2c) connections; otherwise the connection is served as
+/// HTTP/1.1.
+async fn serve_http_connection<I, S>(
+    io: I,
+    service: S,
+    http_config: crate::config::HttpConfig,
+    use_http2: bool,
+) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
     S: tower::Service<
             axum::http::Request<axum::body::Body>,
@@ -554,13 +582,29 @@ where
             }
         });
 
-    let mut builder = hyper::server::conn::http1::Builder::new();
-    builder.timer(TokioTimer::new());
     let idle_secs = http_config.idle_timeout_seconds.max(30);
-    builder.header_read_timeout(Duration::from_secs(idle_secs));
 
-    if let Err(err) = builder.serve_connection(io, hyper_service).await {
-        tracing::debug!("Connection error: {}", err);
+    if use_http2 {
+        // HTTP/2 has no equivalent of the HTTP/1 header read timeout; idle and
+        // stalled connections are instead bounded by ping-based keep-alive: a
+        // PING is sent after `idle_secs` without frames, and the connection is
+        // closed if the peer does not answer within the keep-alive timeout
+        // (hyper's default, 20s).
+        let mut builder = hyper::server::conn::http2::Builder::new(TokioExecutor::new());
+        builder.timer(TokioTimer::new());
+        builder.keep_alive_interval(Some(Duration::from_secs(idle_secs)));
+
+        if let Err(err) = builder.serve_connection(io, hyper_service).await {
+            tracing::debug!("Connection error: {}", err);
+        }
+    } else {
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder.timer(TokioTimer::new());
+        builder.header_read_timeout(Duration::from_secs(idle_secs));
+
+        if let Err(err) = builder.serve_connection(io, hyper_service).await {
+            tracing::debug!("Connection error: {}", err);
+        }
     }
 }
 

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-06-12
+
+### Added
+
+- Cleartext HTTP/2 (h2c) support: connections beginning with the HTTP/2
+  prior-knowledge preface are now served by the HTTP/2 stack. The protocol
+  detector already classified them as HTTP/2, but the accept loop handed them
+  to the HTTP/1 connection handler, so every h2c client failed with a framing
+  error. HTTP/2 connections are kept healthy with ping-based keep-alive (a
+  PING after `http.idle_timeout_seconds` without frames) in place of HTTP/1's
+  header read timeout. HTTP/1.1, TLS, and Noise handling are unchanged. (#83)
+
 ## [1.11.2] - 2026-06-12
 
 ### Documentation
