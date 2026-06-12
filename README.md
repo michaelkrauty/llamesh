@@ -192,6 +192,14 @@ Use `__` (double underscore) for nested fields: `LLAMESH_CLUSTER__ENABLED=true`.
 - **[config.example.yaml](config.example.yaml)** — Annotated example configuration.
 - **[cookbook.example.yaml](cookbook.example.yaml)** — Annotated example cookbook with model definitions.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, quality gates, and pull request conventions.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the security model and how to report vulnerabilities privately.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
