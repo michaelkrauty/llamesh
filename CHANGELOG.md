@@ -21,14 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and never closed again either (successes while open were discarded, leaving
   the circuit reported as open in metrics indefinitely and the backoff
   escalation counter never reset). "Open with backoff elapsed" is now treated
-  as the recovery probe phase: the synchronous gate admits at most one probe
-  per `cluster.circuit_breaker.half_open_probe_interval_ms` (default 1000ms,
-  0 disables gating — this also implements the previously unenforced
-  "limited probes" half-open contract), a success recorded in that phase
-  advances the circuit toward half-open/closed, and a failure restarts the
-  block window with escalated backoff. Results arriving while the backoff is
-  still running are stale responses from requests sent before the circuit
-  opened and leave the state unchanged. (#79)
+  as the recovery probe phase: candidate filtering stays a read-only
+  eligibility check, the probe slot is claimed at the dispatch commit point
+  (at most one probe per `cluster.circuit_breaker.half_open_probe_interval_ms`,
+  default 1000ms, 0 admits every dispatch — this also implements the
+  previously unenforced "limited probes" half-open contract, without letting
+  candidate scans burn the probe slot of peers they never dispatch to), and
+  only results attributed to a claimed probe drive recovery: a probe success
+  advances the circuit toward half-open/closed and a probe failure restarts
+  the block window with escalated backoff, while late responses from
+  requests sent before the circuit opened leave the state unchanged whether
+  they arrive during or after the backoff window. Gossip claims the probe
+  slot when available, so an idle cluster recovers a returned peer within a
+  gossip round even with no client traffic, and recovery transitions wake
+  routing waiters parked on capacity notifications so already-queued
+  requests retry immediately. (#79)
 
 ## [1.11.0] - 2026-06-12
 

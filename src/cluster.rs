@@ -130,6 +130,13 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 .unwrap_or_else(|| peer_url.clone());
             let expected_node_id = url_to_node_id.get(&peer_url).cloned();
             let circuit_breaker = state.circuit_breaker.clone();
+            let capacity_notify = state.capacity_notify.clone();
+            // Gossip always sends regardless of circuit state — it is the
+            // cluster's standing health probe. Claim the recovery probe slot
+            // when one is available so a gossip success while the circuit is
+            // open is attributed as a recovery probe result; without traffic,
+            // this is what closes the circuit after a peer comes back.
+            let _ = circuit_breaker.try_claim_dispatch_sync(&cb_key);
 
             // Spawn each gossip request to avoid head-of-line blocking in the loop
             tokio::spawn(async move {
@@ -169,7 +176,9 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                         }
                                     }
                                     if (200..300).contains(&status) {
-                                        circuit_breaker.record_success(&cb_key).await;
+                                        if circuit_breaker.record_success(&cb_key).await {
+                                            capacity_notify.notify_waiters();
+                                        }
                                     } else {
                                         circuit_breaker.record_failure(&cb_key).await;
                                         debug!(
@@ -192,8 +201,11 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 } else {
                     match client.post(&url).json(&message).send().await {
                         Ok(resp) if resp.status().is_success() => {
-                            // Record success - resets failure count and closes circuit if half-open
-                            circuit_breaker.record_success(&cb_key).await;
+                            // Record success - resets failure count, and on a
+                            // recovery transition wakes parked routing waiters.
+                            if circuit_breaker.record_success(&cb_key).await {
+                                capacity_notify.notify_waiters();
+                            }
                         }
                         Ok(resp) => {
                             circuit_breaker.record_failure(&cb_key).await;

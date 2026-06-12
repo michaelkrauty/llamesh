@@ -65,12 +65,16 @@ impl PeerCircuit {
     /// of the full queued backlog. An interval of 0 disables gating (every
     /// request is admitted, the pre-gating behavior).
     fn try_claim_probe(&self, interval_ms: u64) -> bool {
-        if interval_ms == 0 {
-            return true;
-        }
         // `max(1)` keeps a probe claimed in the first millisecond
         // distinguishable from "never probed".
         let now_ms = (self.created.elapsed().as_millis() as u64).max(1);
+        if interval_ms == 0 {
+            // Gating disabled: every dispatch is admitted — but the claim is
+            // still stamped, since result attribution (probe vs stale
+            // pre-open response) depends on it.
+            self.last_probe_ms.store(now_ms, Ordering::Relaxed);
+            return true;
+        }
         let last = self.last_probe_ms.load(Ordering::Relaxed);
         if last != 0 && now_ms.saturating_sub(last) < interval_ms {
             return false;
@@ -230,28 +234,64 @@ impl CircuitBreaker {
 
         match circuit.state {
             CircuitState::Closed => true,
-            // Half-open (explicit, or implicit as an open circuit whose
-            // backoff has elapsed): admit one recovery probe per configured
-            // interval so the recovering peer is not herded by the whole
-            // queued backlog. The probe stamp is an atomic, so this works
-            // under the read lock.
+            CircuitState::HalfOpen => true,
+            CircuitState::Open => {
+                // Eligible for recovery probes once the backoff has elapsed.
+                // This check is read-only on purpose: it runs while routing
+                // filters peer candidates, and most filtered candidates are
+                // never dispatched to. The probe slot is claimed at the point
+                // of committing to send, via `try_claim_dispatch_sync`.
+                let backoff = self.calculate_backoff(circuit.consecutive_opens);
+                circuit.last_state_change.elapsed() >= backoff
+            }
+        }
+    }
+
+    /// Claim the right to dispatch one request to this peer; call at the
+    /// point of committing to send (not while filtering candidates, which
+    /// would burn the probe slot on peers that are never dispatched to).
+    ///
+    /// Closed circuits always admit. Circuits in the recovery phase —
+    /// half-open, or open with backoff elapsed — admit at most one probe per
+    /// `half_open_probe_interval_ms`, so a recovering peer sees a trickle of
+    /// probes instead of the queued backlog. Like `should_allow_sync`, this
+    /// is synchronous and conservatively admits when the lock is contended.
+    pub fn try_claim_dispatch_sync(&self, peer_id: &str) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+
+        let circuits = match self.circuits.try_read() {
+            Ok(guard) => guard,
+            Err(_) => return true,
+        };
+
+        let Some(circuit) = circuits.get(peer_id) else {
+            return true;
+        };
+
+        match circuit.state {
+            CircuitState::Closed => true,
             CircuitState::HalfOpen => {
                 circuit.try_claim_probe(self.config.half_open_probe_interval_ms)
             }
             CircuitState::Open => {
                 let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                if circuit.last_state_change.elapsed() < backoff {
-                    return false;
-                }
-                circuit.try_claim_probe(self.config.half_open_probe_interval_ms)
+                circuit.last_state_change.elapsed() >= backoff
+                    && circuit.try_claim_probe(self.config.half_open_probe_interval_ms)
             }
         }
     }
 
-    /// Record a successful request to a peer
-    pub async fn record_success(&self, peer_id: &str) {
+    /// Record a successful request to a peer.
+    ///
+    /// Returns `true` when the success advanced a recovery transition
+    /// (open → half-open, or → closed): callers should wake routing waiters
+    /// parked on capacity notifications, which may have filtered this peer
+    /// out before it recovered.
+    pub async fn record_success(&self, peer_id: &str) -> bool {
         if !self.config.enabled {
-            return;
+            return false;
         }
 
         let mut circuits = self.circuits.write().await;
@@ -271,29 +311,34 @@ impl CircuitBreaker {
                         peer_id = %peer_id,
                         "Circuit breaker closed after successful recovery"
                     );
+                    return true;
                 }
+                false
             }
             CircuitState::Closed => {
                 // Reset failure count on success
                 circuit.failure_count = 0;
+                false
             }
             CircuitState::Open => {
-                // The production gate (`should_allow_sync`) admits probes
-                // once the backoff has elapsed but cannot transition state
-                // under its read lock — a success arriving here is a
-                // successful recovery probe, so drive the transition now.
-                // (A success while the backoff is still running is a stale
-                // response from a request sent before the circuit opened;
-                // ignore it, as before.)
+                // The production gate cannot transition state under its read
+                // lock, so a success from a dispatched recovery probe arrives
+                // here while the circuit is still Open — drive the transition
+                // now. Attribute the result to a probe only when one was
+                // actually claimed (the swap consumes the claim): with
+                // unlimited request durations, a slow response from a request
+                // sent before the circuit opened can arrive after the backoff
+                // elapsed, and must not recover a peer nobody has re-probed.
                 let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                if circuit.last_state_change.elapsed() >= backoff {
+                if circuit.last_state_change.elapsed() >= backoff
+                    && circuit.last_probe_ms.swap(0, Ordering::Relaxed) != 0
+                {
                     circuit.last_state_change = Instant::now();
                     circuit.success_count = 1;
                     if circuit.success_count >= self.config.success_threshold {
                         circuit.state = CircuitState::Closed;
                         circuit.failure_count = 0;
                         circuit.consecutive_opens = 0;
-                        circuit.reset_probe();
                         tracing::info!(
                             peer_id = %peer_id,
                             "Circuit breaker closed after successful recovery"
@@ -305,7 +350,9 @@ impl CircuitBreaker {
                             "Circuit breaker transitioning to half-open"
                         );
                     }
+                    return true;
                 }
+                false
             }
         }
     }
@@ -329,6 +376,8 @@ impl CircuitBreaker {
                     circuit.state = CircuitState::Open;
                     circuit.last_state_change = Instant::now();
                     circuit.consecutive_opens += 1;
+                    circuit.success_count = 0;
+                    circuit.reset_probe();
                     tracing::warn!(
                         peer_id = %peer_id,
                         failures = circuit.failure_count,
@@ -349,19 +398,20 @@ impl CircuitBreaker {
                 );
             }
             CircuitState::Open => {
-                // A failure after the backoff elapsed is a failed recovery
-                // probe admitted by the sync gate: restart the block window
-                // with escalated backoff. Without this, the first backoff
-                // expiry permanently un-gates a still-failing peer, since
-                // nothing ever moves `last_state_change` forward again.
-                // (Failures inside the window are stale responses from
-                // requests sent before the circuit opened; keep waiting.)
+                // A failure from a claimed recovery probe restarts the block
+                // window with escalated backoff. Without this, the first
+                // backoff expiry permanently un-gates a still-failing peer,
+                // since nothing ever moves `last_state_change` forward again.
+                // The claim requirement (the swap consumes it) keeps stale
+                // failures — slow requests sent before the circuit opened —
+                // from escalating a window nobody has re-probed.
                 let backoff = self.calculate_backoff(circuit.consecutive_opens);
-                if circuit.last_state_change.elapsed() >= backoff {
+                if circuit.last_state_change.elapsed() >= backoff
+                    && circuit.last_probe_ms.swap(0, Ordering::Relaxed) != 0
+                {
                     circuit.last_state_change = Instant::now();
                     circuit.consecutive_opens += 1;
                     circuit.success_count = 0;
-                    circuit.reset_probe();
                     tracing::warn!(
                         peer_id = %peer_id,
                         consecutive_opens = circuit.consecutive_opens,
@@ -593,11 +643,12 @@ mod tests {
         assert!(!cb.should_allow_sync("p"));
 
         tokio::time::sleep(Duration::from_millis(5)).await;
-        assert!(cb.should_allow_sync("p")); // probe admitted after backoff
+        assert!(cb.should_allow_sync("p")); // eligible after backoff
+        assert!(cb.try_claim_dispatch_sync("p")); // probe claimed at dispatch
 
-        cb.record_success("p").await; // successful probe → half-open
+        assert!(cb.record_success("p").await); // successful probe → half-open
         assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
-        cb.record_success("p").await; // second success → closed
+        assert!(cb.record_success("p").await); // second success → closed
         assert_eq!(cb.get_state("p").await, CircuitState::Closed);
     }
 
@@ -614,8 +665,10 @@ mod tests {
 
         cb.record_failure("p").await; // open; backoff 40ms
         assert!(!cb.should_allow_sync("p"));
+        assert!(!cb.try_claim_dispatch_sync("p")); // dispatch denied too
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(cb.should_allow_sync("p")); // probe admitted
+        assert!(cb.should_allow_sync("p")); // eligible
+        assert!(cb.try_claim_dispatch_sync("p")); // probe claimed
 
         // Failed probe must restart the block window with doubled backoff;
         // without it, the first expiry permanently un-gates the peer.
@@ -649,7 +702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_gating_limits_admissions_per_interval() {
+    async fn probe_gating_limits_dispatch_claims_per_interval() {
         let config = CircuitBreakerConfig {
             failure_threshold: 1,
             success_threshold: 2,
@@ -661,16 +714,50 @@ mod tests {
         cb.record_failure("p").await;
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        assert!(cb.should_allow_sync("p")); // first probe admitted
-        assert!(!cb.should_allow_sync("p")); // backlog herd denied
-        assert!(!cb.should_allow_sync("p"));
+        // Eligibility checks (candidate filtering) are read-only and never
+        // consume the probe slot, no matter how many scans run.
+        assert!(cb.should_allow_sync("p"));
+        assert!(cb.should_allow_sync("p"));
+
+        assert!(cb.try_claim_dispatch_sync("p")); // first dispatch claims the probe
+        assert!(!cb.try_claim_dispatch_sync("p")); // backlog herd denied
+        assert!(!cb.try_claim_dispatch_sync("p"));
 
         // Recovery through probe successes reopens unrestricted traffic.
-        cb.record_success("p").await;
-        cb.record_success("p").await;
+        assert!(cb.record_success("p").await);
+        assert!(cb.record_success("p").await);
         assert_eq!(cb.get_state("p").await, CircuitState::Closed);
+        assert!(cb.try_claim_dispatch_sync("p"));
+        assert!(cb.try_claim_dispatch_sync("p"));
+    }
+
+    #[tokio::test]
+    async fn unclaimed_results_after_backoff_do_not_change_state() {
+        // With unlimited request durations, a slow response from a request
+        // sent before the circuit opened can arrive after the backoff has
+        // elapsed. Without a claimed probe it must neither recover the
+        // circuit nor escalate the backoff.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_base_ms: 1,
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::new(config);
+        cb.record_failure("p").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        assert!(!cb.record_success("p").await); // stale success: no recovery
+        assert_eq!(cb.get_state("p").await, CircuitState::Open);
+
+        cb.record_failure("p").await; // stale failure: no escalation
+        assert_eq!(cb.get_state("p").await, CircuitState::Open);
+        // Backoff window unchanged (1ms, long elapsed): peer still eligible.
         assert!(cb.should_allow_sync("p"));
-        assert!(cb.should_allow_sync("p"));
+
+        // A claimed probe's success, by contrast, recovers the circuit.
+        assert!(cb.try_claim_dispatch_sync("p"));
+        assert!(cb.record_success("p").await);
+        assert_eq!(cb.get_state("p").await, CircuitState::HalfOpen);
     }
 
     #[tokio::test]

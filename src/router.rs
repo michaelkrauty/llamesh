@@ -132,8 +132,12 @@ fn peer_status_is_failure(status: StatusCode) -> bool {
 async fn record_peer_status(state: &NodeState, peer_id: &str, status: StatusCode) {
     if peer_status_is_failure(status) {
         state.circuit_breaker.record_failure(peer_id).await;
-    } else {
-        state.circuit_breaker.record_success(peer_id).await;
+    } else if state.circuit_breaker.record_success(peer_id).await {
+        // The circuit just advanced toward recovery. Wake routing loops that
+        // parked on capacity_notify after filtering this peer out, so they
+        // retry (or send the next recovery probe) immediately instead of
+        // waiting for an unrelated capacity event.
+        state.capacity_notify.notify_waiters();
     }
 }
 
@@ -186,6 +190,10 @@ enum ForwardOutcome {
     /// Peer transport failed (network error, handshake, etc.). Caller should
     /// record a circuit-breaker failure and may retry.
     Transport(AppError),
+    /// The circuit breaker declined to admit this request: the peer's
+    /// circuit is recovering and the probe slot for this interval is taken.
+    /// Not a peer failure — the caller should wait for capacity and retry.
+    ProbeDenied,
 }
 
 /// Forward a request to a peer and classify the outcome. Buffers non-streaming
@@ -198,6 +206,12 @@ async fn attempt_peer_forward(
     response_streaming: bool,
 ) -> ForwardOutcome {
     let peer_id = request.peer_id;
+    // Circuit-breaker admission happens here, at the commit point, rather
+    // than during candidate filtering: filtering scans peers that are never
+    // dispatched to, and must not burn a recovering peer's probe slot.
+    if !state.circuit_breaker.try_claim_dispatch_sync(peer_id) {
+        return ForwardOutcome::ProbeDenied;
+    }
     let resp = match send_peer_request(state, request).await {
         Ok(resp) => resp,
         Err(e) => return ForwardOutcome::Transport(e),
@@ -722,6 +736,16 @@ pub async fn route_request(
                             peer = %peer.node_id,
                             reason = %reason,
                             "Peer reported saturation, waiting for cluster capacity"
+                        );
+                        drop(peer_forward_guard);
+                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+                        continue;
+                    }
+                    ForwardOutcome::ProbeDenied => {
+                        tracing::debug!(
+                            event = "forward_probe_denied",
+                            peer = %peer.node_id,
+                            "Peer circuit recovering and probe slot taken; waiting to retry"
                         );
                         drop(peer_forward_guard);
                         wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
@@ -1278,6 +1302,14 @@ pub async fn route_request(
                             peer = %current_node.node_id,
                             reason = %reason,
                             "Peer reported saturation, waiting for cluster capacity"
+                        );
+                        drop(peer_forward_guard);
+                    }
+                    ForwardOutcome::ProbeDenied => {
+                        tracing::debug!(
+                            event = "forward_probe_denied",
+                            peer = %current_node.node_id,
+                            "Peer circuit recovering and probe slot taken; waiting to retry"
                         );
                         drop(peer_forward_guard);
                     }
