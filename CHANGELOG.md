@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.1] - 2026-06-12
+
+### Fixed
+
+- Every integration-test node now writes its metrics snapshot to a dedicated
+  `tests/metrics_<name>.json` file (removed before each run) instead of
+  inheriting the default `./node-metrics.json`. Test nodes were persisting
+  over each other's snapshots, over previous runs' state, and over the
+  metrics file of any production node running from the same checkout —
+  and loading that node's counters at startup. (#87)
+
 ## [1.13.0] - 2026-06-12
 
 ### Added

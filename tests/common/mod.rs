@@ -89,6 +89,20 @@ pub async fn graceful_stop(child: &mut tokio::process::Child) {
     }
 }
 
+/// Dedicated per-node metrics file for a test, with leftovers from previous
+/// runs removed so persisted counters can't leak into metric assertions.
+/// Each spawned node's config must point `metrics_path` at the returned path
+/// (`./tests/metrics_<suffix>.json`): a unique file per node keeps test nodes
+/// from overwriting each other's snapshots — or the snapshot of a production
+/// node running from the same checkout, which is what the default
+/// `./node-metrics.json` would hit.
+pub async fn reset_metrics_file(root: &Path, suffix: &str) -> PathBuf {
+    let path = root.join(format!("tests/metrics_{suffix}.json"));
+    let _ = tokio::fs::remove_file(&path).await;
+    let _ = tokio::fs::remove_file(path.with_extension("tmp")).await;
+    path
+}
+
 pub async fn wait_for_ready(base_url: &str) -> bool {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))

@@ -46,12 +46,14 @@ async fn write_watchdog_fixtures(
 ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let mock_script = setup_mock_script(root, suffix).await;
     let config_path = root.join(format!("tests/config_{suffix}.yaml"));
+    common::reset_metrics_file(root, suffix).await;
     let cookbook_path = root.join(format!("tests/cookbook_{suffix}.yaml"));
 
     let config_content = format!(
         r#"
 node_id: "test-node-{suffix}"
 listen_addr: "127.0.0.1:{listen_port}"
+metrics_path: "./tests/metrics_{suffix}.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
@@ -248,6 +250,7 @@ async fn test_h2c_prior_knowledge() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "h2c").await;
     let config_path = root.join("tests/config_h2c.yaml");
+    common::reset_metrics_file(&root, "h2c").await;
     let cookbook_path = root.join("tests/cookbook_h2c.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -255,6 +258,7 @@ async fn test_h2c_prior_knowledge() {
         r#"
 node_id: "test-node-h2c"
 listen_addr: "127.0.0.1:9202"
+metrics_path: "./tests/metrics_h2c.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"

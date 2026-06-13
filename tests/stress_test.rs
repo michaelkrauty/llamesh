@@ -43,6 +43,7 @@ async fn test_stress_basic() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "stress").await;
     let config_path = root.join("tests/config_stress.yaml");
+    common::reset_metrics_file(&root, "stress").await;
     let cookbook_path = root.join("tests/cookbook_stress.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -50,6 +51,7 @@ async fn test_stress_basic() {
         r#"
 node_id: "stress-node"
 listen_addr: "127.0.0.1:9096"
+metrics_path: "./tests/metrics_stress.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 8192
 default_model: "stress-model:default"

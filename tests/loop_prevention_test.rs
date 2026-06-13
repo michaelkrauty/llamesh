@@ -13,6 +13,7 @@ async fn start_mock_node(suffix: &str, port_offset: u16) -> (tokio::process::Chi
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, &id).await;
     let config_path = root.join(format!("tests/config_{id}.yaml"));
+    common::reset_metrics_file(&root, &id).await;
     let cookbook_path = root.join(format!("tests/cookbook_{id}.yaml"));
     let proxy_bin = llamesh_binary(&root);
 
@@ -20,6 +21,7 @@ async fn start_mock_node(suffix: &str, port_offset: u16) -> (tokio::process::Chi
         r#"
 node_id: "{}"
 listen_addr: "{}"
+metrics_path: "./tests/metrics_{}.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
@@ -52,6 +54,7 @@ http:
 "#,
         id,
         listen,
+        id,
         15000 + port_offset,
         15009 + port_offset,
         mock_script.display()
