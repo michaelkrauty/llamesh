@@ -56,9 +56,11 @@ model_defaults:
   max_wait_in_queue_ms: 60000
   # Max request duration in ms, 0 = unlimited (default: 0)
   max_request_duration_ms: 0
-  # Minimum seconds an instance must serve before it can be drained for a
-  # competing model; after this it yields to queued competitors on its next
-  # idle transition. 0 = drain immediately. (default: 15)
+  # Minimum seconds a *busy* instance is protected from being drained for a
+  # competing model: an instance with its own requests still queued is not
+  # drained for a competitor until it has served this long. An instance that
+  # goes idle with an empty queue yields to a waiting competitor immediately,
+  # regardless of this value. 0 = never protected. (default: 15)
   min_eviction_tenure_secs: 15
 
 # Global cap on total queued requests across all models, 0 = no global limit

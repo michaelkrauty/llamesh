@@ -229,9 +229,12 @@ pub struct ModelDefaults {
     /// Maximum request duration (ms). 0 = unlimited (no timeout).
     #[serde(default = "default_max_request_duration_ms")]
     pub max_request_duration_ms: u64,
-    /// Minimum time (seconds) an instance must serve before it can be drained
-    /// for a competing model. After tenure expires, the instance yields to
-    /// queued competitors on its next idle transition. 0 = drain immediately.
+    /// Minimum time (seconds) a busy instance is protected from being drained
+    /// for a competing model: an instance with its own requests still queued is
+    /// not drained for a competitor until it has served this long. An instance
+    /// that goes idle with an empty queue yields to a waiting competitor
+    /// immediately regardless of tenure (drain fires on
+    /// `tenure_expired || own_queue_empty`). 0 = never protected.
     #[serde(default = "default_min_eviction_tenure_secs")]
     pub min_eviction_tenure_secs: u64,
 }
@@ -1312,13 +1315,19 @@ models:
     #[test]
     fn example_config_and_cookbook_load_and_validate() {
         // The annotated examples users copy from must stay loadable and valid
-        // as the schema evolves — not merely valid YAML. Loading them through
-        // the real loaders (the same calls main uses) and asserting the
-        // documented knobs keeps the examples from silently drifting away from
-        // the structs. Paths are relative to the crate root, where cargo runs
-        // tests from.
-        let config =
-            load_config(Path::new("config.example.yaml")).expect("config.example.yaml loads");
+        // as the schema evolves — not merely valid YAML. Parse them and run the
+        // same validation main does, asserting the documented knobs so the
+        // examples can't silently drift away from the structs. Paths are
+        // relative to the crate root, where cargo runs tests from.
+        //
+        // Parsed directly rather than through `load_config`, which layers in
+        // `LLAMESH_*` environment overrides: a developer shell or CI job with
+        // such a var exported would otherwise fail these assertions on an
+        // unchanged example, or mask real drift in the file.
+        let config: NodeConfig = serde_yaml::from_str(
+            &std::fs::read_to_string("config.example.yaml").expect("read config.example.yaml"),
+        )
+        .expect("config.example.yaml parses");
         config
             .validate()
             .expect("config.example.yaml passes validation");
