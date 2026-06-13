@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-06-13
+
+### Added
+
+- `GET /v1/models/{model}` retrieves a single model by id, completing the
+  OpenAI "retrieve model" endpoint (used by SDK calls such as
+  `client.models.retrieve(...)`). It returns the same object shape as one entry
+  of `GET /v1/models` — including models advertised only by cluster peers — and
+  responds with `404 Not Found` and the standard error envelope (`type`
+  `model_not_found`) when no local profile or peer advertises the id. The
+  default profile is addressed by the bare model name, other profiles as
+  `model:profile`.
+
 ## [1.14.0] - 2026-06-13
 
 ### Added

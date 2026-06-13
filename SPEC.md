@@ -600,6 +600,12 @@ Implementation notes:
 * For models advertised by cluster peers, metadata is `{ "source": "cluster", "advertised_by": "<peer_node_id>", "cluster_url": "<peer_url>" }`.
 * When in cluster mode, returns the union of models supported by the cluster.
 
+### Retrieve a Model
+
+**Endpoint:** `GET /v1/models/{model}`
+
+Returns the single model object — the same shape as one element of the `GET /v1/models` `data` array — whose `id` matches the path parameter. The default profile is addressed by the bare model name and any other profile as `model:profile`. The catalog searched is identical to `GET /v1/models`, so a model advertised only by a cluster peer is retrievable too. If no local profile or peer advertises the id, the response is `404 Not Found` with the standard error envelope (`type` `model_not_found`).
+
 ### Embeddings
 
 **Endpoint:** `POST /v1/embeddings`
@@ -660,6 +666,7 @@ Behavior:
 | `/v1/reranking` | POST | Reranking (alias) |
 | `/rerank` | POST | Reranking (bare path alias) |
 | `/v1/models` | GET | Model listing |
+| `/v1/models/{model}` | GET | Retrieve a single model |
 | `/healthz` | GET | Liveness probe |
 | `/health` | GET | Liveness probe (llama-server compatibility alias) |
 | `/readyz` | GET | Readiness probe |

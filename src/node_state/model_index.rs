@@ -164,8 +164,17 @@ pub async fn get_args_hash_for_key(cookbook: &RwLock<Cookbook>, key: &str) -> Op
         .iter()
         .find(|p| p.enabled && p.id == profile_id)?;
 
+    Some(args_hash_for_profile(profile))
+}
+
+/// Compute the args-hash for a profile directly, without any cookbook lookup.
+/// Callers that already hold the profile — e.g. while iterating the cookbook
+/// under its read lock — use this to avoid re-locking the cookbook, which would
+/// be a nested read that tokio's write-preferring `RwLock` can deadlock against
+/// a queued writer (a cookbook hot-reload).
+pub fn args_hash_for_profile(profile: &Profile) -> String {
     let (pre_args, _, _) = build_pre_args(profile);
-    Some(compute_args_hash(&pre_args))
+    compute_args_hash(&pre_args)
 }
 
 #[cfg(test)]

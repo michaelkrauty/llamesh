@@ -346,6 +346,10 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
         .route("/v1/reranking", post(router::route_request)) // Alias
         .route("/rerank", post(router::route_request)) // Alias
         .route("/v1/models", get(router::list_models))
+        // Catch-all (`*model`) rather than a single segment so model ids that
+        // contain `/` — which the cookbook permits — are retrievable, matching
+        // exactly what `/v1/models` advertises.
+        .route("/v1/models/*model", get(router::get_model))
         .route("/cluster/gossip", post(cluster::handle_gossip))
         .with_state(state.clone());
 
