@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.2] - 2026-06-13
+
+### Fixed
+
+- The Prometheus `/metrics` endpoint now emits each per-hash metric family
+  (`proxy_hash_requests_total`, `proxy_hash_errors_total`, …) as one
+  contiguous block. The per-hash section previously interleaved the seven
+  families — printing all samples for one hash, then all for the next — which
+  violates the exposition format's grouping requirement: strict parsers
+  (OpenMetrics, `promtool check metrics`) split each family into one-sample
+  fragments. Prometheus's own lenient parser was unaffected, so scraping
+  continued to work. (#89)
+
 ## [1.13.1] - 2026-06-12
 
 ### Fixed

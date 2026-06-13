@@ -801,84 +801,112 @@ pub async fn render_prometheus_with_circuit_breaker(
         }
     }
 
-    // Per-hash (model/profile) metrics
-    out.push_str("# HELP proxy_hash_requests_total Total requests per model/profile hash.\n");
-    out.push_str("# TYPE proxy_hash_requests_total counter\n");
-    out.push_str("# HELP proxy_hash_errors_total Total errors per model/profile hash.\n");
-    out.push_str("# TYPE proxy_hash_errors_total counter\n");
-    out.push_str("# HELP proxy_hash_tokens_generated_total Total tokens generated per hash.\n");
-    out.push_str("# TYPE proxy_hash_tokens_generated_total counter\n");
-    out.push_str("# HELP proxy_hash_total_latency_ms Total latency in milliseconds per hash.\n");
-    out.push_str("# TYPE proxy_hash_total_latency_ms counter\n");
-    out.push_str(
-        "# HELP proxy_hash_p95_latency_ms P95 latency in milliseconds (last 100 samples).\n",
-    );
-    out.push_str("# TYPE proxy_hash_p95_latency_ms gauge\n");
-    out.push_str("# HELP proxy_hash_peak_vram_mb Peak VRAM usage in MB per hash.\n");
-    out.push_str("# TYPE proxy_hash_peak_vram_mb gauge\n");
-    out.push_str("# HELP proxy_hash_peak_sysmem_mb Peak system memory usage in MB per hash.\n");
-    out.push_str("# TYPE proxy_hash_peak_sysmem_mb gauge\n");
+    // Per-hash (model/profile) metrics.
+    //
+    // The Prometheus exposition format requires every sample of a metric
+    // family to be contiguous, preceded by that family's HELP/TYPE. Emitting
+    // all the HELP/TYPE lines once and then a per-hash block (requests, errors,
+    // tokens, … for hash A; then the same for hash B) interleaves the families,
+    // which strict parsers (OpenMetrics, `promtool check metrics`) split into
+    // one-sample fragments. Snapshot each hash's values once, then emit one
+    // fully grouped family at a time.
+    struct HashRow {
+        labels: String,
+        requests: u64,
+        errors: u64,
+        tokens: u64,
+        total_latency_ms: u64,
+        p95_latency_ms: u64,
+        peak_vram_mb: u64,
+        peak_sysmem_mb: u64,
+    }
 
-    let map = metrics.hash_metrics.read().await;
-    for (hash, m) in map.iter() {
-        let escaped_hash = escape_label_value(hash);
-        let display_names: Vec<String> = m.display_names.lock().iter().cloned().collect();
-        let escaped_names = escape_label_value(&display_names.join(","));
+    let rows: Vec<HashRow> = {
+        let map = metrics.hash_metrics.read().await;
+        map.iter()
+            .map(|(hash, m)| {
+                let display_names: Vec<String> = m.display_names.lock().iter().cloned().collect();
+                let labels = format!(
+                    "{{hash=\"{}\",names=\"{}\"}}",
+                    escape_label_value(hash),
+                    escape_label_value(&display_names.join(","))
+                );
+                let p95_latency_ms = {
+                    let mut samples: Vec<u64> = m.latency_samples.lock().iter().cloned().collect();
+                    if samples.is_empty() {
+                        0
+                    } else {
+                        samples.sort_unstable();
+                        let idx = ((samples.len() - 1) as f64 * 0.95).floor() as usize;
+                        samples[idx.min(samples.len() - 1)]
+                    }
+                };
+                HashRow {
+                    labels,
+                    requests: m.requests_total.load(Ordering::Relaxed),
+                    errors: m.errors_total.load(Ordering::Relaxed),
+                    tokens: m.tokens_generated_total.load(Ordering::Relaxed),
+                    total_latency_ms: m.total_latency_ms.load(Ordering::Relaxed),
+                    p95_latency_ms,
+                    peak_vram_mb: m.peak_vram_mb.load(Ordering::Relaxed),
+                    peak_sysmem_mb: m.peak_sysmem_mb.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    };
 
-        out.push_str(&format!(
-            "proxy_hash_requests_total{{hash=\"{}\",names=\"{}\"}} {}\n",
-            escaped_hash,
-            escaped_names,
-            m.requests_total.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "proxy_hash_errors_total{{hash=\"{}\",names=\"{}\"}} {}\n",
-            escaped_hash,
-            escaped_names,
-            m.errors_total.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "proxy_hash_tokens_generated_total{{hash=\"{}\",names=\"{}\"}} {}\n",
-            escaped_hash,
-            escaped_names,
-            m.tokens_generated_total.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "proxy_hash_total_latency_ms{{hash=\"{}\",names=\"{}\"}} {}\n",
-            escaped_hash,
-            escaped_names,
-            m.total_latency_ms.load(Ordering::Relaxed)
-        ));
-
-        let p95 = {
-            let mut samples: Vec<u64> = m.latency_samples.lock().iter().cloned().collect();
-            if samples.is_empty() {
-                0
-            } else {
-                samples.sort_unstable();
-                let idx = ((samples.len() - 1) as f64 * 0.95).floor() as usize;
-                samples[idx.min(samples.len() - 1)]
+    // Emit one fully grouped family: HELP, TYPE, then every hash's sample.
+    let mut push_family =
+        |name: &str, help: &str, metric_type: &str, value: &dyn Fn(&HashRow) -> u64| {
+            out.push_str(&format!("# HELP {name} {help}\n"));
+            out.push_str(&format!("# TYPE {name} {metric_type}\n"));
+            for row in &rows {
+                out.push_str(&format!("{}{} {}\n", name, row.labels, value(row)));
             }
         };
 
-        out.push_str(&format!(
-            "proxy_hash_p95_latency_ms{{hash=\"{escaped_hash}\",names=\"{escaped_names}\"}} {p95}\n"
-        ));
-
-        out.push_str(&format!(
-            "proxy_hash_peak_vram_mb{{hash=\"{}\",names=\"{}\"}} {}\n",
-            escaped_hash,
-            escaped_names,
-            m.peak_vram_mb.load(Ordering::Relaxed)
-        ));
-
-        out.push_str(&format!(
-            "proxy_hash_peak_sysmem_mb{{hash=\"{}\",names=\"{}\"}} {}\n",
-            escaped_hash,
-            escaped_names,
-            m.peak_sysmem_mb.load(Ordering::Relaxed)
-        ));
-    }
+    push_family(
+        "proxy_hash_requests_total",
+        "Total requests per model/profile hash.",
+        "counter",
+        &|r| r.requests,
+    );
+    push_family(
+        "proxy_hash_errors_total",
+        "Total errors per model/profile hash.",
+        "counter",
+        &|r| r.errors,
+    );
+    push_family(
+        "proxy_hash_tokens_generated_total",
+        "Total tokens generated per hash.",
+        "counter",
+        &|r| r.tokens,
+    );
+    push_family(
+        "proxy_hash_total_latency_ms",
+        "Total latency in milliseconds per hash.",
+        "counter",
+        &|r| r.total_latency_ms,
+    );
+    push_family(
+        "proxy_hash_p95_latency_ms",
+        "P95 latency in milliseconds (last 100 samples).",
+        "gauge",
+        &|r| r.p95_latency_ms,
+    );
+    push_family(
+        "proxy_hash_peak_vram_mb",
+        "Peak VRAM usage in MB per hash.",
+        "gauge",
+        &|r| r.peak_vram_mb,
+    );
+    push_family(
+        "proxy_hash_peak_sysmem_mb",
+        "Peak system memory usage in MB per hash.",
+        "gauge",
+        &|r| r.peak_sysmem_mb,
+    );
 
     out
 }
@@ -1096,6 +1124,60 @@ mod tests {
         assert_eq!(restored.queue_drops_timeout.load(Ordering::Relaxed), 2);
         assert_eq!(restored.queue_drops_global_limit.load(Ordering::Relaxed), 1);
         assert_eq!(restored.queue_length.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn render_groups_per_hash_families_contiguously() {
+        // The Prometheus exposition format requires all samples of a metric
+        // family to be contiguous. With more than one hash present, an
+        // interleaved layout would split each family apart; assert every
+        // family's sample lines form a single contiguous run.
+        let metrics = Metrics::new();
+        for (hash, name) in [("hash-a", "model-a:default"), ("hash-b", "model-b:fast")] {
+            let hm = metrics.get_hash_metrics(hash).await;
+            hm.add_display_name(name);
+            hm.requests_total.fetch_add(5, Ordering::Relaxed);
+            hm.observe_latency(12);
+            hm.observe_memory(1000, 2000);
+        }
+
+        let out = render_prometheus_with_circuit_breaker(&metrics, None, "test").await;
+
+        // Two hashes are present, so each per-hash family must have two samples.
+        for family in [
+            "proxy_hash_requests_total",
+            "proxy_hash_errors_total",
+            "proxy_hash_tokens_generated_total",
+            "proxy_hash_total_latency_ms",
+            "proxy_hash_p95_latency_ms",
+            "proxy_hash_peak_vram_mb",
+            "proxy_hash_peak_sysmem_mb",
+        ] {
+            let sample_lines: Vec<usize> = out
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.starts_with(&format!("{family}{{")))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                sample_lines.len(),
+                2,
+                "expected 2 samples for {family}, got {}",
+                sample_lines.len()
+            );
+            // Contiguous: the two sample lines must be adjacent.
+            assert_eq!(
+                sample_lines[1] - sample_lines[0],
+                1,
+                "samples for {family} are not contiguous (interleaved family)"
+            );
+            // HELP/TYPE precede the family's samples exactly once.
+            assert_eq!(
+                out.matches(&format!("# TYPE {family} ")).count(),
+                1,
+                "expected exactly one TYPE line for {family}"
+            );
+        }
     }
 
     #[tokio::test]
