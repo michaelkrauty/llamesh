@@ -23,6 +23,26 @@ pub struct HashMetrics {
 
     // Human-readable names that map to this hash (e.g., "gpt-oss-20b:fast")
     pub display_names: Mutex<HashSet<String>>,
+
+    /// Model parameters parsed from the most recent instance startup for this
+    /// hash. Persisted so `/v1/models` can report them when no instance is
+    /// running. The args hash pins them to the exact launch configuration:
+    /// any cookbook change that affects the params also changes the hash. The
+    /// llama.cpp version recorded alongside guards against serving values
+    /// observed under a different binary (same args, upgraded llama.cpp).
+    pub parsed_params: Mutex<Option<PersistedParsedParams>>,
+}
+
+/// Parsed model params plus the llama.cpp version they were observed under.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedParsedParams {
+    pub params: crate::instance::ParsedModelParams,
+    /// llama.cpp version (commit) of the binary the instance was running, or
+    /// `None` when no version had been recorded (e.g. managed builds
+    /// disabled, or the instance started before the startup build check
+    /// recorded one).
+    #[serde(default)]
+    pub llama_cpp_version: Option<String>,
 }
 
 impl Default for HashMetrics {
@@ -38,6 +58,7 @@ impl Default for HashMetrics {
             sample_count: AtomicU64::new(0),
             last_memory_update: Mutex::new(String::new()),
             display_names: Mutex::new(HashSet::new()),
+            parsed_params: Mutex::new(None),
         }
     }
 }
@@ -61,6 +82,45 @@ impl HashMetrics {
 
     pub fn add_display_name(&self, name: &str) {
         self.display_names.lock().insert(name.to_string());
+    }
+
+    /// Record the model parameters parsed from an instance startup log,
+    /// together with the llama.cpp version that produced them. The latest
+    /// parse wins: params come from the running binary, so a llama.cpp
+    /// upgrade can legitimately change them for the same hash.
+    pub fn set_parsed_params(
+        &self,
+        params: crate::instance::ParsedModelParams,
+        llama_cpp_version: Option<String>,
+    ) {
+        *self.parsed_params.lock() = Some(PersistedParsedParams {
+            params,
+            llama_cpp_version,
+        });
+    }
+
+    /// Get the persisted model parameters for this hash, if any instance for
+    /// it has ever become ready.
+    ///
+    /// Params recorded under a *different* llama.cpp version than the one
+    /// currently live are withheld: the same launch args can resolve to
+    /// different effective values (slot count, context) on another build.
+    /// When either version is unknown there is nothing to compare against,
+    /// so the params are served as-is.
+    pub fn get_parsed_params(
+        &self,
+        current_llama_cpp_version: Option<&str>,
+    ) -> Option<crate::instance::ParsedModelParams> {
+        let stored = self.parsed_params.lock().clone()?;
+        match (
+            stored.llama_cpp_version.as_deref(),
+            current_llama_cpp_version,
+        ) {
+            (Some(stored_version), Some(current_version)) if stored_version != current_version => {
+                None
+            }
+            _ => Some(stored.params),
+        }
     }
 
     /// Get tokens per second based on accumulated metrics.
@@ -219,6 +279,28 @@ pub struct HashMetricsSnapshot {
     pub peak_vram_mb: u64,
     pub peak_sysmem_mb: u64,
     pub sample_count: u64,
+    /// Parsed model params from the most recent instance startup, with the
+    /// llama.cpp version they were observed under.
+    /// `#[serde(default)]` keeps snapshots written by older versions loadable,
+    /// and the lenient deserializer drops (rather than fails on) a value whose
+    /// shape doesn't match — a parse error here would otherwise discard the
+    /// entire snapshot, silently resetting every persisted counter.
+    #[serde(default, deserialize_with = "lenient_parsed_params")]
+    pub parsed_model_params: Option<PersistedParsedParams>,
+}
+
+/// Deserialize `parsed_model_params`, tolerating unknown shapes.
+///
+/// Learned data is valuable but reconstructible; the surrounding counters are
+/// not. If this field ever drifts in shape (as opposed to being absent, which
+/// `default` already handles), losing just the params is strictly better than
+/// `Metrics::load` discarding the whole snapshot.
+fn lenient_parsed_params<'de, D>(deserializer: D) -> Result<Option<PersistedParsedParams>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or(None))
 }
 
 impl Metrics {
@@ -270,6 +352,7 @@ impl Metrics {
                 sample_count: AtomicU64::new(v.sample_count),
                 last_memory_update: Mutex::new(String::new()),
                 display_names: Mutex::new(v.display_names.into_iter().collect()),
+                parsed_params: Mutex::new(v.parsed_model_params),
             };
             map.insert(hash, Arc::new(hm));
         }
@@ -471,6 +554,7 @@ impl Metrics {
                     peak_vram_mb: v.peak_vram_mb.load(Ordering::Relaxed),
                     peak_sysmem_mb: v.peak_sysmem_mb.load(Ordering::Relaxed),
                     sample_count: v.sample_count.load(Ordering::Relaxed),
+                    parsed_model_params: v.parsed_params.lock().clone(),
                 },
             );
         }
@@ -1057,6 +1141,117 @@ mod tests {
             serde_json::from_str(legacy).expect("legacy snapshot should deserialize");
         assert_eq!(snapshot.version, "");
         assert_eq!(snapshot.requests_total, 7);
+    }
+
+    #[tokio::test]
+    async fn test_parsed_params_survive_snapshot_round_trip() {
+        let metrics = Metrics::new();
+        let params = crate::instance::ParsedModelParams {
+            n_ctx: Some(4096),
+            n_ctx_train: Some(131072),
+            n_slots: Some(4),
+            arch: Some("llama".to_string()),
+            ..Default::default()
+        };
+        metrics
+            .get_hash_metrics("hash-a")
+            .await
+            .set_parsed_params(params, Some("b1234-abcdef".to_string()));
+
+        let snapshot = metrics
+            .snapshot("node-a".to_string(), "llama".to_string(), None)
+            .await;
+        // Through the exact persistence format (serde), as load() would see it.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored_snapshot: MetricsSnapshot = serde_json::from_str(&json).unwrap();
+        let restored = Metrics::from_snapshot(restored_snapshot);
+
+        let hm = restored.get_hash_metrics("hash-a").await;
+        let params = hm
+            .get_parsed_params(Some("b1234-abcdef"))
+            .expect("parsed params should survive the snapshot round trip");
+        assert_eq!(params.n_ctx, Some(4096));
+        assert_eq!(params.n_ctx_train, Some(131072));
+        assert_eq!(params.n_slots, Some(4));
+        assert_eq!(params.arch.as_deref(), Some("llama"));
+    }
+
+    #[tokio::test]
+    async fn test_parsed_params_withheld_across_llama_cpp_upgrade() {
+        let hm = HashMetrics::default();
+        let params = crate::instance::ParsedModelParams {
+            n_ctx: Some(4096),
+            ..Default::default()
+        };
+        hm.set_parsed_params(params, Some("b1000-old".to_string()));
+
+        // Same binary: served.
+        assert!(hm.get_parsed_params(Some("b1000-old")).is_some());
+        // Different binary (same args hash): the same launch args can resolve
+        // to different effective values on another build — withheld.
+        assert!(hm.get_parsed_params(Some("b2000-new")).is_none());
+        // Current version unknown (e.g. startup window before the build check
+        // records it): nothing to compare against — served.
+        assert!(hm.get_parsed_params(None).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_parsed_params_without_recorded_version_always_served() {
+        // Params recorded when no llama.cpp version was known (managed builds
+        // disabled) carry no version to compare; they are served as-is.
+        let hm = HashMetrics::default();
+        let params = crate::instance::ParsedModelParams {
+            n_ctx: Some(2048),
+            ..Default::default()
+        };
+        hm.set_parsed_params(params, None);
+
+        assert!(hm.get_parsed_params(Some("b2000-new")).is_some());
+        assert!(hm.get_parsed_params(None).is_some());
+    }
+
+    #[test]
+    fn test_hash_snapshot_deserializes_without_parsed_params() {
+        // Hash entries persisted by versions predating `parsed_model_params`
+        // must still load (the field is `#[serde(default)]`).
+        let legacy = r#"{
+            "display_names": ["m:default"],
+            "requests_total": 3,
+            "errors_total": 0,
+            "tokens_generated_total": 30,
+            "avg_latency_ms": 10.0,
+            "peak_vram_mb": 1000,
+            "peak_sysmem_mb": 2000,
+            "sample_count": 2
+        }"#;
+        let snapshot: HashMetricsSnapshot =
+            serde_json::from_str(legacy).expect("legacy hash snapshot should deserialize");
+        assert!(snapshot.parsed_model_params.is_none());
+        assert_eq!(snapshot.requests_total, 3);
+    }
+
+    #[test]
+    fn test_hash_snapshot_tolerates_malformed_parsed_params() {
+        // A present-but-wrong-shape `parsed_model_params` (e.g. written by a
+        // build where the field had a different layout) must NOT fail the
+        // parse: that would discard the entire snapshot and silently reset
+        // every persisted counter. The params are dropped, the counters kept.
+        let drifted = r#"{
+            "display_names": ["m:default"],
+            "requests_total": 1428315,
+            "errors_total": 16406,
+            "tokens_generated_total": 30,
+            "avg_latency_ms": 10.0,
+            "peak_vram_mb": 1000,
+            "peak_sysmem_mb": 2000,
+            "sample_count": 2,
+            "parsed_model_params": {"n_ctx": 4096, "n_slots": 4}
+        }"#;
+        let snapshot: HashMetricsSnapshot = serde_json::from_str(drifted)
+            .expect("shape drift in parsed params must not discard the snapshot");
+        assert!(snapshot.parsed_model_params.is_none());
+        assert_eq!(snapshot.requests_total, 1428315);
+        assert_eq!(snapshot.errors_total, 16406);
     }
 
     #[tokio::test]

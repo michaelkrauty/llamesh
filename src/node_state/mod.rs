@@ -113,6 +113,11 @@ pub struct NodeState {
     pub draining: Arc<AtomicBool>,
     pub build_manager: Arc<BuildManager>,
     pub rebuild_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes metrics snapshot writes: the periodic persistence tick and
+    /// readiness-triggered writes share one temp-file path, so concurrent
+    /// writers would interleave writes and renames. Held across snapshot
+    /// construction too, so the file is only ever replaced by a newer state.
+    metrics_persist_lock: Arc<tokio::sync::Mutex<()>>,
     pub shutdown_notify: Arc<Notify>,
     /// Index for O(1) model lookups
     model_index: Arc<ModelIndex>,
@@ -467,6 +472,7 @@ impl NodeState {
             draining: Arc::new(AtomicBool::new(false)),
             build_manager: Arc::new(build_manager),
             rebuild_lock: Arc::new(tokio::sync::Mutex::new(())),
+            metrics_persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             shutdown_notify: Arc::new(Notify::new()),
             model_index,
             memory_sampler: Arc::new(MemorySampler::new()),
@@ -736,20 +742,50 @@ impl NodeState {
         chosen
     }
 
-    /// Get parsed model params for a model:profile key from any ready instance.
-    /// Returns None if no ready instance exists or params haven't been parsed yet.
+    /// The llama.cpp version of the binary new instances would currently be
+    /// spawned from. Prefers the build manager's recorded version; before one
+    /// is recorded (the startup window, or while initial-build retries are
+    /// still failing), derives it from the resolved configured binary path —
+    /// the same attribution used when spawning instances. `None` for
+    /// unmanaged binaries.
+    pub async fn current_llama_cpp_version(&self) -> Option<String> {
+        let recorded = self.build_manager.get_version().await;
+        if recorded != "unknown" {
+            return Some(recorded);
+        }
+        let resolved = tokio::fs::canonicalize(&self.config.llama_cpp.binary_path)
+            .await
+            .ok()?;
+        crate::build_manager::version_from_resolved_binary(&resolved)
+    }
+
+    /// Get parsed model params for a model:profile key from a ready instance
+    /// that is still current: not draining, and (when both are known) spawned
+    /// from the currently live binary. After a managed binary swap, old
+    /// instances keep serving in-flight requests while draining — their
+    /// params describe the outgoing binary/config and must not be advertised
+    /// for new requests.
     pub async fn get_parsed_params_for_model(
         &self,
         model_name: &str,
         profile_id: &str,
+        current_llama_cpp_version: Option<&str>,
     ) -> Option<crate::instance::ParsedModelParams> {
         let instances = self.instances.read().await;
         for inst_lock in instances.values() {
             let inst = inst_lock.read().await;
             if inst.model_name == model_name
                 && inst.profile_id == profile_id
+                && !inst.draining.load(std::sync::atomic::Ordering::Relaxed)
                 && *inst.status.lock() == crate::instance::InstanceStatus::Ready
             {
+                if let (Some(instance_version), Some(current_version)) =
+                    (inst.llama_cpp_version.as_deref(), current_llama_cpp_version)
+                {
+                    if instance_version != current_version {
+                        continue;
+                    }
+                }
                 if let Some(params) = inst.get_parsed_params() {
                     return Some(params);
                 }
@@ -2122,6 +2158,23 @@ impl NodeState {
                 // Check if this is a cold start (no learned memory for this args_hash)
                 let is_cold_start = !self.metrics.has_memory_data(&args_hash).await;
 
+                // Resolve the binary path once and exec the resolved path, so
+                // a concurrent rebuild's symlink swap cannot split the version
+                // attribution from the binary the process actually runs. The
+                // llama.cpp version is derived from the resolved managed-build
+                // directory name itself (".../<base>-<commit>/bin/..."), which
+                // also attributes correctly during the startup window before
+                // the build check has recorded a version. Unmanaged binaries
+                // (no managed-build layout) yield None.
+                let configured_binary = self.config.llama_cpp.binary_path.clone();
+                let resolved_binary = tokio::fs::canonicalize(&configured_binary)
+                    .await
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(configured_binary);
+                let llama_cpp_version = crate::build_manager::version_from_resolved_binary(
+                    std::path::Path::new(&resolved_binary),
+                );
+
                 let mut new_instance = Instance::new(
                     instance_id.clone(),
                     model_name.to_string(),
@@ -2131,6 +2184,7 @@ impl NodeState {
                     args_hash.clone(),
                     is_cold_start,
                 );
+                new_instance.llama_cpp_version = llama_cpp_version;
                 if reserve_slot {
                     // Claim the spawning request's slot before the instance
                     // is shared: once it is in the map, concurrent requests
@@ -2146,7 +2200,7 @@ impl NodeState {
                 // where is_alive() returns false because child is None
                 let spawn_result = {
                     let inst = inst_arc.read().await;
-                    inst.spawn(&self.config.llama_cpp.binary_path, &args)
+                    inst.spawn(&resolved_binary, &args)
                 };
 
                 match spawn_result {
@@ -2314,6 +2368,22 @@ impl NodeState {
                     inst.parse_and_store_startup_params();
                     inst.clear_startup_log();
 
+                    // Persist the parsed params on the hash's metrics entry so
+                    // /v1/models can report them after this instance is gone
+                    // (and across restarts, via the metrics snapshot). The
+                    // llama.cpp version captured at spawn time is recorded
+                    // alongside so values from a different binary are not
+                    // served after an upgrade — reading the version here
+                    // instead would mislabel the params if a rebuild swapped
+                    // the binary while this instance was loading.
+                    if let Some(params) = inst.get_parsed_params() {
+                        ready_state
+                            .metrics
+                            .get_hash_metrics(&inst.args_hash)
+                            .await
+                            .set_parsed_params(params, inst.llama_cpp_version.clone());
+                    }
+
                     // Set eviction tenure — instance cannot be drained by competitors until this expires
                     {
                         let mut evictable = inst.evictable_after.lock();
@@ -2356,6 +2426,12 @@ impl NodeState {
                     {
                         woken += 1;
                     }
+
+                    // Persist immediately rather than waiting for the periodic
+                    // loop: a restart inside the persistence interval would
+                    // otherwise drop the just-recorded parsed params (and this
+                    // instance's display-name/request accounting) on the floor.
+                    ready_state.persist_metrics_snapshot().await;
 
                     if is_cold {
                         // Cold start: sample memory after ready and store learned value
@@ -3083,6 +3159,33 @@ impl NodeState {
         }
     }
 
+    /// Write the metrics snapshot to `metrics_path` (atomic write-then-rename).
+    /// Called by the periodic background loop and immediately after events
+    /// whose data would otherwise be lost to a restart inside the persistence
+    /// interval (e.g. newly recorded parsed model params).
+    pub async fn persist_metrics_snapshot(&self) {
+        let _guard = self.metrics_persist_lock.lock().await;
+        let version = self.build_manager.get_version().await;
+        let build_status = self.build_manager.build_status();
+        let snapshot = self
+            .metrics
+            .snapshot(self.config.node_id.clone(), version, Some(build_status))
+            .await;
+        let path = std::path::Path::new(&self.config.metrics_path);
+        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+            // Atomic write: write to temp file then rename
+            let tmp_path = path.with_extension("tmp");
+            if tokio::fs::write(&tmp_path, json).await.is_ok() {
+                if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+                    tracing::warn!(
+                        "Failed to rename metrics file: {}. Metrics file may be stale.",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn run_background_tasks(self: Arc<Self>) {
         info!("Starting background tasks loop");
         loop {
@@ -3098,25 +3201,7 @@ impl NodeState {
             }
 
             // Metrics Persistence
-            let version = self.build_manager.get_version().await;
-            let build_status = self.build_manager.build_status();
-            let snapshot = self
-                .metrics
-                .snapshot(self.config.node_id.clone(), version, Some(build_status))
-                .await;
-            let path = std::path::Path::new(&self.config.metrics_path);
-            if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-                // Atomic write: write to temp file then rename
-                let tmp_path = path.with_extension("tmp");
-                if tokio::fs::write(&tmp_path, json).await.is_ok() {
-                    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
-                        tracing::warn!(
-                            "Failed to rename metrics file: {}. Metrics file may be stale.",
-                            e
-                        );
-                    }
-                }
-            }
+            self.persist_metrics_snapshot().await;
         }
     }
 
@@ -4063,6 +4148,64 @@ mod tests {
         assert_eq!(instance.read().await.in_flight_requests, 1);
         let queues = state.queues.read().await;
         assert!(queues.get(&key).is_none_or(|queue| queue.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn parsed_params_skip_draining_and_version_mismatched_instances() {
+        let config = minimal_node_config();
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+
+        let mut inst = Instance::new(
+            "inst-a".into(),
+            "test".into(),
+            "default".into(),
+            "127.0.0.1".into(),
+            8000,
+            "hash".into(),
+            false,
+        );
+        inst.llama_cpp_version = Some("aaaa1111".into());
+        *inst.status.lock() = InstanceStatus::Ready;
+        *inst.parsed_params.lock() = Some(crate::instance::ParsedModelParams {
+            n_ctx: Some(4096),
+            ..Default::default()
+        });
+        let inst = Arc::new(RwLock::new(inst));
+        state
+            .instances
+            .write()
+            .await
+            .insert("inst-a".into(), inst.clone());
+
+        // Ready, not draining, matching (or unknown) binary: served.
+        assert!(state
+            .get_parsed_params_for_model("test", "default", Some("aaaa1111"))
+            .await
+            .is_some());
+        assert!(state
+            .get_parsed_params_for_model("test", "default", None)
+            .await
+            .is_some());
+
+        // Spawned from a different binary than the currently live one (e.g.
+        // lingering during a post-swap drain window): not advertised.
+        assert!(state
+            .get_parsed_params_for_model("test", "default", Some("bbbb2222"))
+            .await
+            .is_none());
+
+        // Draining instances describe the outgoing binary/config: skipped.
+        inst.read()
+            .await
+            .draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(state
+            .get_parsed_params_for_model("test", "default", Some("aaaa1111"))
+            .await
+            .is_none());
     }
 
     #[tokio::test]

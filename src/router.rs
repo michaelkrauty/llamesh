@@ -453,6 +453,11 @@ pub async fn list_models(
     let mut seen_ids = HashSet::new();
     let owned_by = state.config.node_id.clone();
 
+    // Used to withhold parsed params (persisted, or from a lingering old
+    // instance) recorded under a different llama.cpp binary than the one new
+    // instances would currently be spawned from.
+    let llama_cpp_version = state.current_llama_cpp_version().await;
+
     let cookbook = state.cookbook.read().await;
     for model in &cookbook.models {
         if !model.enabled {
@@ -472,17 +477,24 @@ pub async fn list_models(
             let entry_id = id.clone();
 
             // Look up metrics by args_hash
-            let tps = if let Some(args_hash) = state.get_args_hash_for_key(&id).await {
-                let hash_metrics = state.metrics.get_hash_metrics(&args_hash).await;
-                hash_metrics.tokens_per_second()
-            } else {
-                0.0
-            };
+            let (tps, persisted_params) =
+                if let Some(args_hash) = state.get_args_hash_for_key(&id).await {
+                    let hash_metrics = state.metrics.get_hash_metrics(&args_hash).await;
+                    (
+                        hash_metrics.tokens_per_second(),
+                        hash_metrics.get_parsed_params(llama_cpp_version.as_deref()),
+                    )
+                } else {
+                    (0.0, None)
+                };
 
-            // Get parsed model params from running instance (if any)
+            // Parsed model params: prefer a running, still-current instance
+            // (freshest), fall back to the params persisted from the last
+            // instance startup.
             let parsed_params = state
-                .get_parsed_params_for_model(&model.name, &profile.id)
-                .await;
+                .get_parsed_params_for_model(&model.name, &profile.id, llama_cpp_version.as_deref())
+                .await
+                .or(persisted_params);
 
             let metadata = json!({
                 "model": model.name.as_str(),

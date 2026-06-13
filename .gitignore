@@ -45,3 +45,5 @@ Thumbs.db
 # Claude Code (local config, not for public repo)
 CLAUDE.md
 .claude/
+tests/metrics_*.json
+tests/metrics_*.tmp
