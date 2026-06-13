@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-06-13
+
+### Added
+
+- The JSON metrics snapshot (`/metrics/json` and the persisted
+  `node-metrics.json`) now mirrors five counters that were previously exposed
+  only by the Prometheus `/metrics` endpoint: `queue_pending_tokens`,
+  `queue_wait_total_ms`, `queue_wait_count`, `token_counting_disabled_total`,
+  and `skipped_stream_cleanups_total`. Tooling and dashboards that read the
+  JSON endpoint can now observe queue-wait latency (mean wait =
+  `queue_wait_total_ms / queue_wait_count`), pending slot reservations, and the
+  two operational health counters without scraping Prometheus. The values are
+  mirrored for observability and — like `queue_length` and their Prometheus
+  counterparts — start fresh on restart rather than being restored on load, so
+  `/metrics/json` reports the same values as `/metrics` at every moment. Each
+  new field is `#[serde(default)]`, so older snapshots remain loadable and the
+  durable counters (`requests_total`, `errors_total`, `queue_drops_*`) are
+  unaffected.
+
 ## [1.13.3] - 2026-06-13
 
 ### Documentation

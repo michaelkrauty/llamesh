@@ -230,6 +230,35 @@ pub struct MetricsSnapshot {
     pub queue_drops_timeout: u64,
     #[serde(default)]
     pub queue_drops_global_limit: u64,
+    /// In-flight queue tokens (pending slot reservations awaiting a notified
+    /// waiter). Runtime gauge mirrored here so `/metrics/json` matches the
+    /// Prometheus `proxy_queue_pending_tokens`; like `queue_length` it starts
+    /// fresh on restart and is not restored on load. `#[serde(default)]` keeps
+    /// snapshots written by older versions loadable.
+    #[serde(default)]
+    pub queue_pending_tokens: u64,
+    /// Cumulative queue wait time (ms) and the number of requests that waited;
+    /// together they give the mean queue wait (`queue_wait_total_ms /
+    /// queue_wait_count`). Mirrored so `/metrics/json` matches the Prometheus
+    /// `proxy_queue_wait_total_ms` / `proxy_queue_wait_count`. Like those
+    /// counters they start fresh on restart, so they are serialized for
+    /// observability but not restored on load. `#[serde(default)]` keeps older
+    /// snapshots loadable.
+    #[serde(default)]
+    pub queue_wait_total_ms: u64,
+    #[serde(default)]
+    pub queue_wait_count: u64,
+    /// Times token counting was disabled for a response (token usage
+    /// unavailable) and stream cleanups skipped during shutdown. Process-global
+    /// counters mirrored so `/metrics/json` matches the Prometheus
+    /// `proxy_token_counting_disabled_total` /
+    /// `proxy_skipped_stream_cleanups_total`; they reset on restart like their
+    /// Prometheus counterparts. `#[serde(default)]` keeps older snapshots
+    /// loadable.
+    #[serde(default)]
+    pub token_counting_disabled_total: u64,
+    #[serde(default)]
+    pub skipped_stream_cleanups_total: u64,
     pub hashes: HashMap<String, HashMetricsSnapshot>,
     pub updated_at: String,
     #[serde(default)]
@@ -570,6 +599,13 @@ impl Metrics {
             queue_drops_full: self.queue_drops_full.load(Ordering::Relaxed),
             queue_drops_timeout: self.queue_drops_timeout.load(Ordering::Relaxed),
             queue_drops_global_limit: self.queue_drops_global_limit.load(Ordering::Relaxed),
+            queue_pending_tokens: self.queue_pending_tokens.load(Ordering::Relaxed),
+            queue_wait_total_ms: self.queue_wait_total_ms.load(Ordering::Relaxed),
+            queue_wait_count: self.queue_wait_count.load(Ordering::Relaxed),
+            token_counting_disabled_total: crate::router::TOKEN_COUNTING_DISABLED
+                .load(Ordering::Relaxed),
+            skipped_stream_cleanups_total: crate::router::SKIPPED_STREAM_CLEANUPS
+                .load(Ordering::Relaxed),
             hashes,
             updated_at: chrono::Utc::now().to_rfc3339(),
             is_building: build_status
@@ -1100,6 +1136,14 @@ mod tests {
         assert_eq!(snapshot.queue_drops_full, 0);
         assert_eq!(snapshot.queue_drops_timeout, 0);
         assert_eq!(snapshot.queue_drops_global_limit, 0);
+        // Parity metrics added in 1.14.0 also default when absent, so an
+        // in-place upgrade from an older snapshot stays loadable instead of
+        // resetting every counter via the parse-error fallback.
+        assert_eq!(snapshot.queue_pending_tokens, 0);
+        assert_eq!(snapshot.queue_wait_total_ms, 0);
+        assert_eq!(snapshot.queue_wait_count, 0);
+        assert_eq!(snapshot.token_counting_disabled_total, 0);
+        assert_eq!(snapshot.skipped_stream_cleanups_total, 0);
     }
 
     #[tokio::test]
@@ -1124,6 +1168,62 @@ mod tests {
         assert_eq!(restored.queue_drops_timeout.load(Ordering::Relaxed), 2);
         assert_eq!(restored.queue_drops_global_limit.load(Ordering::Relaxed), 1);
         assert_eq!(restored.queue_length.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_wait_and_pending_metrics_surface_in_snapshot() {
+        // queue_pending_tokens, queue_wait_total_ms and queue_wait_count are
+        // exposed by Prometheus; the JSON snapshot must surface the same values
+        // so `/metrics/json` reaches parity with `/metrics`.
+        let metrics = Metrics::new();
+        metrics.inc_pending_tokens();
+        metrics.inc_pending_tokens();
+        metrics.observe_queue_wait(120);
+        metrics.observe_queue_wait(80);
+
+        let snapshot = metrics.snapshot("n".into(), "v".into(), None).await;
+        assert_eq!(snapshot.queue_pending_tokens, 2);
+        assert_eq!(snapshot.queue_wait_total_ms, 200);
+        assert_eq!(snapshot.queue_wait_count, 2);
+
+        // These are runtime metrics mirrored for observability, not durable
+        // counters: like queue_length they start fresh after a restart.
+        let restored = Metrics::from_snapshot(snapshot);
+        assert_eq!(restored.queue_pending_tokens.load(Ordering::Relaxed), 0);
+        assert_eq!(restored.queue_wait_total_ms.load(Ordering::Relaxed), 0);
+        assert_eq!(restored.queue_wait_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn parity_metrics_deserialize_from_snapshot_json() {
+        // A snapshot carrying the parity metrics (added 1.14.0) deserializes
+        // them, including the two process-global counters
+        // (token_counting_disabled_total, skipped_stream_cleanups_total) that
+        // the JSON mirrors from Prometheus rather than from the Metrics struct.
+        let json = r#"{
+            "node_id": "n",
+            "llama_cpp_version": "abc",
+            "requests_total": 5,
+            "errors_total": 1,
+            "current_requests": 0,
+            "queue_pending_tokens": 3,
+            "queue_wait_total_ms": 450,
+            "queue_wait_count": 9,
+            "token_counting_disabled_total": 4,
+            "skipped_stream_cleanups_total": 2,
+            "hashes": {},
+            "updated_at": "2026-06-13T00:00:00Z"
+        }"#;
+        let snapshot: MetricsSnapshot =
+            serde_json::from_str(json).expect("snapshot with parity metrics must deserialize");
+        assert_eq!(snapshot.queue_pending_tokens, 3);
+        assert_eq!(snapshot.queue_wait_total_ms, 450);
+        assert_eq!(snapshot.queue_wait_count, 9);
+        assert_eq!(snapshot.token_counting_disabled_total, 4);
+        assert_eq!(snapshot.skipped_stream_cleanups_total, 2);
+        // Unrelated persisted counters still load alongside the new fields.
+        assert_eq!(snapshot.requests_total, 5);
+        assert_eq!(snapshot.errors_total, 1);
     }
 
     #[tokio::test]
