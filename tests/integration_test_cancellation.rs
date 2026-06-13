@@ -28,6 +28,7 @@ fn config_yaml(mock_script: &Path) -> String {
         r#"
 node_id: "{NODE_ID}"
 listen_addr: "{LISTEN_ADDR}"
+metrics_path: "./tests/metrics_cancellation.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
@@ -151,6 +152,7 @@ async fn cancelled_request_does_not_leak_in_flight_counter() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_slow_body_mock_script(&root, "cancellation", 5000).await;
     let config_path = root.join("tests/config_cancellation.yaml");
+    common::reset_metrics_file(&root, "cancellation").await;
     let cookbook_path = root.join("tests/cookbook_cancellation.yaml");
     let proxy_bin = llamesh_binary(&root);
 

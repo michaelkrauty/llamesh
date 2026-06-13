@@ -11,6 +11,7 @@ async fn test_admin_auth() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "admin_auth").await;
     let config_path = root.join("tests/config_admin_auth.yaml");
+    common::reset_metrics_file(&root, "admin_auth").await;
     let cookbook_path = root.join("tests/cookbook_admin_auth.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -18,6 +19,7 @@ async fn test_admin_auth() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9200"
+metrics_path: "./tests/metrics_admin_auth.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"

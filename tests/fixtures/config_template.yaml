@@ -9,6 +9,7 @@
 
 node_id: "{{NODE_ID}}"
 listen_addr: "{{LISTEN_ADDR}}"
+metrics_path: "./tests/metrics_{{NODE_ID}}.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "{{DEFAULT_MODEL}}"

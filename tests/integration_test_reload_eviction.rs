@@ -20,6 +20,7 @@ fn config_yaml(mock_script: &std::path::Path) -> String {
         r#"
 node_id: "test-reload-drain"
 listen_addr: "{}"
+metrics_path: "./tests/metrics_reload_eviction.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
@@ -274,6 +275,7 @@ async fn reload_drains_orphaned_instances() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "reload_eviction").await;
     let config_path = root.join("tests/config_reload_eviction.yaml");
+    common::reset_metrics_file(&root, "reload_eviction").await;
     let cookbook_path = root.join("tests/cookbook_reload_eviction.yaml");
     let proxy_bin = llamesh_binary(&root);
 

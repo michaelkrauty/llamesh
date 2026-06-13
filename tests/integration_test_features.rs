@@ -14,6 +14,7 @@ async fn test_embeddings_and_rerank() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "features").await;
     let config_path = root.join("tests/config_features.yaml");
+    common::reset_metrics_file(&root, "features").await;
     let cookbook_path = root.join("tests/cookbook_features.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -21,6 +22,7 @@ async fn test_embeddings_and_rerank() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9200"
+metrics_path: "./tests/metrics_features.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "embedding-model:default"

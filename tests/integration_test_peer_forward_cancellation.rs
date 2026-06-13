@@ -48,6 +48,7 @@ fn config_node(
         r#"
 node_id: "{node_id}"
 listen_addr: "{listen}"
+metrics_path: "./tests/metrics_{node_id}.json"
 public_url: "http://{listen}"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
@@ -205,6 +206,8 @@ async fn cancelled_peer_forward_does_not_leak_current_requests() {
     let mock_script = setup_mock_script(&root, "peer_fwd_cancel").await;
 
     let config_a_path = root.join("tests/config_peer_fwd_cancel_a.yaml");
+    common::reset_metrics_file(&root, "node-a-cancel").await;
+    common::reset_metrics_file(&root, "node-b-cancel").await;
     let cookbook_a_path = root.join("tests/cookbook_peer_fwd_cancel_a.yaml");
     let config_b_path = root.join("tests/config_peer_fwd_cancel_b.yaml");
     let cookbook_b_path = root.join("tests/cookbook_peer_fwd_cancel_b.yaml");
@@ -359,6 +362,8 @@ async fn cancelled_peer_forward_during_noise_body_buffer_does_not_leak_current_r
     let mock_script = setup_slow_body_mock_script(&root, "peer_fwd_body_cancel", 5000).await;
 
     let config_a_path = root.join("tests/config_peer_fwd_body_cancel_a.yaml");
+    common::reset_metrics_file(&root, "node-a-body-cancel").await;
+    common::reset_metrics_file(&root, "node-b-body-cancel").await;
     let cookbook_a_path = root.join("tests/cookbook_peer_fwd_body_cancel_a.yaml");
     let config_b_path = root.join("tests/config_peer_fwd_body_cancel_b.yaml");
     let cookbook_b_path = root.join("tests/cookbook_peer_fwd_body_cancel_b.yaml");

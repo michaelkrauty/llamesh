@@ -16,6 +16,7 @@ async fn test_standalone_proxy() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "standalone").await;
     let config_path = root.join("tests/config_standalone.yaml");
+    common::reset_metrics_file(&root, "standalone").await;
     let cookbook_path = root.join("tests/cookbook_standalone.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -23,6 +24,7 @@ async fn test_standalone_proxy() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9190"
+metrics_path: "./tests/metrics_standalone.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
@@ -128,8 +130,10 @@ async fn test_cluster_proxy() {
     let proxy_bin = llamesh_binary(&root);
 
     let config_a_path = root.join("tests/config_node_a.yaml");
+    common::reset_metrics_file(&root, "node_a").await;
     let cookbook_a_path = root.join("tests/cookbook_node_a.yaml");
     let config_b_path = root.join("tests/config_node_b.yaml");
+    common::reset_metrics_file(&root, "node_b").await;
     let cookbook_b_path = root.join("tests/cookbook_node_b.yaml");
 
     // Node A (9192) knows about Node B (9193)
@@ -137,6 +141,7 @@ async fn test_cluster_proxy() {
         r#"
 node_id: "node-a"
 listen_addr: "127.0.0.1:9192"
+metrics_path: "./tests/metrics_node_a.json"
 public_url: "http://127.0.0.1:9192"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
@@ -200,6 +205,7 @@ models:
         r#"
 node_id: "node-b"
 listen_addr: "127.0.0.1:9193"
+metrics_path: "./tests/metrics_node_b.json"
 public_url: "http://127.0.0.1:9193"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
@@ -325,6 +331,7 @@ async fn test_disabled_model() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "disabled").await;
     let config_path = root.join("tests/config_disabled.yaml");
+    common::reset_metrics_file(&root, "disabled").await;
     let cookbook_path = root.join("tests/cookbook_disabled.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -332,6 +339,7 @@ async fn test_disabled_model() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9094"
+metrics_path: "./tests/metrics_disabled.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "enabled-model:default"
@@ -490,6 +498,7 @@ async fn test_token_counting() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "tokens").await;
     let config_path = root.join("tests/config_tokens.yaml");
+    common::reset_metrics_file(&root, "tokens").await;
     let cookbook_path = root.join("tests/cookbook_tokens.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -497,6 +506,7 @@ async fn test_token_counting() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9195"
+metrics_path: "./tests/metrics_tokens.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
@@ -664,6 +674,7 @@ async fn test_instance_auth() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "auth").await;
     let config_path = root.join("tests/config_auth.yaml");
+    common::reset_metrics_file(&root, "auth").await;
     let cookbook_path = root.join("tests/cookbook_auth.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -671,6 +682,7 @@ async fn test_instance_auth() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9197"
+metrics_path: "./tests/metrics_auth.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "auth-model:default"
@@ -771,6 +783,7 @@ async fn test_crash_recovery() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "crash").await;
     let config_path = root.join("tests/config_crash.yaml");
+    common::reset_metrics_file(&root, "crash").await;
     let cookbook_path = root.join("tests/cookbook_crash.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -778,6 +791,7 @@ async fn test_crash_recovery() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9198"
+metrics_path: "./tests/metrics_crash.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "crash-model:default"
@@ -915,6 +929,7 @@ async fn test_queueing() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "queue").await;
     let config_path = root.join("tests/config_queue.yaml");
+    common::reset_metrics_file(&root, "queue").await;
     let cookbook_path = root.join("tests/cookbook_queue.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -922,6 +937,7 @@ async fn test_queueing() {
         r#"
 node_id: "test-node"
 listen_addr: "127.0.0.1:9199"
+metrics_path: "./tests/metrics_queue.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "queue-model:default"
@@ -1065,6 +1081,7 @@ async fn test_hop_counter_validation() {
     let root = std::env::current_dir().unwrap();
     let mock_script = setup_mock_script(&root, "hops").await;
     let config_path = root.join("tests/config_hops.yaml");
+    common::reset_metrics_file(&root, "hops").await;
     let cookbook_path = root.join("tests/cookbook_hops.yaml");
     let proxy_bin = llamesh_binary(&root);
 
@@ -1072,6 +1089,7 @@ async fn test_hop_counter_validation() {
         r#"
 node_id: "test-node-hops"
 listen_addr: "127.0.0.1:9201"
+metrics_path: "./tests/metrics_hops.json"
 max_vram_mb: 1048576
 max_sysmem_mb: 1024
 default_model: "mock-model:default"
