@@ -3,7 +3,7 @@ mod peer_state;
 mod port_pool;
 mod spawn_reservations;
 
-pub use model_index::{build_pre_args, get_args_hash_for_key, ModelIndex};
+pub use model_index::{args_hash_for_profile, build_pre_args, get_args_hash_for_key, ModelIndex};
 pub use peer_state::{PeerModelStats, PeerState};
 pub use port_pool::PortPool;
 pub use spawn_reservations::SpawnReservations;

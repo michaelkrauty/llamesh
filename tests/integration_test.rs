@@ -72,6 +72,14 @@ models:
         idle_timeout_seconds: 5
         max_instances: 1
         llama_server_args: ""
+  - name: "vendor/slashed-model"
+    description: "Model whose id contains a slash"
+    profiles:
+      - id: "default"
+        model_path: "./models/mock.gguf"
+        idle_timeout_seconds: 5
+        max_instances: 1
+        llama_server_args: ""
 "#;
     tokio::fs::write(&cookbook_path, cookbook_content)
         .await
@@ -135,6 +143,17 @@ models:
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let err: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(err["error"]["type"], "model_not_found");
+
+    // A model id containing '/' must retrieve via the catch-all route, matching
+    // exactly what the listing advertises.
+    let resp = client
+        .get("http://127.0.0.1:9190/v1/models/vendor/slashed-model")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let model: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(model["id"], "vendor/slashed-model");
 
     let body = serde_json::json!({
         "model": "mock-model:default",

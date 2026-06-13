@@ -456,69 +456,95 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
     // instances would currently be spawned from.
     let llama_cpp_version = state.current_llama_cpp_version().await;
 
-    let cookbook = state.cookbook.read().await;
-    for model in &cookbook.models {
-        if !model.enabled {
-            continue;
-        }
-        for profile in &model.profiles {
-            if !profile.enabled {
+    // Phase 1: snapshot the local catalog under the cookbook read lock,
+    // computing each profile's args_hash inline (we already hold the profile).
+    // The per-profile metric and instance lookups in phase 2 must not run while
+    // this guard is held — `get_args_hash_for_key` re-locks the cookbook, and
+    // tokio's write-preferring `RwLock` can deadlock that nested read against a
+    // queued hot-reload — so gather everything they need here and release first.
+    struct LocalProfile {
+        id: String,
+        model_name: String,
+        model_description: Option<String>,
+        profile_id: String,
+        profile_description: Option<String>,
+        idle_timeout_seconds: u64,
+        args_hash: String,
+    }
+    let local_profiles: Vec<LocalProfile> = {
+        let cookbook = state.cookbook.read().await;
+        let mut rows = Vec::new();
+        for model in &cookbook.models {
+            if !model.enabled {
                 continue;
             }
-            let is_default = profile.id == "default";
-            // Use bare model name for default profile, otherwise model:profile
-            let id = if is_default {
-                model.name.clone()
-            } else {
-                format!("{}:{}", model.name, profile.id)
-            };
-            let entry_id = id.clone();
-
-            // Look up metrics by args_hash
-            let (tps, persisted_params) =
-                if let Some(args_hash) = state.get_args_hash_for_key(&id).await {
-                    let hash_metrics = state.metrics.get_hash_metrics(&args_hash).await;
-                    (
-                        hash_metrics.tokens_per_second(),
-                        hash_metrics.get_parsed_params(llama_cpp_version.as_deref()),
-                    )
+            for profile in &model.profiles {
+                if !profile.enabled {
+                    continue;
+                }
+                let is_default = profile.id == "default";
+                // Use bare model name for default profile, otherwise model:profile
+                let id = if is_default {
+                    model.name.clone()
                 } else {
-                    (0.0, None)
+                    format!("{}:{}", model.name, profile.id)
                 };
-
-            // Parsed model params: prefer a running, still-current instance
-            // (freshest), fall back to the params persisted from the last
-            // instance startup.
-            let parsed_params = state
-                .get_parsed_params_for_model(&model.name, &profile.id, llama_cpp_version.as_deref())
-                .await
-                .or(persisted_params);
-
-            let metadata = json!({
-                "model": model.name.as_str(),
-                "model_description": model.description.as_deref(),
-                "profile_id": profile.id.as_str(),
-                "profile_description": profile.description.as_deref(),
-                "idle_timeout_seconds": profile.idle_timeout_seconds,
-                "estimated_tokens_per_second": tps,
-                "parsed_model_params": parsed_params,
-            });
-
-            let model_obj = json!({
-                "id": id,
-                "object": "model",
-                "created": current_time,
-                "owned_by": owned_by.as_str(),
-                "permission": [],
-                "root": model.name.as_str(),
-                "parent": null,
-                "metadata": metadata.clone(),
-            });
-            data.push(model_obj);
-            seen_ids.insert(entry_id);
+                rows.push(LocalProfile {
+                    id,
+                    model_name: model.name.clone(),
+                    model_description: model.description.clone(),
+                    profile_id: profile.id.clone(),
+                    profile_description: profile.description.clone(),
+                    idle_timeout_seconds: profile.idle_timeout_seconds,
+                    args_hash: crate::node_state::args_hash_for_profile(profile),
+                });
+            }
         }
+        rows
+    };
+
+    // Phase 2: the cookbook guard is released, so it is safe to take the metric
+    // and instance locks without risking the nested-read deadlock above.
+    for row in local_profiles {
+        // Look up metrics by args_hash
+        let hash_metrics = state.metrics.get_hash_metrics(&row.args_hash).await;
+        let tps = hash_metrics.tokens_per_second();
+        let persisted_params = hash_metrics.get_parsed_params(llama_cpp_version.as_deref());
+
+        // Parsed model params: prefer a running, still-current instance
+        // (freshest), fall back to the params persisted from the last
+        // instance startup.
+        let parsed_params = state
+            .get_parsed_params_for_model(
+                &row.model_name,
+                &row.profile_id,
+                llama_cpp_version.as_deref(),
+            )
+            .await
+            .or(persisted_params);
+
+        let metadata = json!({
+            "model": row.model_name.clone(),
+            "model_description": row.model_description,
+            "profile_id": row.profile_id,
+            "profile_description": row.profile_description,
+            "idle_timeout_seconds": row.idle_timeout_seconds,
+            "estimated_tokens_per_second": tps,
+            "parsed_model_params": parsed_params,
+        });
+
+        data.push(json!({
+            "id": row.id.clone(),
+            "object": "model",
+            "created": current_time,
+            "owned_by": owned_by.as_str(),
+            "permission": [],
+            "root": row.model_name,
+            "parent": null,
+            "metadata": metadata,
+        }));
+        seen_ids.insert(row.id);
     }
-    drop(cookbook);
 
     if state.config.cluster.enabled {
         let peers = state.peers.read().await;
@@ -561,10 +587,12 @@ pub async fn list_models(
     })))
 }
 
-/// `GET /v1/models/:model` — the OpenAI "retrieve model" endpoint. Returns the
+/// `GET /v1/models/{model}` — the OpenAI "retrieve model" endpoint. Returns the
 /// single model object whose `id` matches, or 404 if this node neither serves
 /// the model nor sees a peer advertising it. The match is exact on the
 /// advertised id, so a non-default profile must be requested as `model:profile`.
+/// Registered as a catch-all so ids containing `/` resolve to the same object
+/// `/v1/models` lists.
 pub async fn get_model(
     State(state): State<Arc<NodeState>>,
     Path(model): Path<String>,
@@ -573,9 +601,12 @@ pub async fn get_model(
     crate::security::check_api_key_auth(state.config.auth.as_ref(), &headers)
         .map_err(AppError::authentication_error)?;
 
+    // A catch-all capture can carry a leading slash; strip it so the match is
+    // exact against the advertised id (which never starts with `/`).
+    let model = model.trim_start_matches('/');
     let data = collect_models(&state).await;
     data.into_iter()
-        .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model.as_str()))
+        .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model))
         .map(Json)
         .ok_or_else(|| {
             AppError::model_not_found(format!(
