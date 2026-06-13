@@ -20,6 +20,7 @@
 #   max_queue_size: (from model_defaults.max_queue_size_per_model)
 #   estimated_vram_mb: unset         # optional cold-start admission hint
 #   estimated_sysmem_mb: unset       # optional cold-start admission hint
+#   min_eviction_tenure_secs: (from model_defaults, default 15)  # per-profile override
 #
 # NOTE: The proxy parses context_size, batch size, etc. from llama-server's
 # startup log. Use llama_server_args to configure -c, -b, -n if needed.
