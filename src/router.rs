@@ -5,7 +5,7 @@ use crate::instance::Instance;
 use crate::node_state::{NodeError, NodeState};
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Path, State},
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
     response::IntoResponse,
     response::Json,
@@ -438,13 +438,11 @@ async fn send_peer_request(
     }
 }
 
-pub async fn list_models(
-    State(state): State<Arc<NodeState>>,
-    headers: HeaderMap,
-) -> Result<Json<Value>, AppError> {
-    crate::security::check_api_key_auth(state.config.auth.as_ref(), &headers)
-        .map_err(AppError::authentication_error)?;
-
+/// Build the OpenAI-style model objects this node advertises: every enabled
+/// local `model:profile`, plus any models advertised by cluster peers. Shared by
+/// `list_models` (`GET /v1/models`) and `get_model` (`GET /v1/models/:model`) so
+/// the two endpoints never disagree on the catalog.
+async fn collect_models(state: &NodeState) -> Vec<Value> {
     let mut data = Vec::new();
     let current_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -546,10 +544,45 @@ pub async fn list_models(
         }
     }
 
+    data
+}
+
+pub async fn list_models(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    crate::security::check_api_key_auth(state.config.auth.as_ref(), &headers)
+        .map_err(AppError::authentication_error)?;
+
+    let data = collect_models(&state).await;
     Ok(Json(json!({
         "object": "list",
         "data": data
     })))
+}
+
+/// `GET /v1/models/:model` — the OpenAI "retrieve model" endpoint. Returns the
+/// single model object whose `id` matches, or 404 if this node neither serves
+/// the model nor sees a peer advertising it. The match is exact on the
+/// advertised id, so a non-default profile must be requested as `model:profile`.
+pub async fn get_model(
+    State(state): State<Arc<NodeState>>,
+    Path(model): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, AppError> {
+    crate::security::check_api_key_auth(state.config.auth.as_ref(), &headers)
+        .map_err(AppError::authentication_error)?;
+
+    let data = collect_models(&state).await;
+    data.into_iter()
+        .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(model.as_str()))
+        .map(Json)
+        .ok_or_else(|| {
+            AppError::model_not_found(format!(
+                "Model '{model}' not found in local cookbook or any peer"
+            ))
+            .with_param("model")
+        })
 }
 
 pub async fn route_request(

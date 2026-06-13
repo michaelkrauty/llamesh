@@ -177,6 +177,7 @@ Use `__` (double underscore) for nested fields: `LLAMESH_CLUSTER__ENABLED=true`.
 | `POST /v1/embeddings` | Embeddings (requires `--embedding` profile) |
 | `POST /v1/rerank` | Reranking (requires `--reranking` profile; aliases: `/v1/reranking`, `/rerank`) |
 | `GET /v1/models` | List available models |
+| `GET /v1/models/{model}` | Retrieve a single model |
 | `GET /healthz` | Health check (alias: `/health`) |
 | `GET /readyz` | Readiness check |
 | `GET /version` | Proxy version |

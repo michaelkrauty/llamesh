@@ -92,12 +92,49 @@ models:
     );
 
     let client = reqwest::Client::new();
+    // The cookbook finishes loading shortly after the liveness probe passes, so
+    // poll the listing until the model is advertised before exercising retrieve.
+    let mut listed = false;
+    for _ in 0..40 {
+        let resp = client
+            .get("http://127.0.0.1:9190/v1/models")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        if body["data"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|m| m["id"] == "mock-model"))
+        {
+            listed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(listed, "mock-model never appeared in /v1/models");
+
+    // Retrieve a single model (OpenAI `GET /v1/models/{id}`): the default
+    // profile is advertised under the bare model name.
     let resp = client
-        .get("http://127.0.0.1:9190/v1/models")
+        .get("http://127.0.0.1:9190/v1/models/mock-model")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let model: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(model["id"], "mock-model");
+    assert_eq!(model["object"], "model");
+
+    // An unknown model id returns 404 with the OpenAI error envelope.
+    let resp = client
+        .get("http://127.0.0.1:9190/v1/models/no-such-model")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let err: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(err["error"]["type"], "model_not_found");
 
     let body = serde_json::json!({
         "model": "mock-model:default",
