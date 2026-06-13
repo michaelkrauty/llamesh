@@ -56,6 +56,15 @@ model_defaults:
   max_wait_in_queue_ms: 60000
   # Max request duration in ms, 0 = unlimited (default: 0)
   max_request_duration_ms: 0
+  # Minimum seconds an instance must serve before it can be drained for a
+  # competing model; after this it yields to queued competitors on its next
+  # idle transition. 0 = drain immediately. (default: 15)
+  min_eviction_tenure_secs: 15
+
+# Global cap on total queued requests across all models, 0 = no global limit
+# (only per-model max_queue_size_per_model applies). Bounds overall memory
+# pressure from queued requests. (default: 0)
+max_total_queue_entries: 0
 
 # -----------------------------------------------------------------------------
 # llama-server Port Allocation
@@ -124,6 +133,12 @@ cluster:
 
   # Max concurrent outbound gossip connections (default: 16)
   max_concurrent_gossip: 16
+
+  # What to do when a peer reports a different llamesh version (default: "warn")
+  #   "warn"         - log the mismatch, keep meshing
+  #   "reject_major" - refuse to mesh with peers on a different major version
+  #   "reject_any"   - refuse to mesh with peers on any different version
+  version_mismatch_action: "warn"
 
   # Peer discovery configuration
   discovery:
@@ -196,6 +211,13 @@ http:
 
   # Idle connection timeout in seconds (required)
   idle_timeout_seconds: 120
+
+  # Timeout in ms for reading a request body (default: 30000)
+  body_read_timeout_ms: 30000
+
+  # Timeout in ms for protocol detection on a new connection, before any bytes
+  # arrive (TLS vs HTTP vs cluster traffic). (default: 10000)
+  protocol_detect_timeout_ms: 10000
 
 # -----------------------------------------------------------------------------
 # Shutdown Behavior

@@ -1310,6 +1310,34 @@ models:
     }
 
     #[test]
+    fn example_config_and_cookbook_load_and_validate() {
+        // The annotated examples users copy from must stay loadable and valid
+        // as the schema evolves — not merely valid YAML. Loading them through
+        // the real loaders (the same calls main uses) and asserting the
+        // documented knobs keeps the examples from silently drifting away from
+        // the structs. Paths are relative to the crate root, where cargo runs
+        // tests from.
+        let config =
+            load_config(Path::new("config.example.yaml")).expect("config.example.yaml loads");
+        config
+            .validate()
+            .expect("config.example.yaml passes validation");
+
+        assert_eq!(config.max_total_queue_entries, 0);
+        assert_eq!(config.model_defaults.min_eviction_tenure_secs, 15);
+        assert_eq!(config.cluster.version_mismatch_action, "warn");
+        assert_eq!(config.http.body_read_timeout_ms, 30_000);
+        assert_eq!(config.http.protocol_detect_timeout_ms, 10_000);
+
+        let cookbook =
+            load_cookbook(Path::new("cookbook.example.yaml")).expect("cookbook.example.yaml loads");
+        cookbook
+            .validate()
+            .expect("cookbook.example.yaml passes validation");
+        assert!(!cookbook.models.is_empty());
+    }
+
+    #[test]
     fn supports_embedding_variant_flags() {
         // Test both --embedding and --embeddings variants
         let p1 = profile_with_args(&["--embedding"]);

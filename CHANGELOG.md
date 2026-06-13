@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.3] - 2026-06-13
+
+### Documentation
+
+- Documented configuration fields that existed in code but were missing from
+  the annotated examples: `max_total_queue_entries`,
+  `model_defaults.min_eviction_tenure_secs`,
+  `cluster.version_mismatch_action`, and `http.body_read_timeout_ms` /
+  `http.protocol_detect_timeout_ms` in `config.example.yaml`, the per-profile
+  `min_eviction_tenure_secs` override in `cookbook.example.yaml`, and
+  `min_eviction_tenure_secs` (config and eviction-tenure behavior) in
+  `SPEC.md`, which previously described it nowhere. A new test loads both
+  example files through the real loaders and validates them, so the examples
+  cannot silently drift from the config structs again.
+
 ## [1.13.2] - 2026-06-13
 
 ### Fixed

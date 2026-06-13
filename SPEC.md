@@ -142,6 +142,7 @@ model_defaults:
   max_instances_per_model: 4
   max_wait_in_queue_ms: 60000
   max_request_duration_ms: 0                # 0 = unlimited
+  min_eviction_tenure_secs: 15              # min serve time before drain for a competing model; 0 = immediate
 
 # Optional static port configuration for llama.cpp instances
 llama_cpp_ports:
@@ -954,6 +955,12 @@ Each instance is a `llama-server` process spawned by the proxy:
 
   * Background task detects and removes crashed instances.
   * Background task samples memory (VRAM and system memory) every 10 seconds continuously, not just during cold-start.
+
+* Eviction tenure (for competing models):
+
+  * When a request needs a model that does not fit without freeing capacity, the router may drain an instance of a *different* model to make room (see the routing score's eviction terms above).
+  * Each instance is protected for `min_eviction_tenure_secs` (default 15) after it becomes ready: until that tenure expires it will not be drained for a competing model, so a freshly spawned instance is not immediately reclaimed. After tenure expires it yields to queued competitors on its next idle transition. `0` allows immediate eviction.
+  * Configured globally in `model_defaults` and overridable per profile in the cookbook. This is independent of idle eviction, which reclaims instances of the *same or any* model once they pass `idle_timeout_seconds` with no in-flight requests.
 
 * Draining:
 
