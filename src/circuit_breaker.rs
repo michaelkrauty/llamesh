@@ -419,9 +419,18 @@ impl CircuitBreaker {
                     circuit.consecutive_opens += 1;
                     circuit.success_count = 0;
                     circuit.reset_probe();
+                    // The backoff now in effect: the circuit blocks dispatches
+                    // for this long before a recovery probe is admitted. Logged
+                    // so operators see the block duration without recomputing
+                    // the exponential schedule from `consecutive_opens` by hand.
+                    let backoff_ms = self
+                        .calculate_backoff(circuit.consecutive_opens)
+                        .as_millis() as u64;
                     tracing::warn!(
                         peer_id = %peer_id,
                         failures = circuit.failure_count,
+                        consecutive_opens = circuit.consecutive_opens,
+                        backoff_ms,
                         "Circuit breaker opened after consecutive failures"
                     );
                 }
@@ -436,8 +445,13 @@ impl CircuitBreaker {
                     circuit.consecutive_opens += 1;
                     circuit.success_count = 0;
                     circuit.reset_probe();
+                    let backoff_ms = self
+                        .calculate_backoff(circuit.consecutive_opens)
+                        .as_millis() as u64;
                     tracing::warn!(
                         peer_id = %peer_id,
+                        consecutive_opens = circuit.consecutive_opens,
+                        backoff_ms,
                         "Circuit breaker reopened after failure in half-open state"
                     );
                 }
@@ -455,9 +469,13 @@ impl CircuitBreaker {
                     circuit.consecutive_opens += 1;
                     circuit.success_count = 0;
                     circuit.reset_probe();
+                    let backoff_ms = self
+                        .calculate_backoff(circuit.consecutive_opens)
+                        .as_millis() as u64;
                     tracing::warn!(
                         peer_id = %peer_id,
                         consecutive_opens = circuit.consecutive_opens,
+                        backoff_ms,
                         "Circuit breaker reopened after failed recovery probe"
                     );
                 }
@@ -921,5 +939,66 @@ mod tests {
         // Large consecutive opens shouldn't overflow
         assert_eq!(cb.calculate_backoff(100), Duration::from_millis(60000));
         assert_eq!(cb.calculate_backoff(u32::MAX), Duration::from_millis(60000));
+    }
+
+    /// Minimal `MakeWriter` that captures formatted log output into a shared
+    /// buffer, so tests can assert on emitted fields with no extra dependency
+    /// and no global subscriber.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn open_log_reports_effective_backoff() {
+        // A current-thread `#[tokio::test]` keeps the scoped subscriber on the
+        // same thread across awaits, so warn events from the calls below are
+        // captured.
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(CaptureWriter(buf.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_base_ms: 5000,
+            open_duration_max_ms: 60000,
+            ..Default::default()
+        });
+
+        // First open: consecutive_opens = 1 -> backoff 5000 * 2^0 = 5000ms.
+        cb.record_failure("p", false).await;
+        // A ticketed probe failure while open escalates the block: this is the
+        // same reopen path a real failed recovery probe drives.
+        // consecutive_opens = 2 -> backoff 5000 * 2^1 = 10000ms.
+        cb.record_failure("p", true).await;
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("\"backoff_ms\":5000"),
+            "expected first open to log backoff_ms=5000; got: {logged}"
+        );
+        assert!(
+            logged.contains("\"backoff_ms\":10000"),
+            "expected escalated reopen to log backoff_ms=10000; got: {logged}"
+        );
     }
 }

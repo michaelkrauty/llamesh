@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.4] - 2026-06-14
+
+### Changed
+
+- Circuit-breaker "now blocking" warnings now report the effective backoff
+  duration (`backoff_ms`) and a uniform `consecutive_opens` count across all
+  three open/reopen transitions (open after consecutive failures, reopen from
+  half-open, reopen after a failed recovery probe). Previously the logs carried
+  only the open count, so operators had to recompute the exponential backoff
+  schedule by hand to know how long a peer would stay blocked before the next
+  recovery probe. This is a logging-only change; circuit-breaker behavior is
+  unchanged.
+
 ## [1.15.3] - 2026-06-14
 
 ### Fixed
