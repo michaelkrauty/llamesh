@@ -12,10 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `/v1/models` and `/v1/models/{model}` now report a stable `created` timestamp
-  (the node's start time) for each model instead of the wall-clock time at
-  request time, which changed on every call. OpenAI clients treat `created` as
-  a fixed per-model creation timestamp, so the previous behavior could confuse
-  tools that cache or compare it.
+  for each model instead of the wall-clock time at request time, which changed
+  on every call. OpenAI clients treat `created` as a fixed per-model creation
+  timestamp, so the previous behavior could confuse tools that cache or compare
+  it. Locally served models report this node's start time; models advertised by
+  cluster peers report the owning peer's start time (propagated via gossip), so
+  a peer-owned model's `created` is consistent across every front-end node that
+  serves it. A peer running an older version that does not advertise its start
+  time falls back to the querying node's start time.
 
 ## [1.15.0] - 2026-06-13
 

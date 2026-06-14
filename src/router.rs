@@ -549,12 +549,20 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
     if state.config.cluster.enabled {
         let peers = state.peers.read().await;
         for peer in peers.values() {
+            // Peer-owned models report the peer's own start time so the value is
+            // consistent across every front-end node serving them; fall back to
+            // this node's start time for older peers that don't advertise it.
+            let peer_created = if peer.started_at_unix > 0 {
+                peer.started_at_unix
+            } else {
+                created
+            };
             for entry in &peer.supported_models {
                 if seen_ids.insert(entry.clone()) {
                     data.push(json!({
                         "id": entry,
                         "object": "model",
-                        "created": created,
+                        "created": peer_created,
                         "owned_by": peer.node_id,
                         "permission": [],
                         "root": entry.split(':').next().unwrap_or(entry),

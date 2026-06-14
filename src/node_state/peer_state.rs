@@ -33,6 +33,13 @@ pub struct PeerState {
     #[serde(default = "default_llama_cpp_version")]
     pub llama_cpp_version: String,
     pub last_seen: u64,
+    /// Unix timestamp (seconds) when the peer node started, advertised via
+    /// gossip. Used as the stable `created` value for this peer's models in
+    /// `/v1/models`, so a peer-owned model reports a consistent creation time
+    /// across all front-end nodes. `0` when an older peer does not advertise it,
+    /// in which case the querying node falls back to its own start time.
+    #[serde(default)]
+    pub started_at_unix: u64,
     pub supported_models: Vec<String>,
     #[serde(default)]
     pub model_stats: HashMap<String, PeerModelStats>,
@@ -125,6 +132,7 @@ mod tests {
             version: "1.0.0".into(),
             llama_cpp_version: "b2c3d4e5f".into(),
             last_seen: 12345,
+            started_at_unix: 1_700_000_000,
             supported_models: vec!["model:fast".into()],
             model_stats: HashMap::new(),
             active_instances: 2,
@@ -150,6 +158,7 @@ mod tests {
         assert_eq!(parsed.address, "http://localhost:8080");
         assert_eq!(parsed.version, "1.0.0");
         assert_eq!(parsed.llama_cpp_version, "b2c3d4e5f");
+        assert_eq!(parsed.started_at_unix, 1_700_000_000);
         assert_eq!(parsed.active_instances, 2);
         assert_eq!(parsed.external_vram_mb, 500);
         assert!(parsed.gpu_telemetry_available);
@@ -182,6 +191,9 @@ mod tests {
         // Missing "llama_cpp_version" (older peer) defaults to "unknown" rather
         // than failing the gossip deserialize.
         assert_eq!(parsed.llama_cpp_version, "unknown");
+        // Older peers omit started_at_unix; it must default to 0 so the
+        // querying node falls back to its own start time for their models.
+        assert_eq!(parsed.started_at_unix, 0);
         assert_eq!(parsed.external_vram_mb, 0);
         assert_eq!(parsed.device_vram_used_mb, 0);
         assert!(!parsed.gpu_telemetry_available);
