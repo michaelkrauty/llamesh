@@ -428,27 +428,31 @@ impl BuildManager {
             .ok()
             .and_then(|bin| Some(bin.parent()?.parent()?.to_path_buf()));
 
-        // Keep the most recent builds based on config; the active build is
-        // always retained regardless of count or age.
+        // The active build is always retained. Among the remaining (non-active)
+        // builds, keep the `keep_builds` most recent and remove the older ones,
+        // so protecting the active build never reduces how many previous builds
+        // are kept for rollback — even when the active build is itself old.
+        let mut non_active = Vec::new();
+        for (path, _) in &builds {
+            let is_active = match &active_build_dir {
+                Some(active) => {
+                    tokio::fs::canonicalize(path).await.ok().as_deref() == Some(active.as_path())
+                }
+                None => false,
+            };
+            if !is_active {
+                non_active.push(path);
+            }
+        }
+
         let keep_count = self.config.keep_builds;
-        if builds.len() > keep_count {
-            let to_remove = builds.len() - keep_count;
-            let mut removed = 0;
-            for (path, _) in &builds {
-                if removed >= to_remove {
-                    break;
-                }
-                if let Some(active) = &active_build_dir {
-                    if tokio::fs::canonicalize(path).await.ok().as_deref() == Some(active.as_path())
-                    {
-                        continue;
-                    }
-                }
+        if non_active.len() > keep_count {
+            let remove_upto = non_active.len() - keep_count;
+            for &path in &non_active[..remove_upto] {
                 info!("Removing old build: {}", path.display());
                 if let Err(e) = tokio::fs::remove_dir_all(path).await {
                     warn!("Failed to remove old build {}: {}", path.display(), e);
                 }
-                removed += 1;
             }
         }
 
@@ -1388,6 +1392,72 @@ fi
         );
         assert!(!llama.join("build-aaaaaaaaa").exists());
         assert!(!llama.join("build-ccccccccc").exists());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_configured_non_active_builds() {
+        // Protecting the active build must not reduce how many previous builds
+        // are kept: with keep_builds=2 and the active build being the oldest,
+        // the two most recent non-active builds are retained alongside it, and
+        // only the older non-active build is removed.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "llama-proxy-cleanup-keep-test-{}",
+            ulid::Ulid::new()
+        ));
+        let llama = temp_dir.join("llama.cpp");
+
+        // Four build dirs created with ascending modification times so the sort
+        // order is deterministic; the first created (active) is the oldest.
+        let names = [
+            "build-100000000",
+            "build-200000000",
+            "build-300000000",
+            "build-400000000",
+        ];
+        for name in names {
+            let bin = llama.join(name).join("bin");
+            tokio::fs::create_dir_all(&bin).await.unwrap();
+            tokio::fs::write(bin.join("llama-server"), b"#!/bin/true\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The active build is the oldest (build-100000000).
+        let link_dir = llama.join("build").join("bin");
+        tokio::fs::create_dir_all(&link_dir).await.unwrap();
+        let link = link_dir.join("llama-server");
+        let active = llama.join("build-100000000");
+        std::os::unix::fs::symlink(active.join("bin").join("llama-server"), &link).unwrap();
+
+        let config = crate::config::LlamaCppConfig {
+            repo_url: String::new(),
+            repo_path: llama.to_string_lossy().to_string(),
+            build_path: llama.join("build").to_string_lossy().to_string(),
+            binary_path: link.to_string_lossy().to_string(),
+            branch: String::new(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: true,
+            keep_builds: 2,
+        };
+        BuildManager::new(config)
+            .cleanup_old_builds()
+            .await
+            .unwrap();
+
+        // Active kept, plus the two most recent non-active builds; the oldest
+        // non-active build is removed.
+        assert!(active.exists(), "active build must be kept");
+        assert!(llama.join("build-300000000").exists());
+        assert!(llama.join("build-400000000").exists());
+        assert!(
+            !llama.join("build-200000000").exists(),
+            "the oldest non-active build should be removed"
+        );
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

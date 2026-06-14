@@ -168,7 +168,7 @@ llama_cpp:
     - "-j32"
   auto_update_interval_seconds: 86400  # once per day; set to 0 when pinning to specific version
   enabled: true                        # set to false to disable auto-build
-  keep_builds: 3                       # recent builds to keep; active always kept (default: 3)
+  keep_builds: 3                       # previous builds kept for rollback; active always kept (default: 3)
 
 # Cluster / mesh config
 cluster:
@@ -1083,7 +1083,7 @@ Each node is responsible for its local `llama.cpp`.
 * On update:
 
   * Configure and build `llama.cpp` with configured `build_args` in per-commit build directories (`build-<hash>/`).
-  * `keep_builds` controls how many recent builds are retained (default 3); the build the live binary currently resolves to is always kept regardless of this count or age.
+  * `keep_builds` controls how many previous (non-active) builds are retained for rollback (default 3); the build the live binary currently resolves to is always kept in addition, regardless of this count or age.
   * Run smoke test:
 
     * `llama-server --help` or simple trivial prompt.
