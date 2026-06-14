@@ -444,10 +444,10 @@ async fn send_peer_request(
 /// the two endpoints never disagree on the catalog.
 async fn collect_models(state: &NodeState) -> Vec<Value> {
     let mut data = Vec::new();
-    let current_time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // Stable per-model `created`: OpenAI clients treat it as a fixed creation
+    // timestamp, so report the node start time instead of the wall clock at
+    // request time, which would otherwise change on every call.
+    let created = state.started_at_unix;
     let mut seen_ids = HashSet::new();
     let owned_by = state.config.node_id.clone();
 
@@ -536,7 +536,7 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
         data.push(json!({
             "id": row.id.clone(),
             "object": "model",
-            "created": current_time,
+            "created": created,
             "owned_by": owned_by.as_str(),
             "permission": [],
             "root": row.model_name,
@@ -549,12 +549,20 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
     if state.config.cluster.enabled {
         let peers = state.peers.read().await;
         for peer in peers.values() {
+            // Peer-owned models report the peer's own start time so the value is
+            // consistent across every front-end node serving them; fall back to
+            // this node's start time for older peers that don't advertise it.
+            let peer_created = if peer.started_at_unix > 0 {
+                peer.started_at_unix
+            } else {
+                created
+            };
             for entry in &peer.supported_models {
                 if seen_ids.insert(entry.clone()) {
                     data.push(json!({
                         "id": entry,
                         "object": "model",
-                        "created": current_time,
+                        "created": peer_created,
                         "owned_by": peer.node_id,
                         "permission": [],
                         "root": entry.split(':').next().unwrap_or(entry),

@@ -91,6 +91,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[derive(Clone)]
 pub struct NodeState {
     pub config: Arc<NodeConfig>,
+    /// Unix timestamp (seconds) when this node started, captured once in
+    /// `new()`. Used as the stable `created` value for models in `/v1/models`,
+    /// so a model's reported creation time is fixed for the process lifetime
+    /// rather than changing on every request.
+    pub started_at_unix: u64,
     pub cookbook: Arc<RwLock<Cookbook>>,
     /// Version counter incremented on each cookbook reload.
     /// Callers can capture this at request start and compare at end
@@ -457,6 +462,10 @@ impl NodeState {
 
         Ok(Self {
             config: Arc::new(config),
+            started_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             cookbook: Arc::new(RwLock::new(cookbook)),
             cookbook_version: Arc::new(AtomicU64::new(0)),
             instances: Arc::new(RwLock::new(HashMap::new())),
@@ -2652,6 +2661,7 @@ impl NodeState {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            started_at_unix: self.started_at_unix,
             supported_models,
             model_stats,
             active_instances,
@@ -3578,6 +3588,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: supported.into_iter().map(|s| s.to_string()).collect(),
             active_instances: 0,
             max_instances: 8,
@@ -3804,7 +3815,8 @@ mod tests {
             address: "http://remote-peer".into(),
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
-            last_seen: now,                                        // Recent
+            last_seen: now, // Recent
+            started_at_unix: 0,
             supported_models: vec!["remote-model:default".into()], // Supports our model
             active_instances: 0,
             max_instances: 10,
@@ -4894,6 +4906,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec![],
             active_instances: 2,
             max_instances: 8,
@@ -4930,6 +4943,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec![],
             active_instances: 0,
             max_instances: 8,
@@ -4966,6 +4980,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec![],
             active_instances: 2,
             max_instances: 8,
@@ -5004,6 +5019,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec![],
             active_instances: 2,
             max_instances: 8,
@@ -5043,6 +5059,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -5080,6 +5097,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 0,
             max_instances: 8,
@@ -5132,6 +5150,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -5169,6 +5188,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 0,
             max_instances: 8,
@@ -5223,6 +5243,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -5250,6 +5271,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -5294,6 +5316,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -5364,6 +5387,7 @@ mod tests {
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
+            started_at_unix: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
