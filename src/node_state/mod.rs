@@ -91,6 +91,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[derive(Clone)]
 pub struct NodeState {
     pub config: Arc<NodeConfig>,
+    /// Unix timestamp (seconds) when this node started, captured once in
+    /// `new()`. Used as the stable `created` value for models in `/v1/models`,
+    /// so a model's reported creation time is fixed for the process lifetime
+    /// rather than changing on every request.
+    pub started_at_unix: u64,
     pub cookbook: Arc<RwLock<Cookbook>>,
     /// Version counter incremented on each cookbook reload.
     /// Callers can capture this at request start and compare at end
@@ -457,6 +462,10 @@ impl NodeState {
 
         Ok(Self {
             config: Arc::new(config),
+            started_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             cookbook: Arc::new(RwLock::new(cookbook)),
             cookbook_version: Arc::new(AtomicU64::new(0)),
             instances: Arc::new(RwLock::new(HashMap::new())),

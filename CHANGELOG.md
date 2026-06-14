@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.1] - 2026-06-14
+
+### Fixed
+
+- `/v1/models` and `/v1/models/{model}` now report a stable `created` timestamp
+  (the node's start time) for each model instead of the wall-clock time at
+  request time, which changed on every call. OpenAI clients treat `created` as
+  a fixed per-model creation timestamp, so the previous behavior could confuse
+  tools that cache or compare it.
+
 ## [1.15.0] - 2026-06-13
 
 ### Added

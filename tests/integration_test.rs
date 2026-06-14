@@ -155,6 +155,60 @@ models:
     let model: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(model["id"], "vendor/slashed-model");
 
+    // `created` must be a stable per-model timestamp (OpenAI semantics): the
+    // same model reports the same value across requests, even ones more than a
+    // second apart, instead of the wall clock at request time. Read it, wait
+    // past a one-second boundary, and read again.
+    let model_created = |models: &serde_json::Value| -> serde_json::Value {
+        models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "mock-model")
+            .unwrap()["created"]
+            .clone()
+    };
+    let list1: serde_json::Value = client
+        .get("http://127.0.0.1:9190/v1/models")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let created1 = model_created(&list1);
+    assert!(
+        created1.as_u64().is_some_and(|c| c > 0),
+        "created should be a positive unix timestamp"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let list2: serde_json::Value = client
+        .get("http://127.0.0.1:9190/v1/models")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        created1,
+        model_created(&list2),
+        "model `created` must be stable across requests, not the request-time clock"
+    );
+    // Retrieve must report the same `created` as the listing.
+    let retrieved: serde_json::Value = client
+        .get("http://127.0.0.1:9190/v1/models/mock-model")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        retrieved["created"], created1,
+        "retrieve `created` must match the listing"
+    );
+
     let body = serde_json::json!({
         "model": "mock-model:default",
         "messages": [{"role": "user", "content": "Hello"}],
