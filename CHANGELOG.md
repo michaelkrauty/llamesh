@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.3] - 2026-06-14
+
+### Fixed
+
+- Streaming token counting now counts `reasoning_content` and `tool_calls`
+  deltas in addition to `content`. Previously only visible `content` deltas were
+  counted, so `tokens_generated` (and the derived `estimated_tokens_per_second`
+  reported in `/v1/models`) undercounted responses from reasoning ("thinking")
+  and tool-calling models whenever the upstream stream omitted the authoritative
+  `usage` chunk. A `usage` chunk, when present, remains authoritative.
+
 ## [1.15.2] - 2026-06-14
 
 ### Fixed
