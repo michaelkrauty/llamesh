@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.2] - 2026-06-14
+
+### Fixed
+
+- The llama.cpp build cleanup (`keep_builds`) no longer deletes the build the
+  live binary is currently using. Cleanup previously removed the oldest builds
+  purely by timestamp until only `keep_builds` remained, so a small value
+  (`keep_builds: 0` in particular) or an out-of-order build timestamp could
+  delete the active build directory out from under the running server. The
+  build the binary symlink resolves to is now always retained, regardless of
+  `keep_builds` or age.
+
 ## [1.15.1] - 2026-06-14
 
 ### Fixed

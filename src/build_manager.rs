@@ -418,15 +418,37 @@ impl BuildManager {
         // Sort by creation time (oldest first)
         builds.sort_by_key(|(_, created)| *created);
 
-        // Keep recent builds based on config
+        // Resolve the build directory the live binary symlink currently points
+        // into, so cleanup never deletes the build that is actively serving —
+        // even when keep_builds is small (e.g. 0) or a build's timestamp is out
+        // of order. The managed layout is `<build-dir>/bin/llama-server`, so the
+        // build dir is two levels up from the resolved binary.
+        let active_build_dir = tokio::fs::canonicalize(&self.config.binary_path)
+            .await
+            .ok()
+            .and_then(|bin| Some(bin.parent()?.parent()?.to_path_buf()));
+
+        // Keep the most recent builds based on config; the active build is
+        // always retained regardless of count or age.
         let keep_count = self.config.keep_builds;
         if builds.len() > keep_count {
             let to_remove = builds.len() - keep_count;
-            for (path, _) in builds.iter().take(to_remove) {
+            let mut removed = 0;
+            for (path, _) in &builds {
+                if removed >= to_remove {
+                    break;
+                }
+                if let Some(active) = &active_build_dir {
+                    if tokio::fs::canonicalize(path).await.ok().as_deref() == Some(active.as_path())
+                    {
+                        continue;
+                    }
+                }
                 info!("Removing old build: {}", path.display());
                 if let Err(e) = tokio::fs::remove_dir_all(path).await {
                     warn!("Failed to remove old build {}: {}", path.display(), e);
                 }
+                removed += 1;
             }
         }
 
@@ -1316,5 +1338,57 @@ fi
 
         buf.clear();
         assert!(!read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_active_build() {
+        // Cleanup must never delete the build the live binary symlink resolves
+        // to, even when keep_builds is 0 (which would otherwise remove every
+        // build, including the one currently serving).
+        let temp_dir =
+            std::env::temp_dir().join(format!("llama-proxy-cleanup-test-{}", ulid::Ulid::new()));
+        let llama = temp_dir.join("llama.cpp");
+
+        // Three managed build dirs, each with a bin/llama-server file.
+        for name in ["build-aaaaaaaaa", "build-bbbbbbbbb", "build-ccccccccc"] {
+            let bin = llama.join(name).join("bin");
+            tokio::fs::create_dir_all(&bin).await.unwrap();
+            tokio::fs::write(bin.join("llama-server"), b"#!/bin/true\n")
+                .await
+                .unwrap();
+        }
+
+        // The live binary symlink (build/bin/llama-server) points at the middle
+        // build, so the active build is neither the newest nor the oldest.
+        let link_dir = llama.join("build").join("bin");
+        tokio::fs::create_dir_all(&link_dir).await.unwrap();
+        let link = link_dir.join("llama-server");
+        let active = llama.join("build-bbbbbbbbb");
+        std::os::unix::fs::symlink(active.join("bin").join("llama-server"), &link).unwrap();
+
+        let config = crate::config::LlamaCppConfig {
+            repo_url: String::new(),
+            repo_path: llama.to_string_lossy().to_string(),
+            build_path: llama.join("build").to_string_lossy().to_string(),
+            binary_path: link.to_string_lossy().to_string(),
+            branch: String::new(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: true,
+            keep_builds: 0,
+        };
+        let bm = BuildManager::new(config);
+        bm.cleanup_old_builds().await.unwrap();
+
+        // The active build survives; the other two are removed.
+        assert!(
+            active.exists(),
+            "active build dir must not be deleted by cleanup"
+        );
+        assert!(!llama.join("build-aaaaaaaaa").exists());
+        assert!(!llama.join("build-ccccccccc").exists());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
