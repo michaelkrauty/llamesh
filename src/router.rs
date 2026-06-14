@@ -1931,10 +1931,27 @@ fn process_line(line: &[u8], counter: &AtomicU64) {
             if let Some(choices) = val.get("choices").and_then(|c| c.as_array()) {
                 if let Some(choice) = choices.first() {
                     if let Some(delta) = choice.get("delta") {
-                        if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                            if !content.is_empty() {
-                                counter.fetch_add(1, Ordering::Relaxed);
-                            }
+                        // Count any delta carrying generated output: visible
+                        // content, reasoning content (thinking models emit it in
+                        // a separate field), or tool-call fragments. A
+                        // content-only check undercounts streams from reasoning
+                        // and tool-calling models whenever the upstream omits the
+                        // authoritative `usage` chunk.
+                        let nonempty_str = |key: &str| {
+                            delta
+                                .get(key)
+                                .and_then(|v| v.as_str())
+                                .is_some_and(|s| !s.is_empty())
+                        };
+                        let has_tool_calls = delta
+                            .get("tool_calls")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|a| !a.is_empty());
+                        if nonempty_str("content")
+                            || nonempty_str("reasoning_content")
+                            || has_tool_calls
+                        {
+                            counter.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -2358,6 +2375,47 @@ mod tests {
         let prev = counter.load(Ordering::Relaxed);
         process_line(b"data: [DONE]", &counter);
         assert_eq!(counter.load(Ordering::Relaxed), prev);
+    }
+
+    #[test]
+    fn test_process_line_counts_reasoning_content() {
+        use std::sync::atomic::AtomicU64;
+        let counter = AtomicU64::new(0);
+
+        // Thinking models stream reasoning in a separate `reasoning_content`
+        // field; it is generated output and must be counted.
+        process_line(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}",
+            &counter,
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Empty reasoning_content does not increment.
+        process_line(
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\"}}]}",
+            &counter,
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_process_line_counts_tool_calls() {
+        use std::sync::atomic::AtomicU64;
+        let counter = AtomicU64::new(0);
+
+        // A tool-call delta carries generated output and must be counted.
+        process_line(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}",
+            &counter,
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // An empty tool_calls array does not increment.
+        process_line(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[]}}]}",
+            &counter,
+        );
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[test]
