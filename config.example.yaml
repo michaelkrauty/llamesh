@@ -119,7 +119,9 @@ llama_cpp:
   # Set to false if managing llama.cpp builds externally
   enabled: true
 
-  # Number of old builds to keep (default: 3)
+  # Number of previous builds to keep for rollback, besides the one currently
+  # in use (default: 3). The active build is always kept in addition, so a
+  # value of 0 keeps only the active build.
   keep_builds: 3
 
 # -----------------------------------------------------------------------------

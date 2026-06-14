@@ -418,11 +418,37 @@ impl BuildManager {
         // Sort by creation time (oldest first)
         builds.sort_by_key(|(_, created)| *created);
 
-        // Keep recent builds based on config
+        // Resolve the build directory the live binary symlink currently points
+        // into, so cleanup never deletes the build that is actively serving —
+        // even when keep_builds is small (e.g. 0) or a build's timestamp is out
+        // of order. The managed layout is `<build-dir>/bin/llama-server`, so the
+        // build dir is two levels up from the resolved binary.
+        let active_build_dir = tokio::fs::canonicalize(&self.config.binary_path)
+            .await
+            .ok()
+            .and_then(|bin| Some(bin.parent()?.parent()?.to_path_buf()));
+
+        // The active build is always retained. Among the remaining (non-active)
+        // builds, keep the `keep_builds` most recent and remove the older ones,
+        // so protecting the active build never reduces how many previous builds
+        // are kept for rollback — even when the active build is itself old.
+        let mut non_active = Vec::new();
+        for (path, _) in &builds {
+            let is_active = match &active_build_dir {
+                Some(active) => {
+                    tokio::fs::canonicalize(path).await.ok().as_deref() == Some(active.as_path())
+                }
+                None => false,
+            };
+            if !is_active {
+                non_active.push(path);
+            }
+        }
+
         let keep_count = self.config.keep_builds;
-        if builds.len() > keep_count {
-            let to_remove = builds.len() - keep_count;
-            for (path, _) in builds.iter().take(to_remove) {
+        if non_active.len() > keep_count {
+            let remove_upto = non_active.len() - keep_count;
+            for &path in &non_active[..remove_upto] {
                 info!("Removing old build: {}", path.display());
                 if let Err(e) = tokio::fs::remove_dir_all(path).await {
                     warn!("Failed to remove old build {}: {}", path.display(), e);
@@ -1316,5 +1342,123 @@ fi
 
         buf.clear();
         assert!(!read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_active_build() {
+        // Cleanup must never delete the build the live binary symlink resolves
+        // to, even when keep_builds is 0 (which would otherwise remove every
+        // build, including the one currently serving).
+        let temp_dir =
+            std::env::temp_dir().join(format!("llama-proxy-cleanup-test-{}", ulid::Ulid::new()));
+        let llama = temp_dir.join("llama.cpp");
+
+        // Three managed build dirs, each with a bin/llama-server file.
+        for name in ["build-aaaaaaaaa", "build-bbbbbbbbb", "build-ccccccccc"] {
+            let bin = llama.join(name).join("bin");
+            tokio::fs::create_dir_all(&bin).await.unwrap();
+            tokio::fs::write(bin.join("llama-server"), b"#!/bin/true\n")
+                .await
+                .unwrap();
+        }
+
+        // The live binary symlink (build/bin/llama-server) points at the middle
+        // build, so the active build is neither the newest nor the oldest.
+        let link_dir = llama.join("build").join("bin");
+        tokio::fs::create_dir_all(&link_dir).await.unwrap();
+        let link = link_dir.join("llama-server");
+        let active = llama.join("build-bbbbbbbbb");
+        std::os::unix::fs::symlink(active.join("bin").join("llama-server"), &link).unwrap();
+
+        let config = crate::config::LlamaCppConfig {
+            repo_url: String::new(),
+            repo_path: llama.to_string_lossy().to_string(),
+            build_path: llama.join("build").to_string_lossy().to_string(),
+            binary_path: link.to_string_lossy().to_string(),
+            branch: String::new(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: true,
+            keep_builds: 0,
+        };
+        let bm = BuildManager::new(config);
+        bm.cleanup_old_builds().await.unwrap();
+
+        // The active build survives; the other two are removed.
+        assert!(
+            active.exists(),
+            "active build dir must not be deleted by cleanup"
+        );
+        assert!(!llama.join("build-aaaaaaaaa").exists());
+        assert!(!llama.join("build-ccccccccc").exists());
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_configured_non_active_builds() {
+        // Protecting the active build must not reduce how many previous builds
+        // are kept: with keep_builds=2 and the active build being the oldest,
+        // the two most recent non-active builds are retained alongside it, and
+        // only the older non-active build is removed.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "llama-proxy-cleanup-keep-test-{}",
+            ulid::Ulid::new()
+        ));
+        let llama = temp_dir.join("llama.cpp");
+
+        // Four build dirs created with ascending modification times so the sort
+        // order is deterministic; the first created (active) is the oldest.
+        let names = [
+            "build-100000000",
+            "build-200000000",
+            "build-300000000",
+            "build-400000000",
+        ];
+        for name in names {
+            let bin = llama.join(name).join("bin");
+            tokio::fs::create_dir_all(&bin).await.unwrap();
+            tokio::fs::write(bin.join("llama-server"), b"#!/bin/true\n")
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The active build is the oldest (build-100000000).
+        let link_dir = llama.join("build").join("bin");
+        tokio::fs::create_dir_all(&link_dir).await.unwrap();
+        let link = link_dir.join("llama-server");
+        let active = llama.join("build-100000000");
+        std::os::unix::fs::symlink(active.join("bin").join("llama-server"), &link).unwrap();
+
+        let config = crate::config::LlamaCppConfig {
+            repo_url: String::new(),
+            repo_path: llama.to_string_lossy().to_string(),
+            build_path: llama.join("build").to_string_lossy().to_string(),
+            binary_path: link.to_string_lossy().to_string(),
+            branch: String::new(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: true,
+            keep_builds: 2,
+        };
+        BuildManager::new(config)
+            .cleanup_old_builds()
+            .await
+            .unwrap();
+
+        // Active kept, plus the two most recent non-active builds; the oldest
+        // non-active build is removed.
+        assert!(active.exists(), "active build must be kept");
+        assert!(llama.join("build-300000000").exists());
+        assert!(llama.join("build-400000000").exists());
+        assert!(
+            !llama.join("build-200000000").exists(),
+            "the oldest non-active build should be removed"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
 }
