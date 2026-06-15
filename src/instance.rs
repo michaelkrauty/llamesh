@@ -213,6 +213,33 @@ pub fn compute_args_hash(args: &[String]) -> String {
     )
 }
 
+/// Per-probe timeout for a single readiness health check (see [`probe_ready`]).
+/// Short enough that the readiness loop keeps its polling cadence and respects
+/// the overall startup timeout even when a probe stalls, yet generous enough to
+/// tolerate a busy server that is briefly slow to answer `/health`.
+const HEALTH_CHECK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Issue a single readiness probe against `health_addr`, bounded by `timeout`.
+///
+/// Returns `true` only on a 2xx response — the server is up and the model is
+/// loaded and ready to serve. A 503 (model still loading), any other status, a
+/// connection error, or a timeout all return `false`, signalling the caller to
+/// keep polling. The timeout is essential: without it a server that accepts the
+/// connection but never sends a response would block the readiness loop
+/// indefinitely, past the overall startup deadline.
+async fn probe_ready(
+    client: &reqwest::Client,
+    health_addr: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> bool {
+    let mut req = client.get(health_addr).timeout(timeout);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {key}"));
+    }
+    matches!(req.send().await, Ok(resp) if resp.status().is_success())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstanceStatus {
     Starting,
@@ -480,26 +507,22 @@ impl Instance {
                 ));
             }
 
-            // Only use /health endpoint to determine readiness.
-            // The /health endpoint returns 503 while the model is loading and 200 when ready.
-            // Note: /v1/models can return 200 even while model is still loading, so it's not
-            // a reliable indicator of readiness for serving requests.
-            let mut health_req = client.get(&health_addr);
-            if let Some(ref key) = api_key {
-                health_req = health_req.header("Authorization", format!("Bearer {key}"));
-            }
-
-            match health_req.send().await {
-                Ok(resp) => {
-                    if resp.status().is_success() {
-                        self.mark_ready();
-                        return Ok(());
-                    }
-                    // 503 means model is still loading, keep polling
-                }
-                Err(_) => {
-                    // Connection refused or timeout - server might not be up yet, keep polling
-                }
+            // Only use /health to determine readiness: it returns 503 while the
+            // model is still loading and 200 once it can serve. (/v1/models can
+            // return 200 before the model is loaded, so it is not reliable.)
+            // Each probe is bounded by HEALTH_CHECK_REQUEST_TIMEOUT so a server
+            // that accepts the connection but never answers cannot block this
+            // loop past the overall startup timeout.
+            if probe_ready(
+                client,
+                &health_addr,
+                api_key.as_deref(),
+                HEALTH_CHECK_REQUEST_TIMEOUT,
+            )
+            .await
+            {
+                self.mark_ready();
+                return Ok(());
             }
 
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -917,5 +940,86 @@ mod tests {
         assert!(params.n_layer.is_none());
         assert!(params.arch.is_none());
         assert!(params.model_name.is_none());
+    }
+
+    // The per-probe timeout must be positive and stay well under the minimum
+    // overall startup budget, so one probe can never consume the whole budget.
+    const _: () = {
+        assert!(
+            HEALTH_CHECK_REQUEST_TIMEOUT.as_secs() >= 1,
+            "health check request timeout must be at least 1 second"
+        );
+        assert!(
+            HEALTH_CHECK_REQUEST_TIMEOUT.as_secs() <= 30,
+            "health check request timeout must stay well under the startup budget"
+        );
+    };
+
+    /// Spawn a one-shot TCP server that accepts a single connection, reads the
+    /// request, and replies with the given HTTP status line. Returns the
+    /// `http://host:port/health` URL to probe.
+    async fn spawn_oneshot_http(status_line: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!("HTTP/1.1 {status_line}\r\nContent-Length: 0\r\n\r\n");
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}/health")
+    }
+
+    #[tokio::test]
+    async fn probe_ready_true_on_2xx() {
+        let url = spawn_oneshot_http("200 OK").await;
+        let client = reqwest::Client::builder().build().unwrap();
+        assert!(probe_ready(&client, &url, None, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn probe_ready_false_on_503() {
+        let url = spawn_oneshot_http("503 Service Unavailable").await;
+        let client = reqwest::Client::builder().build().unwrap();
+        assert!(!probe_ready(&client, &url, None, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn probe_ready_false_when_unreachable() {
+        // Bind then immediately drop to obtain a port nothing is listening on.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::builder().build().unwrap();
+        let url = format!("http://{addr}/health");
+        assert!(!probe_ready(&client, &url, None, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn probe_ready_times_out_on_stalled_server() {
+        // A server that accepts connections but never sends a response. Without
+        // the per-probe timeout this would block forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock); // hold the connection open, never respond
+            }
+        });
+        let client = reqwest::Client::builder().build().unwrap();
+        let url = format!("http://{addr}/health");
+        let start = Instant::now();
+        let ready = probe_ready(&client, &url, None, Duration::from_millis(300)).await;
+        let elapsed = start.elapsed();
+        assert!(!ready, "a stalled server must not be reported ready");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "probe must time out promptly rather than hang, took {elapsed:?}"
+        );
     }
 }
