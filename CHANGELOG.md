@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.4] - 2026-06-14
+
+### Fixed
+
+- `503` responses returned while a node is draining for shutdown now carry a
+  `Retry-After` header, like the other retryable `503`s (queue full/timeout, no
+  capacity, spawn failures). Previously a draining node rejected new requests
+  with a bare `503`, giving OpenAI-compatible clients no backoff hint during a
+  rolling restart. Draining is transient — the node is restarting and should
+  accept requests again shortly — so it now returns `Retry-After: 5`, matching
+  the transient-condition tier. The four draining rejection sites are unified
+  behind a single `AppError::node_draining()` constructor, so they share one
+  message, type, and retry hint instead of drifting (two had previously diverged
+  to "Node is shutting down" versus "Node is draining"). The error-model section
+  of the spec now documents the per-condition `Retry-After` values.
+
 ## [1.16.3] - 2026-06-14
 
 ### Fixed

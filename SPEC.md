@@ -757,7 +757,7 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
     * `draining`: Node is shutting down and not accepting new requests.
     * `peer_unavailable_retry`: Peer is temporarily unavailable, client should retry.
 
-For `503` responses, the proxy may include a `Retry-After` header (e.g., `Retry-After: 30` for `spawn_failures_exhausted`).
+For the `503` responses it generates, the proxy includes a `Retry-After` header hinting how long to wait before retrying: `5` seconds for transient conditions (`queue_full`, `queue_timeout`, `draining`) and `30` seconds for capacity-bound conditions (`no_capacity`, `spawn_failures_exhausted`).
 
 ### Health and Readiness
 

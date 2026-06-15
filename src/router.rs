@@ -659,10 +659,7 @@ pub async fn route_request(
     let endpoint_kind = EndpointKind::from_path(&path_only);
 
     if state.draining.load(Ordering::Relaxed) {
-        return Err(AppError::service_unavailable(
-            "Node is draining",
-            "draining",
-        ));
+        return Err(AppError::node_draining());
     }
 
     // Auth Check
@@ -780,10 +777,7 @@ pub async fn route_request(
                     // change before giving up.
                     if state.draining.load(Ordering::Relaxed) {
                         state.metrics.inc_errors();
-                        return Err(AppError::service_unavailable(
-                            "Node is shutting down",
-                            "draining",
-                        ));
+                        return Err(AppError::node_draining());
                     }
                     // We can only distinguish "no one will ever serve this"
                     // from "no one can serve it right now" by checking
@@ -1029,10 +1023,7 @@ pub async fn route_request(
             if state.draining.load(Ordering::Relaxed) {
                 state.metrics.inc_errors();
                 hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                return Err(AppError::service_unavailable(
-                    "Node is shutting down",
-                    "draining",
-                ));
+                return Err(AppError::node_draining());
             }
 
             // Model exists locally but no node can serve right now
@@ -1624,10 +1615,7 @@ pub async fn route_request(
                 if state.draining.load(Ordering::Relaxed) {
                     state.metrics.inc_errors();
                     hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                    return Err(AppError::service_unavailable(
-                        "Node is shutting down",
-                        "draining",
-                    ));
+                    return Err(AppError::node_draining());
                 }
 
                 // Re-select. Could be the same peer (its circuit may have

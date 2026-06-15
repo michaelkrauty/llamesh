@@ -1,5 +1,5 @@
 use axum::{
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
+    http::{header::RETRY_AFTER, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -108,6 +108,17 @@ impl AppError {
             "client_disconnected",
         )
     }
+
+    /// 503 returned while this node is draining for shutdown and no longer
+    /// accepting new work. The condition is transient — the node is restarting
+    /// and should accept requests again shortly — so the response carries a
+    /// short `Retry-After` hint, matching the other retryable 503s the router
+    /// returns (queue full/timeout). Centralizing it here keeps every draining
+    /// rejection identical in message, type, and retry hint.
+    pub fn node_draining() -> Self {
+        Self::service_unavailable("Node is draining for shutdown", "draining")
+            .with_header(RETRY_AFTER, HeaderValue::from_static("5"))
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +192,18 @@ mod tests {
         let err = AppError::internal_server_error("oops");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.error.type_, "internal_error");
+    }
+
+    #[test]
+    fn test_node_draining_sets_retry_after() {
+        let err = AppError::node_draining();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.error.type_, "draining");
+        // Draining is retryable, so the response must hint when to retry.
+        let headers = err
+            .headers
+            .expect("draining 503 must carry a Retry-After header");
+        assert_eq!(headers.get(RETRY_AFTER).unwrap(), "5");
     }
 
     #[test]
