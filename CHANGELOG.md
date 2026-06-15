@@ -17,9 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   llama.cpp version was only available via the `proxy_build_info` Prometheus
   metric and `/cluster/nodes`; surfacing it on `/version` makes the obvious
   endpoint answer the obvious question, which matters because the llama.cpp
-  version changes as the node auto-updates. `llama_cpp_version` is `"unknown"`
-  until the startup build records the running commit. The existing `version`
-  field is unchanged.
+  version changes as the node auto-updates. Because that commit is an
+  operational build detail otherwise exposed only by those authenticated
+  endpoints, `llama_cpp_version` is included only when the caller is authorized
+  (API key auth disabled, or an accepted key presented) and is omitted for
+  unauthenticated callers; the always-public `version` field is unchanged.
+  When present, `llama_cpp_version` is `"unknown"` until the startup build
+  records the running commit.
 
 ## [1.15.6] - 2026-06-14
 
