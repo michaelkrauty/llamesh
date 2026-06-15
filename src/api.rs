@@ -52,10 +52,39 @@ async fn metrics_handler(
     .await)
 }
 
-async fn version_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION")
-    }))
+/// Build the `/version` response body. The proxy `version` is always present;
+/// `llama_cpp_version` (the commit the node is running) is included only when
+/// the caller is authorized — it is omitted otherwise. When present it is
+/// `"unknown"` until the startup build records the running commit (the same
+/// value reported by the `proxy_build_info` metric and `/cluster/nodes`).
+fn version_payload(proxy_version: &str, llama_cpp_version: Option<&str>) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "version": proxy_version });
+    if let Some(version) = llama_cpp_version {
+        payload["llama_cpp_version"] = serde_json::Value::String(version.to_string());
+    }
+    payload
+}
+
+async fn version_handler(
+    State(state): State<Arc<NodeState>>,
+    headers: HeaderMap,
+) -> Json<serde_json::Value> {
+    // The proxy version is always public — this endpoint is unauthenticated,
+    // like /healthz and /readyz. The llama.cpp commit is an operational build
+    // detail otherwise exposed only by the authenticated /metrics and
+    // /cluster/nodes endpoints, so include it only when the caller is
+    // authorized, rather than widening what auth was configured to hide. With
+    // auth disabled, check_api_key_auth returns Ok and the field is included.
+    let authorized = security::check_api_key_auth(state.config.auth.as_ref(), &headers).is_ok();
+    let llama_cpp_version = if authorized {
+        Some(state.build_manager.get_version().await)
+    } else {
+        None
+    };
+    Json(version_payload(
+        env!("CARGO_PKG_VERSION"),
+        llama_cpp_version.as_deref(),
+    ))
 }
 
 fn check_auth(
@@ -1046,4 +1075,33 @@ fn spawn_signal_listener(state: Arc<NodeState>) {
         }
         .instrument(span),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_payload_includes_llama_cpp_version_when_authorized() {
+        let payload = version_payload("1.2.3", Some("abc1234"));
+        assert_eq!(payload["version"], "1.2.3");
+        assert_eq!(payload["llama_cpp_version"], "abc1234");
+    }
+
+    #[test]
+    fn version_payload_omits_llama_cpp_version_when_unauthorized() {
+        // An unauthorized caller still gets the always-public proxy version,
+        // but the llama.cpp build detail is left out entirely.
+        let payload = version_payload("1.2.3", None);
+        assert_eq!(payload["version"], "1.2.3");
+        assert!(payload.get("llama_cpp_version").is_none());
+    }
+
+    #[test]
+    fn version_payload_passes_through_unknown_llama_cpp_version() {
+        // Before the startup build records the running commit, get_version()
+        // returns "unknown"; the endpoint surfaces that verbatim.
+        let payload = version_payload("1.2.3", Some("unknown"));
+        assert_eq!(payload["llama_cpp_version"], "unknown");
+    }
 }

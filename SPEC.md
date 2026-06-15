@@ -672,7 +672,7 @@ Behavior:
 | `/healthz` | GET | Liveness probe |
 | `/health` | GET | Liveness probe (llama-server compatibility alias) |
 | `/readyz` | GET | Readiness probe |
-| `/version` | GET | Proxy version |
+| `/version` | GET | Proxy version (and llama.cpp version when authorized) |
 | `/metrics` | GET | Prometheus metrics |
 | `/metrics/json` | GET | JSON metrics |
 | `/cluster/nodes` | GET | Cluster node view |
@@ -1290,7 +1290,8 @@ cluster:
 
 * `/version`:
 
-  * Returns the current version of the proxy in a JSON object: `{ "version": "0.1.0" }`.
+  * Returns the proxy version, always: `{ "version": "1.16.0" }`. This endpoint is unauthenticated (like `/healthz` and `/readyz`).
+  * When the caller is authorized — i.e. API key auth is disabled, or an accepted key is presented — the response also includes the llama.cpp commit the node is currently running: `{ "version": "1.16.0", "llama_cpp_version": "dd4623a74" }`. The commit is an operational build detail otherwise exposed only by the authenticated `/metrics` and `/cluster/nodes` endpoints, so it is omitted for unauthenticated callers rather than widening what auth was configured to hide. `llama_cpp_version` is `"unknown"` until the startup build records the running commit.
 
 ### Graceful Shutdown
 
