@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.2] - 2026-06-14
+
+### Fixed
+
+- Per-model latency is no longer double-counted for locally-served requests.
+  The local serving path added each request's duration to `total_latency_ms`
+  twice — once directly and once inside `observe_latency` — so the counter grew
+  at twice the true rate. This halved the derived `estimated_tokens_per_second`
+  reported in `/v1/models` metadata and `/cluster/nodes` model stats, and
+  inflated the `proxy_hash_total_latency_ms` Prometheus counter. Because the
+  same throughput estimate feeds the cluster scheduler's performance bonus
+  (`min(tps, 200) * 5`), the understated value also subtly skewed node
+  selection, weighting throughput about half as much as intended and turning
+  the 200 tok/s bonus clamp into an effective 400 tok/s clamp. Latency now
+  accumulates exactly once on every path. Forwarded (proxied-to-peer) requests
+  continue to accumulate `total_latency_ms` without feeding the local p95
+  sample window, since their wall-clock time includes the peer round-trip and
+  the peer's own queueing and generation. The bug had been present since the
+  first release.
+
 ## [1.16.1] - 2026-06-14
 
 ### Fixed
