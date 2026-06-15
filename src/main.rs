@@ -38,6 +38,19 @@ const INITIAL_BUILD_RETRY_DELAYS: &[Duration] = &[
     Duration::from_secs(600),
 ];
 
+/// Backoff schedule for a scheduled (periodic) llama.cpp update check. Unlike
+/// the initial build, this runs while the node is already serving with the
+/// network normally up, so a failure is usually a brief `git fetch` blip;
+/// retrying within the cycle smooths it over instead of skipping a whole
+/// `auto_update_interval_seconds` (commonly a day). Kept short and bounded so a
+/// persistently failing upstream build is reattempted only a few times before
+/// the next scheduled tick.
+const SCHEDULED_UPDATE_RETRY_DELAYS: &[Duration] = &[
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -380,25 +393,65 @@ async fn main() -> anyhow::Result<()> {
         let bm = node_state.build_manager.clone();
         let lock = node_state.rebuild_lock.clone();
         let interval_secs = config.llama_cpp.auto_update_interval_seconds;
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-            // The first tick completes immediately, so we skip it to avoid double-build on startup
-            interval.tick().await;
-
-            loop {
+        tokio::spawn(
+            async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+                // The first tick completes immediately, so we skip it to avoid double-build on startup
                 interval.tick().await;
-                info!("Running scheduled llama.cpp update check");
 
-                // Try to acquire lock
-                if let Ok(_permit) = lock.try_lock() {
-                    if let Err(e) = bm.update_and_build().await {
-                        tracing::error!(event = "llama_build_failure", error = %e, "Scheduled update failed");
+                loop {
+                    interval.tick().await;
+                    info!("Running scheduled llama.cpp update check");
+
+                    // Defer to a build already running (manual rebuild, or a
+                    // still-running initial build): skip this cycle rather than
+                    // queueing behind it. The probe permit is released immediately;
+                    // the retry loop below re-acquires the lock per attempt.
+                    if lock.try_lock().is_err() {
+                        tracing::warn!(
+                            "Skipping scheduled update because a rebuild is already in progress"
+                        );
+                        continue;
                     }
-                } else {
-                    tracing::warn!("Skipping scheduled update because a rebuild is already in progress");
+
+                    // Retry transient failures (e.g. a momentary DNS/network blip
+                    // on `git fetch`) within this cycle instead of skipping a whole
+                    // auto_update_interval_seconds — commonly a day. The lock is
+                    // re-acquired per attempt and never held across a backoff
+                    // sleep, so the manual rebuild endpoint stays responsive
+                    // between attempts. Only an exhausted retry budget escalates to
+                    // an ERROR-level build-failure event; a transient blip that
+                    // recovers is logged at WARN by the retry helper and clears.
+                    let outcome = util::retry_with_backoff(
+                        "scheduled llama.cpp update",
+                        SCHEDULED_UPDATE_RETRY_DELAYS,
+                        || true,
+                        || {
+                            let bm = bm.clone();
+                            let lock = lock.clone();
+                            async move {
+                                let _permit = lock.lock().await;
+                                bm.update_and_build().await
+                            }
+                        },
+                    )
+                    .await;
+
+                    match outcome {
+                        util::RetryOutcome::Success(()) | util::RetryOutcome::Aborted(_) => {}
+                        util::RetryOutcome::Exhausted(e) => {
+                            tracing::error!(
+                                event = "llama_build_failure",
+                                error = %e,
+                                "Scheduled update failed after retries"
+                            );
+                        }
+                    }
                 }
             }
-        }.instrument(span.clone()));
+            .instrument(span.clone()),
+        );
     }
 
     // Binary swap watcher — drains running instances when build manager swaps the binary
@@ -440,4 +493,48 @@ async fn main() -> anyhow::Result<()> {
     shutdown_state.shutdown_all_instances().await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // A scheduled-update cycle must retry transient failures. An empty delay
+    // schedule would silently make a single `git fetch` blip skip a whole
+    // auto_update_interval_seconds (commonly a day) and log it at ERROR as a
+    // build failure — the regression this schedule guards against.
+    #[test]
+    fn scheduled_update_retry_delays_allow_retries() {
+        assert!(!SCHEDULED_UPDATE_RETRY_DELAYS.is_empty());
+    }
+
+    // A transient failure recovers within the scheduled retry budget without
+    // reaching the exhausted (ERROR-logged) outcome — the behavior this
+    // schedule exists to provide. Paused time auto-advances the backoff sleeps.
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_update_recovers_from_transient_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_op = calls.clone();
+        let outcome = util::retry_with_backoff(
+            "scheduled llama.cpp update",
+            SCHEDULED_UPDATE_RETRY_DELAYS,
+            || true,
+            || {
+                let calls = calls_op.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        Err(anyhow::anyhow!("transient git fetch failure"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(matches!(outcome, util::RetryOutcome::Success(())));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }

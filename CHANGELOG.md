@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.5] - 2026-06-14
+
+### Fixed
+
+- Scheduled (periodic) llama.cpp update checks now retry transient failures
+  with backoff instead of giving up after a single attempt. A momentary
+  `git fetch` network or DNS blip during the check previously skipped the whole
+  cycle — waiting a full `auto_update_interval_seconds` (commonly a day) before
+  trying again — and logged it at ERROR as a `llama_build_failure` event. The
+  check now retries within the cycle, re-acquiring the rebuild lock per attempt
+  (never held across a backoff sleep, so the manual rebuild endpoint stays
+  responsive), and only escalates to an ERROR-level `llama_build_failure` event
+  once the retry budget is exhausted. This brings the scheduled update path in
+  line with the resilience the initial build already had.
+
 ## [1.15.4] - 2026-06-14
 
 ### Changed
