@@ -626,16 +626,19 @@ pub async fn get_model(
 
 /// Resolve the request's `model` field to the identifier to route on.
 ///
-/// Per the API spec, an omitted `model` substitutes the configured
-/// `default_model`; a JSON `null` is treated the same way (no model specified),
-/// so both return `Some(default_model)`. A `model` that is present but is not a
-/// non-empty string returns `None`: silently falling back to the default would
-/// route to a different model than the caller named, masking the mistake, so
-/// the caller turns `None` into a 400 `invalid_request_error`.
+/// Per the API spec, an *omitted* `model` substitutes the configured
+/// `default_model`, so an absent field returns `Some(default_model)`. A `model`
+/// that is present but is not a non-empty string — including JSON `null` —
+/// returns `None`: silently falling back to the default would route to a
+/// different model than the caller named, masking the mistake, so the caller
+/// turns `None` into a 400 `invalid_request_error`. Only an absent field, not a
+/// present `null`, takes the default path.
 fn resolve_requested_model(json_body: &Value, default_model: &str) -> Option<String> {
     match json_body.get("model") {
-        None | Some(Value::Null) => Some(default_model.to_string()),
+        None => Some(default_model.to_string()),
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        // Present but not a usable string (null, number, bool, object, array,
+        // or empty string): a client error, not an implicit default request.
         Some(_) => None,
     }
 }
@@ -2229,13 +2232,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_requested_model_null_uses_default() {
-        // A null model is treated as "not specified", like an omitted field.
+    fn resolve_requested_model_null_is_invalid() {
+        // A present `null` is not the same as an omitted field: it is an
+        // invalid value (None -> 400), not an implicit request for the default.
         let body = json!({"model": null});
-        assert_eq!(
-            resolve_requested_model(&body, "default-m"),
-            Some("default-m".to_string())
-        );
+        assert_eq!(resolve_requested_model(&body, "default-m"), None);
     }
 
     #[test]

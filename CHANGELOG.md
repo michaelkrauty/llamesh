@@ -12,13 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A request whose `model` field is present but is not a non-empty string (for
-  example a number, boolean, object, or empty string) is now rejected with a
-  400 `invalid_request_error` instead of silently falling back to
-  `default_model`. Previously only an *omitted* `model` substituted the default,
-  but a present-but-wrong-type value resolved to `None` through the same path
-  and was served the default model — masking a client mistake by routing to a
-  different model than was named. An omitted or `null` `model` still substitutes
-  `default_model` as documented.
+  example `null`, a number, boolean, object, or empty string) is now rejected
+  with a 400 `invalid_request_error` instead of silently falling back to
+  `default_model`. Previously only an *omitted* `model` was meant to substitute
+  the default, but any present-but-non-string value resolved to `None` through
+  the same path and was served the default model — masking a client mistake by
+  routing to a different model than was named. Only an omitted `model`
+  substitutes `default_model`, as documented.
 
 ## [1.15.5] - 2026-06-14
 
