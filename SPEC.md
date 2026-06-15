@@ -539,7 +539,8 @@ Request (example):
 
 Behavior:
 
-* If `model` is omitted, substitute `default_model` from config.
+* If `model` is omitted, substitute `default_model` from config. Only an absent field takes this default path.
+* If `model` is present but is not a non-empty string (e.g. `null`, a number, boolean, object, or empty string), reject with a 400 `invalid_request_error` (see **Error Model & HTTP Semantics**). A present-but-invalid `model` is treated as a client error rather than an implicit request for the default.
 * If `model` cannot be resolved to `(model_name, profile)` defined in the cookbook -> 404 JSON error (see **Error Model & HTTP Semantics**).
 * Otherwise, route according to routing algorithm (see below), and stream the `llama-server` response converted to the OpenAI SSE format.
 
