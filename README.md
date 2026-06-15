@@ -180,7 +180,7 @@ Use `__` (double underscore) for nested fields: `LLAMESH_CLUSTER__ENABLED=true`.
 | `GET /v1/models/{model}` | Retrieve a single model |
 | `GET /healthz` | Health check (alias: `/health`) |
 | `GET /readyz` | Readiness check |
-| `GET /version` | Proxy version |
+| `GET /version` | Proxy and llama.cpp versions |
 | `GET /metrics` | Prometheus metrics |
 | `GET /metrics/json` | JSON metrics snapshot |
 | `GET /cluster/nodes` | Cluster state |

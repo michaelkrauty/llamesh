@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-06-14
+
+### Added
+
+- The `GET /version` endpoint now reports the llama.cpp commit the node is
+  running alongside the proxy version:
+  `{ "version": "1.16.0", "llama_cpp_version": "dd4623a74" }`. Previously the
+  llama.cpp version was only available via the `proxy_build_info` Prometheus
+  metric and `/cluster/nodes`; surfacing it on `/version` makes the obvious
+  endpoint answer the obvious question, which matters because the llama.cpp
+  version changes as the node auto-updates. `llama_cpp_version` is `"unknown"`
+  until the startup build records the running commit. The existing `version`
+  field is unchanged.
+
 ## [1.15.6] - 2026-06-14
 
 ### Fixed

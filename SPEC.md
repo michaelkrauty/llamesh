@@ -672,7 +672,7 @@ Behavior:
 | `/healthz` | GET | Liveness probe |
 | `/health` | GET | Liveness probe (llama-server compatibility alias) |
 | `/readyz` | GET | Readiness probe |
-| `/version` | GET | Proxy version |
+| `/version` | GET | Proxy and llama.cpp versions |
 | `/metrics` | GET | Prometheus metrics |
 | `/metrics/json` | GET | JSON metrics |
 | `/cluster/nodes` | GET | Cluster node view |
@@ -1290,7 +1290,7 @@ cluster:
 
 * `/version`:
 
-  * Returns the current version of the proxy in a JSON object: `{ "version": "0.1.0" }`.
+  * Returns the proxy version and the llama.cpp commit the node is currently running, in a JSON object: `{ "version": "1.16.0", "llama_cpp_version": "dd4623a74" }`. `llama_cpp_version` is `"unknown"` until the startup build records the running commit (the same value reported by the `proxy_build_info` metric and `/cluster/nodes`).
 
 ### Graceful Shutdown
 

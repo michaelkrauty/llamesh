@@ -52,10 +52,23 @@ async fn metrics_handler(
     .await)
 }
 
-async fn version_handler() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION")
-    }))
+/// Build the `/version` response body: the proxy's own version plus the
+/// llama.cpp commit the node is currently running. `llama_cpp_version` is
+/// `"unknown"` until the startup build records the running commit (the same
+/// value reported by the `proxy_build_info` metric and `/cluster/nodes`).
+fn version_payload(proxy_version: &str, llama_cpp_version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "version": proxy_version,
+        "llama_cpp_version": llama_cpp_version,
+    })
+}
+
+async fn version_handler(State(state): State<Arc<NodeState>>) -> Json<serde_json::Value> {
+    let llama_cpp_version = state.build_manager.get_version().await;
+    Json(version_payload(
+        env!("CARGO_PKG_VERSION"),
+        &llama_cpp_version,
+    ))
 }
 
 fn check_auth(
@@ -1046,4 +1059,25 @@ fn spawn_signal_listener(state: Arc<NodeState>) {
         }
         .instrument(span),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_payload_includes_proxy_and_llama_cpp_versions() {
+        let payload = version_payload("1.2.3", "abc1234");
+        assert_eq!(payload["version"], "1.2.3");
+        assert_eq!(payload["llama_cpp_version"], "abc1234");
+    }
+
+    #[test]
+    fn version_payload_passes_through_unknown_llama_cpp_version() {
+        // Before the startup build records the running commit, get_version()
+        // returns "unknown"; the endpoint surfaces that verbatim rather than
+        // omitting the field.
+        let payload = version_payload("1.2.3", "unknown");
+        assert_eq!(payload["llama_cpp_version"], "unknown");
+    }
 }
