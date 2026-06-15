@@ -624,6 +624,22 @@ pub async fn get_model(
         })
 }
 
+/// Resolve the request's `model` field to the identifier to route on.
+///
+/// Per the API spec, an omitted `model` substitutes the configured
+/// `default_model`; a JSON `null` is treated the same way (no model specified),
+/// so both return `Some(default_model)`. A `model` that is present but is not a
+/// non-empty string returns `None`: silently falling back to the default would
+/// route to a different model than the caller named, masking the mistake, so
+/// the caller turns `None` into a 400 `invalid_request_error`.
+fn resolve_requested_model(json_body: &Value, default_model: &str) -> Option<String> {
+    match json_body.get("model") {
+        None | Some(Value::Null) => Some(default_model.to_string()),
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(_) => None,
+    }
+}
+
 pub async fn route_request(
     State(state): State<Arc<NodeState>>,
     conn_handle: Option<Extension<ConnectionHandle>>,
@@ -662,10 +678,10 @@ pub async fn route_request(
     let json_body: Value =
         serde_json::from_slice(&bytes).map_err(|_| AppError::invalid_request("Invalid JSON"))?;
 
-    let model_req = json_body.get("model").and_then(|v| v.as_str());
-    let model_to_use = model_req
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| state.config.default_model.clone());
+    let model_to_use = resolve_requested_model(&json_body, &state.config.default_model)
+        .ok_or_else(|| {
+            AppError::invalid_request("'model' must be a non-empty string").with_param("model")
+        })?;
 
     // Only text-generation endpoints have a streaming response shape. Some
     // OpenAI clients include `stream` on all requests; embeddings/rerank must
@@ -2202,6 +2218,60 @@ fn ensure_profile_supports_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_requested_model_absent_uses_default() {
+        let body = json!({"messages": []});
+        assert_eq!(
+            resolve_requested_model(&body, "default-m"),
+            Some("default-m".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_requested_model_null_uses_default() {
+        // A null model is treated as "not specified", like an omitted field.
+        let body = json!({"model": null});
+        assert_eq!(
+            resolve_requested_model(&body, "default-m"),
+            Some("default-m".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_requested_model_string_is_used() {
+        let body = json!({"model": "gpt-oss-20b:fast"});
+        assert_eq!(
+            resolve_requested_model(&body, "default-m"),
+            Some("gpt-oss-20b:fast".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_requested_model_empty_string_is_invalid() {
+        // An empty string is present-but-invalid, not "omitted": None, so the
+        // caller returns a 400 rather than substituting the default.
+        let body = json!({"model": ""});
+        assert_eq!(resolve_requested_model(&body, "default-m"), None);
+    }
+
+    #[test]
+    fn resolve_requested_model_non_string_is_invalid() {
+        // A present-but-wrong-type model must not silently route to the
+        // default — it is a client error (None -> 400 at the call site).
+        for body in [
+            json!({"model": 123}),
+            json!({"model": true}),
+            json!({"model": {"name": "x"}}),
+            json!({"model": ["x"]}),
+        ] {
+            assert_eq!(
+                resolve_requested_model(&body, "default-m"),
+                None,
+                "expected None for body {body:?}"
+            );
+        }
+    }
 
     fn profile_with_args(args: &[&str]) -> Profile {
         Profile {
