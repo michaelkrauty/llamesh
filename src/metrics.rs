@@ -64,6 +64,12 @@ impl Default for HashMetrics {
 }
 
 impl HashMetrics {
+    /// Record one locally-served request's latency. This is the single
+    /// accumulation point for `total_latency_ms`, so callers must not also add
+    /// to that counter themselves — doing both double-counts the latency and
+    /// halves the derived `tokens_per_second`. The latency is also pushed into
+    /// the bounded p95 sample window, which only locally-served requests feed
+    /// (see `observe_forwarded_latency`).
     pub fn observe_latency(&self, ms: u64) {
         self.total_latency_ms.fetch_add(ms, Ordering::Relaxed);
         let mut samples = self.latency_samples.lock();
@@ -71,6 +77,15 @@ impl HashMetrics {
             samples.pop_front();
         }
         samples.push_back(ms);
+    }
+
+    /// Record a forwarded (proxied-to-peer) request's latency. It accumulates
+    /// `total_latency_ms` exactly like `observe_latency`, but deliberately does
+    /// not feed the p95 sample window: a forwarded request's wall-clock time
+    /// includes the peer round-trip and the peer's own queueing and
+    /// generation, so it would pollute this node's local-generation p95.
+    pub fn observe_forwarded_latency(&self, ms: u64) {
+        self.total_latency_ms.fetch_add(ms, Ordering::Relaxed);
     }
 
     pub fn observe_memory(&self, vram_mb: u64, sysmem_mb: u64) {
@@ -1444,6 +1459,36 @@ mod tests {
 
         let tps = hm.tokens_per_second();
         assert!((tps - 500.0).abs() < 0.01); // 1000 tokens / 2 seconds = 500 TPS
+    }
+
+    #[test]
+    fn test_observe_latency_accumulates_total_once() {
+        // `observe_latency` is the single accumulation point for
+        // `total_latency_ms`. A caller that also added the same value would
+        // double-count it and halve the derived tokens/sec, so the method must
+        // add each observation exactly once.
+        let hm = HashMetrics::default();
+        hm.observe_latency(1000);
+        hm.observe_latency(1000);
+        assert_eq!(hm.total_latency_ms.load(Ordering::Relaxed), 2000);
+        assert_eq!(hm.latency_samples.lock().len(), 2);
+
+        // 1000 generated tokens over the 2 s of accumulated latency is 500 TPS;
+        // a double-counted total would report 250.
+        hm.tokens_generated_total.fetch_add(1000, Ordering::Relaxed);
+        assert!((hm.tokens_per_second() - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_observe_forwarded_latency_accumulates_total_without_sample() {
+        // Forwarded requests still accumulate `total_latency_ms`, but must not
+        // feed the p95 sample window (their wall-clock time includes the peer
+        // round-trip and the peer's own queueing and generation).
+        let hm = HashMetrics::default();
+        hm.observe_forwarded_latency(1500);
+        hm.observe_forwarded_latency(500);
+        assert_eq!(hm.total_latency_ms.load(Ordering::Relaxed), 2000);
+        assert!(hm.latency_samples.lock().is_empty());
     }
 
     #[tokio::test]

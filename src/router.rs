@@ -1202,9 +1202,10 @@ pub async fn route_request(
                                         state.notify_queue(&model_name, &profile_id).await;
                                     }
                                     let duration = start_time.elapsed().as_millis() as u64;
-                                    hash_metrics
-                                        .total_latency_ms
-                                        .fetch_add(duration, Ordering::Relaxed);
+                                    // `observe_latency` already accumulates
+                                    // `total_latency_ms` (and records the p95
+                                    // sample); adding it again here would
+                                    // double-count the latency.
                                     hash_metrics.observe_latency(duration);
                                     hash_metrics.tokens_generated_total.fetch_add(
                                         tokens_for_cleanup.load(Ordering::Relaxed),
@@ -1329,9 +1330,7 @@ pub async fn route_request(
                                             state.metrics.dec_current_requests();
                                             peer_forward_guard.release();
                                             let duration = start_time.elapsed().as_millis() as u64;
-                                            hash_metrics
-                                                .total_latency_ms
-                                                .fetch_add(duration, Ordering::Relaxed);
+                                            hash_metrics.observe_forwarded_latency(duration);
                                             hash_metrics.tokens_generated_total.fetch_add(
                                                 tokens_for_cleanup.load(Ordering::Relaxed),
                                                 Ordering::Relaxed,
@@ -1494,9 +1493,7 @@ pub async fn route_request(
                                 state.metrics.dec_current_requests();
                                 peer_forward_guard.release();
                                 let duration = start_time.elapsed().as_millis() as u64;
-                                hash_metrics
-                                    .total_latency_ms
-                                    .fetch_add(duration, Ordering::Relaxed);
+                                hash_metrics.observe_forwarded_latency(duration);
                                 hash_metrics.tokens_generated_total.fetch_add(
                                     tokens_for_cleanup.load(Ordering::Relaxed),
                                     Ordering::Relaxed,
@@ -1527,9 +1524,7 @@ pub async fn route_request(
                                 state.metrics.dec_current_requests();
                                 peer_forward_guard.release();
                                 let duration = start_time.elapsed().as_millis() as u64;
-                                hash_metrics
-                                    .total_latency_ms
-                                    .fetch_add(duration, Ordering::Relaxed);
+                                hash_metrics.observe_forwarded_latency(duration);
                                 hash_metrics.tokens_generated_total.fetch_add(
                                     tokens_for_cleanup.load(Ordering::Relaxed),
                                     Ordering::Relaxed,
