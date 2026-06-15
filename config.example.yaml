@@ -210,17 +210,20 @@ cluster:
 # -----------------------------------------------------------------------------
 
 http:
-  # Max request body size in bytes (required)
+  # Max request body size in bytes (required; must be > 0 — a 0 limit rejects
+  # every request that carries a body)
   request_body_limit_bytes: 1048576  # 1MB
 
-  # Idle connection timeout in seconds (required)
+  # Idle connection timeout in seconds (required; must be > 0 — a 0 timeout tears
+  # down connections the moment they go idle, defeating keep-alive)
   idle_timeout_seconds: 120
 
-  # Timeout in ms for reading a request body (default: 30000)
+  # Timeout in ms for reading a request body (default: 30000; must be > 0 — a 0
+  # timeout elapses immediately, so every body read times out)
   body_read_timeout_ms: 30000
 
   # Timeout in ms for protocol detection on a new connection, before any bytes
-  # arrive (TLS vs HTTP vs cluster traffic). (default: 10000)
+  # arrive (TLS vs HTTP vs cluster traffic). (default: 10000; must be > 0)
   protocol_detect_timeout_ms: 10000
 
 # -----------------------------------------------------------------------------
