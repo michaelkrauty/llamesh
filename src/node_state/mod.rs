@@ -3179,7 +3179,12 @@ impl NodeState {
         let build_status = self.build_manager.build_status();
         let snapshot = self
             .metrics
-            .snapshot(self.config.node_id.clone(), version, Some(build_status))
+            .snapshot(
+                self.config.node_id.clone(),
+                version,
+                Some(build_status),
+                self.started_at_unix,
+            )
             .await;
         let path = std::path::Path::new(&self.config.metrics_path);
         if let Ok(json) = serde_json::to_string_pretty(&snapshot) {

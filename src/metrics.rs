@@ -227,6 +227,14 @@ pub struct MetricsSnapshot {
     #[serde(default)]
     pub version: String,
     pub llama_cpp_version: String,
+    /// Unix timestamp (seconds) when this process started. Mirrors the
+    /// Prometheus `process_start_time_seconds` gauge and the `started_at_unix`
+    /// field of `/cluster/nodes`. Set fresh from the node's start time on every
+    /// snapshot — it reflects the running process, so it is serialized for
+    /// observability but never restored on load. `#[serde(default)]` keeps
+    /// snapshots written by older versions loadable.
+    #[serde(default)]
+    pub started_at_unix: u64,
     pub requests_total: u64,
     pub errors_total: u64,
     pub current_requests: u64,
@@ -559,6 +567,7 @@ impl Metrics {
         node_id: String,
         version: String,
         build_status: Option<crate::build_manager::BuildStatus>,
+        start_time_unix: u64,
     ) -> MetricsSnapshot {
         let mut hashes = HashMap::new();
         let map = self.hash_metrics.read().await;
@@ -607,6 +616,7 @@ impl Metrics {
             node_id,
             version: env!("CARGO_PKG_VERSION").to_string(),
             llama_cpp_version: version,
+            started_at_unix: start_time_unix,
             requests_total: self.requests_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
             current_requests: self.current_requests.load(Ordering::Relaxed),
@@ -654,6 +664,7 @@ pub async fn render_prometheus_with_circuit_breaker(
     metrics: &Metrics,
     circuit_breaker: Option<&CircuitBreaker>,
     llama_cpp_version: &str,
+    start_time_unix: u64,
 ) -> String {
     let mut out = String::new();
 
@@ -676,6 +687,20 @@ pub async fn render_prometheus_with_circuit_breaker(
         env!("CARGO_PKG_VERSION"),
         escape_label_value(llama_cpp_version)
     ));
+
+    // Process start time as a Unix timestamp (seconds). This is the canonical,
+    // un-prefixed Prometheus metric name (`process_start_time_seconds`) that
+    // standard tooling queries by exact name — Grafana uptime panels and
+    // restart-detection alerts compute `time() - process_start_time_seconds`
+    // and treat a change in its value as a restart — so it intentionally does
+    // not carry the `proxy_` prefix used by this proxy's own metrics. It
+    // mirrors the `started_at_unix` field in `/metrics/json` and
+    // `/cluster/nodes`.
+    out.push_str(
+        "# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n",
+    );
+    out.push_str("# TYPE process_start_time_seconds gauge\n");
+    out.push_str(&format!("process_start_time_seconds {start_time_unix}\n"));
 
     // Global metrics with TYPE/HELP headers for Prometheus spec compliance
     out.push_str("# HELP proxy_requests_total Total number of requests received.\n");
@@ -1024,7 +1049,7 @@ mod tests {
         });
 
         let snapshot = metrics
-            .snapshot("node-test".into(), "v1".into(), None)
+            .snapshot("node-test".into(), "v1".into(), None, 1_700_000_000)
             .await;
         let hash_snap = snapshot
             .hashes
@@ -1071,7 +1096,9 @@ mod tests {
         hm.requests_total.fetch_add(1, Ordering::Relaxed);
         hm.observe_latency(50);
 
-        let output = render_prometheus_with_circuit_breaker(&metrics, None, "abc123def").await;
+        let output =
+            render_prometheus_with_circuit_breaker(&metrics, None, "abc123def", 1_700_000_000)
+                .await;
 
         assert!(output.contains("proxy_requests_total 1"));
         assert!(output.contains("proxy_node_external_vram_mb 50"));
@@ -1086,7 +1113,9 @@ mod tests {
     #[tokio::test]
     async fn test_prometheus_build_info() {
         let metrics = Metrics::new();
-        let output = render_prometheus_with_circuit_breaker(&metrics, None, "6ed481eea").await;
+        let output =
+            render_prometheus_with_circuit_breaker(&metrics, None, "6ed481eea", 1_700_000_000)
+                .await;
 
         // build_info is rendered as a constant gauge carrying the proxy version
         // (the crate version at compile time) and the llama.cpp binary version
@@ -1104,12 +1133,39 @@ mod tests {
         // renderer must escape it for Prometheus label-value safety even though
         // commit hashes never contain special characters in practice.
         let metrics = Metrics::new();
-        let output = render_prometheus_with_circuit_breaker(&metrics, None, "weird\"\\\nver").await;
+        let output =
+            render_prometheus_with_circuit_breaker(&metrics, None, "weird\"\\\nver", 1_700_000_000)
+                .await;
 
         assert!(output.contains(&format!(
             "proxy_build_info{{version=\"{}\",llama_cpp_version=\"weird\\\"\\\\\\nver\"}} 1",
             env!("CARGO_PKG_VERSION")
         )));
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_process_start_time() {
+        let metrics = Metrics::new();
+        let output =
+            render_prometheus_with_circuit_breaker(&metrics, None, "abc", 1_700_001_234).await;
+
+        // The canonical, un-prefixed Prometheus metric that standard tooling
+        // queries by exact name to compute uptime and detect restarts.
+        assert!(output.contains("# TYPE process_start_time_seconds gauge"));
+        assert!(output.contains("process_start_time_seconds 1700001234"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_includes_started_at_unix() {
+        let metrics = Metrics::new();
+        let snapshot = metrics
+            .snapshot("n".into(), "v".into(), None, 1_700_009_999)
+            .await;
+        assert_eq!(snapshot.started_at_unix, 1_700_009_999);
+        // Survives a JSON round-trip (the field /metrics/json consumers read).
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: MetricsSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.started_at_unix, 1_700_009_999);
     }
 
     #[test]
@@ -1159,6 +1215,8 @@ mod tests {
         assert_eq!(snapshot.queue_wait_count, 0);
         assert_eq!(snapshot.token_counting_disabled_total, 0);
         assert_eq!(snapshot.skipped_stream_cleanups_total, 0);
+        // started_at_unix, added in 1.17.0, defaults when absent too.
+        assert_eq!(snapshot.started_at_unix, 0);
     }
 
     #[tokio::test]
@@ -1170,7 +1228,9 @@ mod tests {
         metrics.record_queue_drop(QueueDropReason::GlobalLimit);
         metrics.set_queue_length(7);
 
-        let snapshot = metrics.snapshot("n".into(), "v".into(), None).await;
+        let snapshot = metrics
+            .snapshot("n".into(), "v".into(), None, 1_700_000_000)
+            .await;
         assert_eq!(snapshot.queue_drops_full, 1);
         assert_eq!(snapshot.queue_drops_timeout, 2);
         assert_eq!(snapshot.queue_drops_global_limit, 1);
@@ -1196,7 +1256,9 @@ mod tests {
         metrics.observe_queue_wait(120);
         metrics.observe_queue_wait(80);
 
-        let snapshot = metrics.snapshot("n".into(), "v".into(), None).await;
+        let snapshot = metrics
+            .snapshot("n".into(), "v".into(), None, 1_700_000_000)
+            .await;
         assert_eq!(snapshot.queue_pending_tokens, 2);
         assert_eq!(snapshot.queue_wait_total_ms, 200);
         assert_eq!(snapshot.queue_wait_count, 2);
@@ -1256,7 +1318,8 @@ mod tests {
             hm.observe_memory(1000, 2000);
         }
 
-        let out = render_prometheus_with_circuit_breaker(&metrics, None, "test").await;
+        let out =
+            render_prometheus_with_circuit_breaker(&metrics, None, "test", 1_700_000_000).await;
 
         // Two hashes are present, so each per-hash family must have two samples.
         for family in [
@@ -1301,7 +1364,8 @@ mod tests {
         metrics.set_queue_length(3);
         metrics.record_queue_drop(QueueDropReason::Timeout);
 
-        let out = render_prometheus_with_circuit_breaker(&metrics, None, "test").await;
+        let out =
+            render_prometheus_with_circuit_breaker(&metrics, None, "test", 1_700_000_000).await;
         assert!(out.contains("proxy_queue_length 3\n"));
         assert!(out.contains("proxy_queue_drops_total{reason=\"full\"} 0\n"));
         assert!(out.contains("proxy_queue_drops_total{reason=\"timeout\"} 1\n"));
@@ -1312,7 +1376,12 @@ mod tests {
     async fn test_snapshot_includes_proxy_version() {
         let metrics = Metrics::new();
         let snapshot = metrics
-            .snapshot("node-a".to_string(), "llama-cpp-1234".to_string(), None)
+            .snapshot(
+                "node-a".to_string(),
+                "llama-cpp-1234".to_string(),
+                None,
+                1_700_000_000,
+            )
             .await;
 
         // The proxy version is the crate version and is distinct from the
@@ -1356,7 +1425,12 @@ mod tests {
             .set_parsed_params(params, Some("b1234-abcdef".to_string()));
 
         let snapshot = metrics
-            .snapshot("node-a".to_string(), "llama".to_string(), None)
+            .snapshot(
+                "node-a".to_string(),
+                "llama".to_string(),
+                None,
+                1_700_000_000,
+            )
             .await;
         // Through the exact persistence format (serde), as load() would see it.
         let json = serde_json::to_string(&snapshot).unwrap();

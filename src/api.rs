@@ -48,6 +48,7 @@ async fn metrics_handler(
         &state.metrics,
         Some(&state.circuit_breaker),
         &llama_cpp_version,
+        state.started_at_unix,
     )
     .await)
 }
@@ -191,7 +192,12 @@ async fn metrics_json_handler(
     Ok(Json(
         state
             .metrics
-            .snapshot(state.config.node_id.clone(), version, Some(build_status))
+            .snapshot(
+                state.config.node_id.clone(),
+                version,
+                Some(build_status),
+                state.started_at_unix,
+            )
             .await,
     ))
 }
