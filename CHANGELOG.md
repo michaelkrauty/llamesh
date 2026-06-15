@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-06-15
+
+### Added
+
+- Process start time is now exposed for uptime and restart detection. The
+  `/metrics` endpoint emits the canonical, un-prefixed Prometheus gauge
+  `process_start_time_seconds` (the Unix timestamp when the process started),
+  which standard tooling queries by exact name — Grafana uptime panels and
+  alerting rules compute `time() - process_start_time_seconds`, and a change in
+  its value flags a restart. It deliberately keeps the conventional unprefixed
+  name rather than the `proxy_` prefix used by this proxy's own metrics, so
+  existing dashboards work unmodified. The `/metrics/json` snapshot carries the
+  same value as `started_at_unix`, matching the field already reported by
+  `/cluster/nodes`. The new snapshot field is `#[serde(default)]`, so an
+  in-place upgrade from an older `node-metrics.json` keeps loading.
+
 ## [1.16.4] - 2026-06-14
 
 ### Fixed
