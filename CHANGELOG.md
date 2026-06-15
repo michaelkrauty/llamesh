@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.1] - 2026-06-14
+
+### Fixed
+
+- Config validation now rejects zero values for the `http` server limits and
+  timeouts (`request_body_limit_bytes`, `idle_timeout_seconds`,
+  `body_read_timeout_ms`, `protocol_detect_timeout_ms`) at startup, with a clear
+  message for each. Previously a zero deserialized cleanly but broke request
+  handling at runtime: a `request_body_limit_bytes` of 0 rejects every request
+  carrying a body, a zero millisecond timeout elapses immediately (so body reads
+  and protocol detection always time out — tokio treats a zero timeout as
+  already expired, not disabled), and a zero `idle_timeout_seconds` tears down
+  connections the moment they go idle. This matches the existing startup
+  validation for zero gossip and port settings.
+
 ## [1.16.0] - 2026-06-14
 
 ### Added

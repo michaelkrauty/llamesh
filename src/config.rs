@@ -167,6 +167,39 @@ impl NodeConfig {
             }
         }
 
+        // Validate HTTP server limits and timeouts. Each feeds a hyper or tokio
+        // primitive directly, and a zero value deserializes cleanly but breaks
+        // request handling at runtime, so catch it at startup. A zero millisecond
+        // timeout elapses immediately (tokio treats it as already expired), not
+        // "disabled". `request_body_limit_bytes` and `idle_timeout_seconds` are
+        // required and have no default, which makes a stray 0 easy to introduce.
+        if self.http.request_body_limit_bytes == 0 {
+            return Err(anyhow::anyhow!(
+                "http.request_body_limit_bytes is 0; every request carrying a body would be \
+                 rejected as too large. Set a positive byte limit."
+            ));
+        }
+        if self.http.idle_timeout_seconds == 0 {
+            return Err(anyhow::anyhow!(
+                "http.idle_timeout_seconds is 0; idle connections would be torn down the moment \
+                 they go idle, defeating HTTP keep-alive. Set a positive timeout."
+            ));
+        }
+        if self.http.body_read_timeout_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "http.body_read_timeout_ms is 0; a zero timeout elapses immediately, so every \
+                 request body read would time out. Set a positive timeout, or omit it for the \
+                 default."
+            ));
+        }
+        if self.http.protocol_detect_timeout_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "http.protocol_detect_timeout_ms is 0; a zero timeout elapses immediately, so \
+                 every connection's protocol detection would time out. Set a positive timeout, \
+                 or omit it for the default."
+            ));
+        }
+
         Ok(())
     }
 }
@@ -948,8 +981,8 @@ mod tests {
                 version_mismatch_action: "warn".to_string(),
             },
             http: HttpConfig {
-                request_body_limit_bytes: 0,
-                idle_timeout_seconds: 0,
+                request_body_limit_bytes: 1_048_576,
+                idle_timeout_seconds: 120,
                 body_read_timeout_ms: 30_000,
                 protocol_detect_timeout_ms: 10_000,
             },
@@ -1014,8 +1047,8 @@ mod tests {
                 version_mismatch_action: "warn".to_string(),
             },
             http: HttpConfig {
-                request_body_limit_bytes: 0,
-                idle_timeout_seconds: 0,
+                request_body_limit_bytes: 1_048_576,
+                idle_timeout_seconds: 120,
                 body_read_timeout_ms: 30_000,
                 protocol_detect_timeout_ms: 10_000,
             },
@@ -1133,6 +1166,44 @@ mod tests {
         // The gossip loop never runs with cluster disabled, so these unused
         // fields must not be rejected (avoids breaking single-node configs).
         assert!(config_with_cluster(false, 0, 0).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_positive_http_settings() {
+        // The base test config carries valid (non-zero) HTTP settings.
+        assert!(config_with_ports(None).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_request_body_limit() {
+        // A 0 byte limit rejects every request carrying a body.
+        let mut config = config_with_ports(None);
+        config.http.request_body_limit_bytes = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_idle_timeout() {
+        // A 0 idle timeout tears down connections the moment they go idle.
+        let mut config = config_with_ports(None);
+        config.http.idle_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_body_read_timeout() {
+        // A 0 ms timeout elapses immediately, so body reads always time out.
+        let mut config = config_with_ports(None);
+        config.http.body_read_timeout_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_protocol_detect_timeout() {
+        // A 0 ms timeout elapses immediately, so protocol detection always times out.
+        let mut config = config_with_ports(None);
+        config.http.protocol_detect_timeout_ms = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
