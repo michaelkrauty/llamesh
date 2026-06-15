@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.3] - 2026-06-14
+
+### Fixed
+
+- Bound the two outbound HTTP requests that lacked a timeout, so an
+  unresponsive endpoint that accepts a connection but never replies can no
+  longer stall the proxy. The instance readiness health probe now applies a
+  per-request timeout: previously a `llama-server` that accepted the connection
+  but never answered `/health` could block the readiness loop indefinitely, past
+  the overall startup deadline, holding the spawn slot. The plaintext (non-Noise)
+  cluster gossip request now carries the same 10-second timeout the Noise gossip
+  path already used, so a hung peer cannot tie up a gossip task and its
+  concurrency permit. The Noise gossip path and both peer-forwarding paths were
+  already bounded; these were the only unbounded outbound calls.
+
 ## [1.16.2] - 2026-06-14
 
 ### Fixed

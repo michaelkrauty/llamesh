@@ -12,6 +12,12 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
 
+/// Per-request timeout for a single gossip exchange with a peer, applied on
+/// both the Noise and plaintext transports. Bounds each request so an
+/// unresponsive peer that accepts the connection but never replies cannot hold
+/// a gossip task (and its concurrency permit) open indefinitely.
+const GOSSIP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub node_id: String,
@@ -164,7 +170,7 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                     path: "/cluster/gossip",
                                     headers: &headers,
                                     body: &body,
-                                    timeout_duration: Some(std::time::Duration::from_secs(10)),
+                                    timeout_duration: Some(GOSSIP_REQUEST_TIMEOUT),
                                 },
                             )
                             .await
@@ -214,7 +220,13 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                         }
                     }
                 } else {
-                    match client.post(&url).json(&message).send().await {
+                    match client
+                        .post(&url)
+                        .json(&message)
+                        .timeout(GOSSIP_REQUEST_TIMEOUT)
+                        .send()
+                        .await
+                    {
                         Ok(resp) if resp.status().is_success() => {
                             // Record success - resets failure count, and on a
                             // recovery transition wakes parked routing waiters.

@@ -941,6 +941,7 @@ Each instance is a `llama-server` process spawned by the proxy:
 * Health checking:
 
   * Uses the `/health` endpoint on the `llama-server` instance exclusively.
+  * The proxy polls `/health` until it returns `200` (ready) or the overall `startup_timeout_seconds` budget elapses. Each individual probe is bounded by its own short request timeout, so a server that accepts the connection but never responds cannot stall the readiness loop past that budget.
   * If spawn/health check fails:
 
     * Mark instance as failed, emit error logs.
