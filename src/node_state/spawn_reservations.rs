@@ -12,7 +12,9 @@
 //! it before the instance reaches the map. Reservations are created while the
 //! caller holds the `instances` write lock, which makes check-and-reserve
 //! atomic: the second contender observes the first's reservation and queues
-//! instead of spawning.
+//! instead of spawning. Each reservation also carries the spawn's estimated
+//! VRAM/system memory, so the memory guardrails (not just the instance-count
+//! limit) account for in-flight spawns that have not yet started allocating.
 //!
 //! The interior mutex is a synchronous leaf lock, held only for the map
 //! operation itself and never across `await`. Releases happen from `Drop`,
@@ -22,25 +24,50 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Counts of spawns that have passed capacity checks but whose instances are
-/// not yet in the instances map, keyed by `model:profile`.
+/// In-flight spawn bookkeeping: per-`model:profile` counts plus the aggregate
+/// memory those spawns are expected to consume.
+#[derive(Default)]
+struct Reservations {
+    by_profile: HashMap<String, usize>,
+    total_vram_mb: u64,
+    total_sysmem_mb: u64,
+}
+
+/// Spawns that have passed capacity checks but whose instances are not yet in
+/// the instances map, tracked by count (per profile and total) and by the
+/// VRAM/system memory they are expected to consume.
 #[derive(Default)]
 pub struct SpawnReservations {
-    by_profile: Mutex<HashMap<String, usize>>,
+    inner: Mutex<Reservations>,
 }
 
 impl SpawnReservations {
     /// Number of in-flight spawns for a `model:profile` key.
     pub fn profile_count(&self, key: &str) -> usize {
-        self.by_profile.lock().get(key).copied().unwrap_or(0)
+        self.inner.lock().by_profile.get(key).copied().unwrap_or(0)
     }
 
     /// Total in-flight spawns on this node.
     pub fn node_total(&self) -> usize {
-        self.by_profile.lock().values().sum()
+        self.inner.lock().by_profile.values().sum()
+    }
+
+    /// Aggregate `(vram_mb, sysmem_mb)` that in-flight spawns are expected to
+    /// consume. These spawns are not yet in the instances map, and may not
+    /// have begun allocating device memory, so the memory guardrails must add
+    /// this to the measured usage — otherwise several concurrent spawns of
+    /// different profiles each see the same headroom and jointly overshoot
+    /// `max_vram_mb`/`max_sysmem_mb`.
+    pub fn reserved_memory(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        (inner.total_vram_mb, inner.total_sysmem_mb)
     }
 
     /// Records an in-flight spawn and returns its guard.
+    ///
+    /// `vram_mb`/`sysmem_mb` are the spawn's estimated memory use; they are
+    /// added to [`SpawnReservations::reserved_memory`] until the guard is
+    /// released, and subtracted again on release.
     ///
     /// Call only while holding the `instances` write lock, so that the
     /// capacity check and the reservation form one atomic step with respect
@@ -55,26 +82,37 @@ impl SpawnReservations {
     pub fn reserve(
         self: &Arc<Self>,
         key: String,
+        vram_mb: u64,
+        sysmem_mb: u64,
         on_abandon: Option<Box<dyn FnOnce() + Send>>,
     ) -> SpawnReservation {
-        *self.by_profile.lock().entry(key.clone()).or_insert(0) += 1;
+        {
+            let mut inner = self.inner.lock();
+            *inner.by_profile.entry(key.clone()).or_insert(0) += 1;
+            inner.total_vram_mb += vram_mb;
+            inner.total_sysmem_mb += sysmem_mb;
+        }
         SpawnReservation {
             reservations: self.clone(),
             key,
+            vram_mb,
+            sysmem_mb,
             released: false,
             on_abandon,
         }
     }
 
-    fn release_one(&self, key: &str) {
-        let mut by_profile = self.by_profile.lock();
-        match by_profile.get_mut(key) {
+    fn release_one(&self, key: &str, vram_mb: u64, sysmem_mb: u64) {
+        let mut inner = self.inner.lock();
+        match inner.by_profile.get_mut(key) {
             Some(n) if *n > 1 => *n -= 1,
             Some(_) => {
-                by_profile.remove(key);
+                inner.by_profile.remove(key);
             }
             None => debug_assert!(false, "released a reservation that was never taken: {key}"),
         }
+        inner.total_vram_mb = inner.total_vram_mb.saturating_sub(vram_mb);
+        inner.total_sysmem_mb = inner.total_sysmem_mb.saturating_sub(sysmem_mb);
     }
 }
 
@@ -92,6 +130,8 @@ impl SpawnReservations {
 pub struct SpawnReservation {
     reservations: Arc<SpawnReservations>,
     key: String,
+    vram_mb: u64,
+    sysmem_mb: u64,
     released: bool,
     on_abandon: Option<Box<dyn FnOnce() + Send>>,
 }
@@ -109,7 +149,8 @@ impl SpawnReservation {
             return;
         }
         self.released = true;
-        self.reservations.release_one(&self.key);
+        self.reservations
+            .release_one(&self.key, self.vram_mb, self.sysmem_mb);
         if abandoned {
             if let Some(callback) = self.on_abandon.take() {
                 callback();
@@ -133,27 +174,32 @@ mod tests {
         let reservations = Arc::new(SpawnReservations::default());
         assert_eq!(reservations.profile_count("m:p"), 0);
         assert_eq!(reservations.node_total(), 0);
+        assert_eq!(reservations.reserved_memory(), (0, 0));
 
-        let guard = reservations.reserve("m:p".to_string(), None);
+        let guard = reservations.reserve("m:p".to_string(), 4000, 500, None);
         assert_eq!(reservations.profile_count("m:p"), 1);
         assert_eq!(reservations.node_total(), 1);
+        assert_eq!(reservations.reserved_memory(), (4000, 500));
 
         drop(guard);
         assert_eq!(reservations.profile_count("m:p"), 0);
         assert_eq!(reservations.node_total(), 0);
+        assert_eq!(reservations.reserved_memory(), (0, 0));
     }
 
     #[test]
     fn explicit_handoff_makes_drop_a_no_op() {
         let reservations = Arc::new(SpawnReservations::default());
-        let mut guard = reservations.reserve("m:p".to_string(), None);
+        let mut guard = reservations.reserve("m:p".to_string(), 1000, 200, None);
         guard.handoff();
         assert_eq!(reservations.profile_count("m:p"), 0);
+        assert_eq!(reservations.reserved_memory(), (0, 0));
         guard.handoff();
         assert_eq!(reservations.profile_count("m:p"), 0);
         drop(guard);
         assert_eq!(reservations.profile_count("m:p"), 0);
         assert_eq!(reservations.node_total(), 0);
+        assert_eq!(reservations.reserved_memory(), (0, 0));
     }
 
     #[test]
@@ -167,6 +213,8 @@ mod tests {
         let counter = abandoned.clone();
         let guard = reservations.reserve(
             "m:p".to_string(),
+            0,
+            0,
             Some(Box::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             })),
@@ -179,6 +227,8 @@ mod tests {
         let counter = abandoned.clone();
         let mut guard = reservations.reserve(
             "m:p".to_string(),
+            0,
+            0,
             Some(Box::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             })),
@@ -192,9 +242,9 @@ mod tests {
     #[test]
     fn counts_are_per_key_and_stack() {
         let reservations = Arc::new(SpawnReservations::default());
-        let g1 = reservations.reserve("m:a".to_string(), None);
-        let g2 = reservations.reserve("m:a".to_string(), None);
-        let g3 = reservations.reserve("m:b".to_string(), None);
+        let g1 = reservations.reserve("m:a".to_string(), 100, 10, None);
+        let g2 = reservations.reserve("m:a".to_string(), 100, 10, None);
+        let g3 = reservations.reserve("m:b".to_string(), 300, 30, None);
 
         assert_eq!(reservations.profile_count("m:a"), 2);
         assert_eq!(reservations.profile_count("m:b"), 1);
@@ -209,5 +259,22 @@ mod tests {
         assert_eq!(reservations.profile_count("m:a"), 0);
         assert_eq!(reservations.profile_count("m:b"), 0);
         assert_eq!(reservations.node_total(), 0);
+    }
+
+    #[test]
+    fn reserved_memory_aggregates_across_keys_and_releases() {
+        let reservations = Arc::new(SpawnReservations::default());
+        let g1 = reservations.reserve("m:a".to_string(), 6000, 800, None);
+        let g2 = reservations.reserve("m:b".to_string(), 3000, 400, None);
+        assert_eq!(reservations.reserved_memory(), (9000, 1200));
+
+        // Hand-off releases the memory just like a drop, so the in-flight
+        // total reflects only spawns still pending.
+        let mut g1 = g1;
+        g1.handoff();
+        assert_eq!(reservations.reserved_memory(), (3000, 400));
+
+        drop(g2);
+        assert_eq!(reservations.reserved_memory(), (0, 0));
     }
 }

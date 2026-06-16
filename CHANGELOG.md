@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.2] - 2026-06-15
+
+### Fixed
+
+- In-flight spawn reservations now count toward the VRAM/system-memory
+  guardrails, not just the instance-count limit. When a request commits to
+  spawning a `llama-server`, the node records a reservation and releases its
+  lock before the slow spawn, so concurrent requests can run their capacity
+  checks while the instance is not yet in the map. The instance-count check
+  already added these reservations (`spawn_reservations.node_total()`), but the
+  memory check did not: several simultaneous spawns of *different* profiles each
+  saw the same free VRAM and were all admitted, so the node could overshoot
+  `max_vram_mb`/`max_sysmem_mb` and trigger an OOM instead of queueing. Each
+  reservation now carries its estimated memory, and the guardrail folds the
+  in-flight total into the usage it checks against — taking the max with
+  measured device VRAM rather than summing, so a spawn that has already begun
+  allocating (and thus shows in device telemetry) is not double-counted. With no
+  spawns in flight the check is unchanged.
+
 ## [1.18.1] - 2026-06-15
 
 ### Fixed

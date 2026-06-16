@@ -1001,8 +1001,21 @@ impl NodeState {
             .calculate_resource_snapshot_for_instances(instances_map)
             .await;
         self.observe_resource_snapshot(&resource_snapshot);
-        let mut curr_vram = resource_snapshot.effective_vram_mb;
-        let mut curr_sysmem = resource_snapshot.effective_sysmem_mb;
+        // In-flight spawns have reserved capacity but are not yet in the map
+        // (so absent from the managed `llamesh_vram_mb`/`effective_sysmem_mb`)
+        // and may not have begun allocating device VRAM yet (so absent from
+        // `device_vram_used_mb`). Fold their estimated memory in, so several
+        // concurrent spawns of different profiles cannot each observe the same
+        // headroom and jointly overshoot `max_vram_mb`/`max_sysmem_mb`. For
+        // VRAM, take the max against measured device usage rather than summing:
+        // a spawn that HAS begun allocating already shows up in
+        // `device_vram_used_mb`, and summing would double-count it. When no
+        // spawns are in flight this is exactly `effective_vram_mb` /
+        // `effective_sysmem_mb`, so steady-state behavior is unchanged.
+        let (reserved_vram, reserved_sysmem) = self.spawn_reservations.reserved_memory();
+        let mut curr_vram = (resource_snapshot.llamesh_vram_mb + reserved_vram)
+            .max(resource_snapshot.device_vram_used_mb);
+        let mut curr_sysmem = resource_snapshot.effective_sysmem_mb + reserved_sysmem;
 
         for (id, inst_lock) in instances_map.iter() {
             let inst = inst_lock.read().await;
@@ -2117,6 +2130,8 @@ impl NodeState {
             let abandon_state = self.clone();
             let mut spawn_reservation = self.spawn_reservations.reserve(
                 profile_key,
+                required_vram,
+                required_sysmem,
                 Some(Box::new(move || {
                     tokio::spawn(async move {
                         // Drains scheduled because this reservation occupied
@@ -4000,7 +4015,7 @@ mod tests {
         // reached the instances map yet.
         let guard = state
             .spawn_reservations
-            .reserve("test:default".to_string(), None);
+            .reserve("test:default".to_string(), 0, 0, None);
 
         let err = state
             .try_get_or_spawn("test", &profile, false, "test", false)
@@ -4047,9 +4062,10 @@ mod tests {
 
         // A different profile's in-flight spawn occupies the node's only
         // slot. It is not in the map, so it cannot be evicted to make room.
-        let _guard = state
-            .spawn_reservations
-            .reserve("other-model:default".to_string(), None);
+        let _guard =
+            state
+                .spawn_reservations
+                .reserve("other-model:default".to_string(), 0, 0, None);
 
         let err = state
             .try_get_or_spawn("test", &profile, false, "test", false)
@@ -4703,6 +4719,55 @@ mod tests {
         let map = state.instances.read().await;
         let victims = state.pick_victims(&map, 400, 0).await.unwrap();
         assert_eq!(victims, vec!["inst-a"]);
+    }
+
+    #[tokio::test]
+    async fn pick_victims_accounts_for_in_flight_spawn_reservations() {
+        // A spawn for one profile is in flight (reserved VRAM) but not yet in
+        // the instances map. A second spawn for a different profile must not be
+        // admitted when the two together exceed the VRAM budget: the
+        // reservation has to count toward usage even though its instance is not
+        // in the map and (no GPU telemetry here) has not begun allocating
+        // device VRAM.
+        let mut config = minimal_node_config();
+        config.max_vram_mb = 1000;
+        config.max_sysmem_mb = 1_000_000;
+        let cookbook = Cookbook { models: vec![] };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+        // Pin device VRAM to zero so the test is isolated from the host GPU and
+        // the only usage in play is the in-flight reservation.
+        state
+            .memory_sampler
+            .set_device_vram_override(Some(gpu_snapshot(0, 100_000)));
+
+        // Empty map, no reservation: a 600 MB spawn fits the 1000 MB budget, so
+        // no eviction is needed. (Confirms the baseline before the reservation.)
+        {
+            let map = state.instances.read().await;
+            let victims = state.pick_victims(&map, 600, 0).await.unwrap();
+            assert!(
+                victims.is_empty(),
+                "600 MB must fit an empty 1000 MB node without eviction"
+            );
+        }
+
+        // A different profile's spawn reserves 600 MB while in flight.
+        let _reservation =
+            state
+                .spawn_reservations
+                .reserve("other:default".to_string(), 600, 0, None);
+
+        // The same 600 MB request now totals 1200 MB. Nothing in the map can be
+        // evicted, so admission must be refused rather than overshooting VRAM.
+        let map = state.instances.read().await;
+        let err = state.pick_victims(&map, 600, 0).await.unwrap_err();
+        assert!(
+            matches!(err, NodeError::InsufficientResources),
+            "an in-flight spawn's VRAM must count toward the guardrail, got: {err:?}"
+        );
     }
 
     #[tokio::test]
