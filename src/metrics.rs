@@ -326,6 +326,16 @@ pub struct HashMetricsSnapshot {
     pub errors_total: u64,
     pub tokens_generated_total: u64,
     pub avg_latency_ms: f64,
+    /// Total accumulated request latency in milliseconds — the primary counter
+    /// behind both `avg_latency_ms` (which is `total_latency_ms /
+    /// requests_total`) and the Prometheus `proxy_hash_total_latency_ms` series.
+    /// Persisted directly so it survives a restart exactly, like every other
+    /// counter in this snapshot, rather than being reconstructed from the
+    /// rounded `avg_latency_ms`. `#[serde(default)]` keeps snapshots written by
+    /// older versions loadable; for those the field is absent (zero) and
+    /// `from_snapshot` rebuilds it from `avg_latency_ms * requests_total`.
+    #[serde(default)]
+    pub total_latency_ms: u64,
     #[serde(default)]
     pub p95_latency_ms: u64,
     pub peak_vram_mb: u64,
@@ -395,9 +405,18 @@ impl Metrics {
                 requests_total: AtomicU64::new(v.requests_total),
                 errors_total: AtomicU64::new(v.errors_total),
                 tokens_generated_total: AtomicU64::new(v.tokens_generated_total),
-                total_latency_ms: AtomicU64::new(
-                    (v.avg_latency_ms * v.requests_total as f64) as u64,
-                ),
+                total_latency_ms: AtomicU64::new(if v.total_latency_ms > 0 {
+                    v.total_latency_ms
+                } else {
+                    // Snapshots written before `total_latency_ms` was persisted
+                    // directly carry only the rounded `avg_latency_ms`; rebuild
+                    // the counter from it so an older snapshot still restores a
+                    // (near-exact) total instead of resetting it to zero. New
+                    // snapshots always take the branch above and round-trip
+                    // exactly. When the total is genuinely zero, `avg_latency_ms`
+                    // is zero too, so this fallback also yields zero.
+                    (v.avg_latency_ms * v.requests_total as f64) as u64
+                }),
                 latency_samples: Mutex::new(VecDeque::new()), // Samples lost on restart, acceptable
                 peak_vram_mb: AtomicU64::new(v.peak_vram_mb),
                 peak_sysmem_mb: AtomicU64::new(v.peak_sysmem_mb),
@@ -603,6 +622,7 @@ impl Metrics {
                     errors_total: v.errors_total.load(Ordering::Relaxed),
                     tokens_generated_total: v.tokens_generated_total.load(Ordering::Relaxed),
                     avg_latency_ms: avg,
+                    total_latency_ms: latency,
                     p95_latency_ms: p95,
                     peak_vram_mb: v.peak_vram_mb.load(Ordering::Relaxed),
                     peak_sysmem_mb: v.peak_sysmem_mb.load(Ordering::Relaxed),
@@ -1060,6 +1080,7 @@ mod tests {
         assert_eq!(hash_snap.errors_total, 1);
         assert_eq!(hash_snap.tokens_generated_total, 100);
         assert_eq!(hash_snap.avg_latency_ms, 60.0); // 300 / 5
+        assert_eq!(hash_snap.total_latency_ms, 300); // 100 + 200, persisted directly
         assert_eq!(hash_snap.p95_latency_ms, 100); // 95th percentile of [100, 200]: idx=floor((2-1)*0.95)=0
         assert_eq!(hash_snap.peak_vram_mb, 1000);
         assert_eq!(hash_snap.peak_sysmem_mb, 2000);
@@ -1499,6 +1520,9 @@ mod tests {
             serde_json::from_str(legacy).expect("legacy hash snapshot should deserialize");
         assert!(snapshot.parsed_model_params.is_none());
         assert_eq!(snapshot.requests_total, 3);
+        // `total_latency_ms` is also absent in pre-1.18.0 snapshots; it defaults
+        // to zero, which signals `from_snapshot` to reconstruct it from the avg.
+        assert_eq!(snapshot.total_latency_ms, 0);
     }
 
     #[test]
@@ -1523,6 +1547,66 @@ mod tests {
         assert!(snapshot.parsed_model_params.is_none());
         assert_eq!(snapshot.requests_total, 1428315);
         assert_eq!(snapshot.errors_total, 16406);
+    }
+
+    #[tokio::test]
+    async fn total_latency_ms_round_trips_exactly_through_snapshot() {
+        // `total_latency_ms` is persisted directly, not rebuilt from the rounded
+        // `avg_latency_ms`. 61 ms over 7 requests has an average (8.714…ms) that
+        // is not exactly representable, so the previous `(avg * requests) as u64`
+        // reconstruction truncated it to 60 — losing a millisecond off the
+        // `proxy_hash_total_latency_ms` counter on every restart. Persisting the
+        // counter directly round-trips it exactly.
+        let metrics = Metrics::new();
+        let hm = metrics.get_hash_metrics("h").await;
+        hm.requests_total.fetch_add(7, Ordering::Relaxed);
+        hm.total_latency_ms.fetch_add(61, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot("n".into(), "v".into(), None, 0).await;
+        assert_eq!(snapshot.hashes.get("h").unwrap().total_latency_ms, 61);
+
+        let restored = Metrics::from_snapshot(snapshot);
+        let map = restored.hash_metrics.read().await;
+        assert_eq!(
+            map.get("h")
+                .unwrap()
+                .total_latency_ms
+                .load(Ordering::Relaxed),
+            61,
+            "directly-persisted total must round-trip exactly, not truncate to 60"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_missing_total_latency_reconstructs_from_avg() {
+        // A snapshot written before `total_latency_ms` was persisted carries
+        // only `avg_latency_ms`. `from_snapshot` must rebuild the counter from
+        // `avg * requests` (the defaulted zero triggers the fallback) so an
+        // in-place upgrade preserves the prior total instead of resetting it.
+        let metrics = Metrics::new();
+        let hm = metrics.get_hash_metrics("h").await;
+        hm.requests_total.fetch_add(3, Ordering::Relaxed);
+        hm.total_latency_ms.fetch_add(30, Ordering::Relaxed); // avg = 10.0, exact
+
+        let snapshot = metrics.snapshot("n".into(), "v".into(), None, 0).await;
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        let hash_obj = value["hashes"]["h"].as_object_mut().unwrap();
+        hash_obj.remove("total_latency_ms");
+        assert!(hash_obj.contains_key("avg_latency_ms"));
+
+        let legacy: MetricsSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.hashes.get("h").unwrap().total_latency_ms, 0); // defaulted
+
+        let restored = Metrics::from_snapshot(legacy);
+        let map = restored.hash_metrics.read().await;
+        assert_eq!(
+            map.get("h")
+                .unwrap()
+                .total_latency_ms
+                .load(Ordering::Relaxed),
+            30,
+            "legacy snapshot must reconstruct total from avg * requests"
+        );
     }
 
     #[tokio::test]

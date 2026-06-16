@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-06-15
+
+### Fixed
+
+- Per-hash total latency is now persisted directly in the metrics snapshot
+  instead of being reconstructed from the rounded `avg_latency_ms` on restart.
+  It was the only counter in the snapshot stored as a derived value: on load the
+  proxy rebuilt it as `avg_latency_ms * requests_total`, and because that product
+  is not exact in floating point, the `proxy_hash_total_latency_ms` counter could
+  shift by a millisecond across a restart — and with it `tokens_per_second()`,
+  which feeds `estimated_tokens_per_second` on `/v1/models`. The snapshot now
+  stores the raw counter, so it survives a restart exactly; `avg_latency_ms` is
+  retained as a read-only convenience derived from it.
+
+### Added
+
+- The `/metrics/json` per-hash entries now include `total_latency_ms`, the raw
+  latency counter behind `avg_latency_ms` and the Prometheus
+  `proxy_hash_total_latency_ms` series. Snapshots written by older versions that
+  lack the field still load — the value is reconstructed from `avg_latency_ms`
+  for backward compatibility.
+
 ## [1.17.0] - 2026-06-15
 
 ### Added
