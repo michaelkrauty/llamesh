@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.1] - 2026-06-15
+
+### Fixed
+
+- Upstream and peer response-body read failures now return the standard OpenAI
+  error envelope instead of a bare plaintext body. When a local `llama-server`
+  or a cluster peer accepted a non-streaming request and sent `200` headers but
+  then failed to deliver the full body (e.g. the backend process was killed
+  mid-response, or the connection reset before the body finished), the proxy
+  replied with `502` and a raw string (`"Failed to read upstream response"` /
+  `"Failed to read peer response"`) carrying no `Content-Type: application/json`
+  and no `error` object. OpenAI-compatible clients deserialize the body as JSON,
+  so they saw a parse error instead of the real failure. Both paths now return
+  `{"error":{"message","type":"upstream_error","param","code"}}` like every
+  other error, unified behind a single `AppError::upstream_error()` constructor
+  (which the existing local upstream-error path now also uses).
+
 ## [1.18.0] - 2026-06-15
 
 ### Fixed

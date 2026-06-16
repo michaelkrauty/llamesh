@@ -1221,11 +1221,7 @@ pub async fn route_request(
                             // Guard handles dec_current_requests and in_flight cleanup
                             hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
 
-                            Err(AppError::new(
-                                StatusCode::BAD_GATEWAY,
-                                format!("Upstream error: {e}"),
-                                "upstream_error",
-                            ))
+                            Err(AppError::upstream_error(format!("Upstream error: {e}")))
                         }
                     }
                 }
@@ -1697,10 +1693,8 @@ async fn handle_non_streaming_response(
         Ok(b) => b,
         Err(e) => {
             error!("Failed to read upstream response body: {}", e);
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("Failed to read upstream response"))
-                .unwrap_or_else(|_| Response::new(Body::from("Internal error")));
+            return AppError::upstream_error(format!("Failed to read upstream response body: {e}"))
+                .into_response();
         }
     };
 
@@ -1853,10 +1847,8 @@ async fn peer_response_to_client(
                     ),
                     Err(e) => {
                         error!("Failed to read peer response body: {}", e);
-                        Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .body(Body::from("Failed to read peer response"))
-                            .unwrap_or_else(|_| Response::new(Body::from("Internal error")))
+                        AppError::upstream_error(format!("Failed to read peer response body: {e}"))
+                            .into_response()
                     }
                 }
             }
