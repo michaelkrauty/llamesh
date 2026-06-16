@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.2] - 2026-06-15
+
+### Fixed
+
+- Config validation now rejects degenerate per-peer circuit breaker settings at
+  startup (when cluster mode and the breaker are both enabled). A zero
+  `failure_threshold` or `success_threshold` would open or close a peer's
+  circuit without the intended number of failures or recovery probes; a zero
+  `open_duration_base_ms` or `open_duration_max_ms` collapses the open-state
+  backoff to nothing, so a failing peer is re-probed on every request with no
+  spacing; and a base backoff greater than the max is immediately capped, so the
+  exponential backoff never grows. Each deserialized cleanly but degraded peer
+  failure handling at runtime, so they are now caught with a clear message, like
+  the existing gossip, port, and HTTP-limit checks. `half_open_probe_interval_ms`
+  is exempt, since `0` is a documented value that disables probe gating. As
+  defense in depth, the backoff multiplication is now saturating, so a large
+  (but valid) base can no longer overflow and wrap to a near-zero backoff.
+
 ## [1.18.1] - 2026-06-15
 
 ### Fixed
