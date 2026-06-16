@@ -20,11 +20,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   memory check did not: several simultaneous spawns of *different* profiles each
   saw the same free VRAM and were all admitted, so the node could overshoot
   `max_vram_mb`/`max_sysmem_mb` and trigger an OOM instead of queueing. Each
-  reservation now carries its estimated memory, and the guardrail folds the
-  in-flight total into the usage it checks against — taking the max with
-  measured device VRAM rather than summing, so a spawn that has already begun
-  allocating (and thus shows in device telemetry) is not double-counted. With no
-  spawns in flight the check is unchanged.
+  reservation now carries its estimated memory, and the guardrail adds the
+  in-flight total on top of the effective usage it already tracks (which
+  includes non-llamesh "external" device VRAM). A reservation that has begun
+  allocating is briefly counted in both the reservation total and device
+  telemetry; that errs toward queueing rather than oversubscription, which is
+  the safe direction. With no spawns in flight the check is unchanged. The
+  memory-capacity branch of the post-enqueue lost-wake recheck was extended to
+  match, so a request blocked only by a reservation that is then abandoned is
+  woken promptly instead of waiting for its queue timeout.
 
 ## [1.18.1] - 2026-06-15
 

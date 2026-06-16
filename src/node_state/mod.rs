@@ -1004,17 +1004,20 @@ impl NodeState {
         // In-flight spawns have reserved capacity but are not yet in the map
         // (so absent from the managed `llamesh_vram_mb`/`effective_sysmem_mb`)
         // and may not have begun allocating device VRAM yet (so absent from
-        // `device_vram_used_mb`). Fold their estimated memory in, so several
-        // concurrent spawns of different profiles cannot each observe the same
-        // headroom and jointly overshoot `max_vram_mb`/`max_sysmem_mb`. For
-        // VRAM, take the max against measured device usage rather than summing:
-        // a spawn that HAS begun allocating already shows up in
-        // `device_vram_used_mb`, and summing would double-count it. When no
-        // spawns are in flight this is exactly `effective_vram_mb` /
-        // `effective_sysmem_mb`, so steady-state behavior is unchanged.
+        // `device_vram_used_mb`). Add their estimated memory on top of the
+        // effective usage, so several concurrent spawns of different profiles
+        // cannot each observe the same headroom and jointly overshoot
+        // `max_vram_mb`/`max_sysmem_mb`. `effective_vram_mb` already folds in
+        // non-llamesh ("external") device usage, so the reservation must be
+        // added to it rather than max'd against device telemetry — otherwise
+        // external VRAM is dropped whenever a reservation exceeds it. The cost
+        // is a brief over-count while a reservation is partially allocated (its
+        // partial usage appears in both device telemetry and the reservation
+        // total); that errs toward queueing rather than OOM, which is the safe
+        // direction. With no spawns in flight this is exactly `effective_vram_mb`
+        // / `effective_sysmem_mb`, so steady-state behavior is unchanged.
         let (reserved_vram, reserved_sysmem) = self.spawn_reservations.reserved_memory();
-        let mut curr_vram = (resource_snapshot.llamesh_vram_mb + reserved_vram)
-            .max(resource_snapshot.device_vram_used_mb);
+        let mut curr_vram = resource_snapshot.effective_vram_mb + reserved_vram;
         let mut curr_sysmem = resource_snapshot.effective_sysmem_mb + reserved_sysmem;
 
         for (id, inst_lock) in instances_map.iter() {
@@ -1737,13 +1740,16 @@ impl NodeState {
                         // the capacity check above may have been abandoned
                         // before this request became visible in the queue, in
                         // which case its abandon notification found nobody to
-                        // wake. Now that we are enqueued, re-check the gate
-                        // and wake the queue's front waiter if it cleared.
-                        if matches!(
-                            e,
-                            NodeError::MaxInstancesProfile | NodeError::MaxInstancesNode
-                        ) {
-                            let gate_cleared = {
+                        // wake. Now that we are enqueued, re-check the gate and
+                        // wake the queue's front waiter if it cleared. This
+                        // covers the instance-count gates and the memory gate,
+                        // which an in-flight reservation's estimated memory can
+                        // also trip. The eviction-needed case is handled
+                        // separately via `needs_eviction` above; here we only
+                        // detect capacity an abandoned reservation freed
+                        // directly.
+                        let gate_cleared = match e {
+                            NodeError::MaxInstancesProfile | NodeError::MaxInstancesNode => {
                                 let instances_map = self.instances.read().await;
                                 let profile_count = Self::count_profile_instances(
                                     &instances_map,
@@ -1760,10 +1766,30 @@ impl NodeState {
                                     + self.spawn_reservations.node_total()
                                     < self.config.max_instances_per_node;
                                 profile_ok && node_ok
-                            };
-                            if gate_cleared {
-                                self.notify_queue(model_name, &profile.id).await;
                             }
+                            NodeError::InsufficientResources => {
+                                // Recompute the same memory gate `pick_victims`
+                                // applies (effective usage plus in-flight
+                                // reservations). If the spawn now fits without
+                                // eviction — e.g. the tipping reservation was
+                                // abandoned — wake the front waiter to retry.
+                                let (required_vram, required_sysmem) =
+                                    self.get_memory_estimate_for_key(&key).await;
+                                let instances_map = self.instances.read().await;
+                                let snapshot = self
+                                    .calculate_resource_snapshot_for_instances(&instances_map)
+                                    .await;
+                                let (reserved_vram, reserved_sysmem) =
+                                    self.spawn_reservations.reserved_memory();
+                                let curr_vram = snapshot.effective_vram_mb + reserved_vram;
+                                let curr_sysmem = snapshot.effective_sysmem_mb + reserved_sysmem;
+                                curr_vram + required_vram <= self.config.max_vram_mb
+                                    && curr_sysmem + required_sysmem <= self.config.max_sysmem_mb
+                            }
+                            _ => false,
+                        };
+                        if gate_cleared {
+                            self.notify_queue(model_name, &profile.id).await;
                         }
 
                         // Wait for queue notification with optional timeout
@@ -4767,6 +4793,45 @@ mod tests {
         assert!(
             matches!(err, NodeError::InsufficientResources),
             "an in-flight spawn's VRAM must count toward the guardrail, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pick_victims_counts_reservations_on_top_of_external_vram() {
+        // Regression guard: external (non-llamesh) VRAM and an in-flight
+        // reservation are independent contributions and must both count. The
+        // reservation has to be ADDED to the effective usage (which already
+        // includes external VRAM), not max'd against device telemetry —
+        // otherwise external VRAM is dropped whenever the reservation exceeds
+        // it, reopening the oversubscription/OOM hole.
+        let mut config = minimal_node_config();
+        config.max_vram_mb = 1000;
+        config.max_sysmem_mb = 1_000_000;
+        let cookbook = Cookbook { models: vec![] };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+        // 500 MB of non-llamesh ("external") device VRAM, no managed instances.
+        state
+            .memory_sampler
+            .set_device_vram_override(Some(gpu_snapshot(500, 100_000)));
+
+        // A different profile reserves 300 MB while spawning.
+        let _reservation =
+            state
+                .spawn_reservations
+                .reserve("other:default".to_string(), 300, 0, None);
+
+        // Effective usage is 500 (external) + 300 (reservation) = 800 MB. A
+        // 400 MB request would reach 1200 MB on a 1000 MB node, so it must be
+        // refused. (A max() of `0 + 300` vs `500` would wrongly read 500 and
+        // admit it.)
+        let map = state.instances.read().await;
+        let err = state.pick_victims(&map, 400, 0).await.unwrap_err();
+        assert!(
+            matches!(err, NodeError::InsufficientResources),
+            "external VRAM and reservation must both count, got: {err:?}"
         );
     }
 
