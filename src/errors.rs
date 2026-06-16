@@ -97,6 +97,18 @@ impl AppError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message, "internal_error")
     }
 
+    /// `502` returned when an upstream `llama-server` or a cluster peer accepted
+    /// the request but then failed to deliver a complete response — for example
+    /// the backend process was killed mid-body, or the connection reset before
+    /// the body finished transferring. Surfaced as the standard OpenAI error
+    /// envelope like every other error, so SDK clients that parse the response
+    /// body as JSON receive a structured error instead of a parse failure.
+    /// Centralizing it keeps the upstream-failure rejections identical in type
+    /// across the router's local-serving and peer-forwarding paths.
+    pub fn upstream_error(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, message, "upstream_error")
+    }
+
     pub fn request_timeout(message: impl Into<String>) -> Self {
         Self::new(StatusCode::REQUEST_TIMEOUT, message, "request_timeout")
     }
@@ -192,6 +204,19 @@ mod tests {
         let err = AppError::internal_server_error("oops");
         assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(err.error.type_, "internal_error");
+    }
+
+    #[test]
+    fn test_upstream_error() {
+        // A failed upstream/peer body read must surface as the OpenAI error
+        // envelope (502, type "upstream_error"), not a bare string body.
+        let err = AppError::upstream_error("backend closed the connection mid-body");
+        assert_eq!(err.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.error.type_, "upstream_error");
+        assert_eq!(
+            AppError::upstream_error("x").into_response().status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     #[test]
