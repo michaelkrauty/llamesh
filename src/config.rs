@@ -165,6 +165,58 @@ impl NodeConfig {
                      or disable cluster mode."
                 ));
             }
+
+            // Validate the per-peer circuit breaker tuning. These feed the
+            // open/close thresholds and the exponential backoff
+            // (`open_duration_base_ms * 2^n`, capped at `open_duration_max_ms`).
+            // A zero value deserializes cleanly but degenerates the breaker: a
+            // zero failure or success threshold opens or closes the circuit
+            // without the intended number of failures / recovery probes, and a
+            // zero base or max collapses the backoff to nothing, so a failing
+            // peer is re-probed on every request with no spacing. A base larger
+            // than the max is immediately capped, so the backoff never grows.
+            // `half_open_probe_interval_ms` is intentionally exempt: 0 is a
+            // documented value that disables probe gating. Only checked in
+            // cluster mode with the breaker enabled, where these fields are used.
+            let cb = &self.cluster.circuit_breaker;
+            if cb.enabled {
+                if cb.failure_threshold == 0 {
+                    return Err(anyhow::anyhow!(
+                        "cluster.circuit_breaker.failure_threshold is 0; the circuit would open \
+                         without any failures, blocking all traffic to a peer. Set it to at \
+                         least 1, or disable the circuit breaker."
+                    ));
+                }
+                if cb.success_threshold == 0 {
+                    return Err(anyhow::anyhow!(
+                        "cluster.circuit_breaker.success_threshold is 0; a half-open circuit \
+                         would close without a successful recovery probe. Set it to at least 1."
+                    ));
+                }
+                if cb.open_duration_base_ms == 0 {
+                    return Err(anyhow::anyhow!(
+                        "cluster.circuit_breaker.open_duration_base_ms is 0; the open-state \
+                         backoff would collapse to zero, so a failing peer is re-probed with no \
+                         spacing. Set a positive base backoff."
+                    ));
+                }
+                if cb.open_duration_max_ms == 0 {
+                    return Err(anyhow::anyhow!(
+                        "cluster.circuit_breaker.open_duration_max_ms is 0; a zero cap forces \
+                         every backoff to zero, so a failing peer is re-probed with no spacing. \
+                         Set a positive maximum backoff."
+                    ));
+                }
+                if cb.open_duration_base_ms > cb.open_duration_max_ms {
+                    return Err(anyhow::anyhow!(
+                        "cluster.circuit_breaker.open_duration_base_ms ({}) is greater than \
+                         open_duration_max_ms ({}); the base backoff is immediately capped to the \
+                         maximum, so the exponential backoff never takes effect. Set base <= max.",
+                        cb.open_duration_base_ms,
+                        cb.open_duration_max_ms
+                    ));
+                }
+            }
         }
 
         // Validate HTTP server limits and timeouts. Each feeds a hyper or tokio
@@ -1166,6 +1218,72 @@ mod tests {
         // The gossip loop never runs with cluster disabled, so these unused
         // fields must not be rejected (avoids breaking single-node configs).
         assert!(config_with_cluster(false, 0, 0).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_valid_circuit_breaker_when_cluster_enabled() {
+        // Defaults are valid; explicit minimum values are accepted too, and a
+        // zero probe interval is a documented value (disables probe gating).
+        assert!(config_with_cluster(true, 5, 16).validate().is_ok());
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.circuit_breaker.failure_threshold = 1;
+        config.cluster.circuit_breaker.success_threshold = 1;
+        config.cluster.circuit_breaker.open_duration_base_ms = 1;
+        config.cluster.circuit_breaker.open_duration_max_ms = 1;
+        config.cluster.circuit_breaker.half_open_probe_interval_ms = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_circuit_breaker_thresholds() {
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.circuit_breaker.failure_threshold = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.circuit_breaker.success_threshold = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_circuit_breaker_backoff_durations() {
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.circuit_breaker.open_duration_base_ms = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.circuit_breaker.open_duration_max_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_circuit_breaker_base_backoff_above_max() {
+        // A base larger than the cap is immediately capped, so the exponential
+        // backoff never grows — almost certainly a swapped-values misconfig.
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.circuit_breaker.open_duration_base_ms = 2000;
+        config.cluster.circuit_breaker.open_duration_max_ms = 1000;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_ignores_circuit_breaker_tuning_when_breaker_disabled() {
+        // A disabled breaker never uses these fields, so they must not be rejected.
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.circuit_breaker.enabled = false;
+        config.cluster.circuit_breaker.failure_threshold = 0;
+        config.cluster.circuit_breaker.open_duration_base_ms = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_ignores_circuit_breaker_tuning_when_cluster_disabled() {
+        // The breaker only runs in cluster mode; single-node configs must not
+        // be rejected for unused breaker fields.
+        let mut config = config_with_cluster(false, 5, 16);
+        config.cluster.circuit_breaker.failure_threshold = 0;
+        config.cluster.circuit_breaker.open_duration_base_ms = 0;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

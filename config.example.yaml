@@ -192,13 +192,14 @@ cluster:
   circuit_breaker:
     # Enable circuit breaker (default: true)
     enabled: true
-    # Number of consecutive failures before opening circuit (default: 5)
+    # Number of consecutive failures before opening circuit (default: 5, must be > 0)
     failure_threshold: 5
-    # Number of successes in half-open state to close circuit (default: 2)
+    # Number of successes in half-open state to close circuit (default: 2, must be > 0)
     success_threshold: 2
-    # Base backoff duration in ms when circuit opens (default: 5000)
+    # Base backoff duration in ms when circuit opens
+    # (default: 5000, must be > 0 and <= open_duration_max_ms)
     open_duration_base_ms: 5000
-    # Max backoff duration in ms with exponential backoff (default: 60000)
+    # Max backoff duration in ms with exponential backoff (default: 60000, must be > 0)
     open_duration_max_ms: 60000
     # Minimum interval in ms between recovery probes once an open circuit's
     # backoff has elapsed; limits traffic to a recovering peer until the

@@ -503,9 +503,12 @@ impl CircuitBreaker {
         let base = self.config.open_duration_base_ms;
         let max = self.config.open_duration_max_ms;
 
-        // Exponential backoff: base * 2^(consecutive_opens - 1), capped at max
+        // Exponential backoff: base * 2^(consecutive_opens - 1), capped at max.
+        // `saturating_mul` guards the multiply: with a large (but valid, <= max)
+        // base, `base * 1024` could otherwise overflow u64 and wrap to a tiny
+        // value that slips under the `.min(max)` cap, collapsing the backoff.
         let exponent = consecutive_opens.saturating_sub(1).min(10);
-        let backoff_ms = (base * 2u64.pow(exponent)).min(max);
+        let backoff_ms = base.saturating_mul(2u64.pow(exponent)).min(max);
 
         Duration::from_millis(backoff_ms)
     }
@@ -594,6 +597,26 @@ mod tests {
         assert_eq!(cb.calculate_backoff(4), Duration::from_millis(8000));
         assert_eq!(cb.calculate_backoff(5), Duration::from_millis(16000));
         assert_eq!(cb.calculate_backoff(6), Duration::from_millis(30000)); // Capped
+    }
+
+    #[test]
+    fn test_backoff_saturates_instead_of_overflowing() {
+        // A large (but valid: base <= max) base must not overflow the
+        // `base * 2^exponent` multiply and wrap to a tiny value that slips
+        // under the cap. `1 << 54` times `2^10` is exactly `1 << 64`, which
+        // wraps to 0 with a plain multiply; saturating multiplication clamps,
+        // and `.min(max)` then yields the configured maximum.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            open_duration_base_ms: 1u64 << 54,
+            open_duration_max_ms: 1u64 << 60,
+            ..Default::default()
+        });
+        // The exponent caps at 10, so this is (1 << 54) * (1 << 10) = 1 << 64.
+        assert_eq!(
+            cb.calculate_backoff(11),
+            Duration::from_millis(1u64 << 60),
+            "backoff must saturate to max, not wrap to ~0"
+        );
     }
 
     #[tokio::test]
