@@ -452,6 +452,7 @@ Per node, metrics snapshots are stored as JSON files at the path specified by `m
       "errors_total": 5,
       "tokens_generated_total": 50000,
       "avg_latency_ms": 430.0,
+      "total_latency_ms": 215000,
       "p95_latency_ms": 1200,
       "peak_vram_mb": 28672,
       "peak_sysmem_mb": 13312,
