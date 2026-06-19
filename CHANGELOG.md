@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.3] - 2026-06-19
+
+### Fixed
+
+- Config validation now rejects a zero `max_instances_per_node` at startup. The
+  field caps how many `llama-server` instances a node will spawn locally, and a
+  zero cap means it can never spawn one — fatal in any mode. A standalone node
+  can then serve nothing; a clustered node still self-routes a request for a
+  model in its own cookbook (local selection is gated on whether the node can
+  serve locally, not on the cap, and the zero-capacity skip only applies to
+  peers) and times out on the unsatisfiable cap instead of forwarding to a peer.
+  It deserialized cleanly (the field has a default), degrading the node silently
+  at runtime, so it is now caught at startup with a clear message, like the
+  existing gossip, port, circuit-breaker, and HTTP-limit checks. A
+  forwarding-only node instead keeps an empty local cookbook (so it never
+  self-routes) and a non-zero cap that is never reached.
+
 ## [1.18.2] - 2026-06-15
 
 ### Fixed

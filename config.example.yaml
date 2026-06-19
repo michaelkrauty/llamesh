@@ -34,6 +34,8 @@ max_vram_mb: 16000  # 16GB
 max_sysmem_mb: 64000  # 64GB
 
 # Maximum number of llama-server instances this node can run (default: 100)
+# Must be at least 1: a zero cap means the node can never spawn an instance. A
+# forwarding-only node keeps an empty cookbook and leaves this at its default.
 max_instances_per_node: 100
 
 # -----------------------------------------------------------------------------
