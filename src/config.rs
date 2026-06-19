@@ -219,22 +219,24 @@ impl NodeConfig {
             }
         }
 
-        // Validate the local instance cap against the deployment mode.
-        // `max_instances_per_node` caps how many llama-server instances this node
-        // will spawn locally. In standalone (non-cluster) mode there are no peers
-        // to forward to, so a zero cap leaves the node unable to spawn any instance
-        // and therefore unable to serve any request — every request waits out its
-        // queue and then fails. The field deserializes cleanly (it has a default),
-        // so catch the degenerate value at startup. In cluster mode a zero cap is
-        // permitted: a node may intentionally host nothing locally and forward
-        // everything to peers, and peer selection already skips a zero-capacity
-        // node when choosing a forward target.
-        if !self.cluster.enabled && self.max_instances_per_node == 0 {
+        // Validate the local instance cap. `max_instances_per_node` caps how many
+        // llama-server instances this node will spawn locally. A zero cap means the
+        // node can never spawn an instance, which is fatal regardless of cluster
+        // mode: a standalone node can then serve nothing, and a clustered node still
+        // routes a request for a model in its own cookbook to itself — local
+        // selection in `select_best_node` is gated on `can_serve_locally`, not on
+        // the cap, and the zero-capacity skip only applies to peers — where it
+        // queues on the unsatisfiable cap and times out instead of forwarding to a
+        // peer. The field deserializes cleanly (it has a default), so reject a zero
+        // cap at startup. A forwarding-only node instead keeps an empty local
+        // cookbook (so it never self-routes) and a non-zero cap that is never hit.
+        if self.max_instances_per_node == 0 {
             return Err(anyhow::anyhow!(
-                "max_instances_per_node is 0 and cluster mode is disabled; the node \
-                 cannot spawn any local instance and has no peers to forward to, so it \
-                 can serve no requests. Set max_instances_per_node to at least 1, or \
-                 enable cluster mode."
+                "max_instances_per_node is 0; the node can never spawn a local \
+                 llama-server instance, so any model in its cookbook is unservable. \
+                 In a cluster the node still routes locally-known models to itself \
+                 and times out instead of forwarding. Set max_instances_per_node to \
+                 at least 1."
             ));
         }
 
@@ -1307,29 +1309,37 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_max_instances_per_node_in_standalone_mode() {
-        // With cluster mode off there are no peers to forward to, so a zero
-        // local instance cap leaves the node unable to spawn any instance and
-        // therefore unable to serve any request. It deserializes cleanly (the
-        // field has a default), so it must be caught at startup.
+        // A standalone node with a zero local instance cap can never spawn an
+        // instance and has no peers to forward to, so it can serve nothing. It
+        // deserializes cleanly (the field has a default), so it must be caught.
         let mut config = config_with_cluster(false, 5, 16);
         config.max_instances_per_node = 0;
         assert!(config.validate().is_err());
     }
 
     #[test]
-    fn validate_accepts_zero_max_instances_per_node_in_cluster_mode() {
-        // In cluster mode a node may intentionally host nothing locally and
-        // forward everything to peers (peer selection already skips a
-        // zero-capacity node), so a zero cap is permitted there.
+    fn validate_rejects_zero_max_instances_per_node_in_cluster_mode() {
+        // A zero cap is fatal in cluster mode too: the node still self-routes a
+        // request for a model in its own cookbook (local selection is gated on
+        // can_serve_locally, not the cap) and then times out on the
+        // unsatisfiable cap instead of forwarding to a peer.
         let mut config = config_with_cluster(true, 5, 16);
         config.max_instances_per_node = 0;
-        assert!(config.validate().is_ok());
+        assert!(config.validate().is_err());
     }
 
     #[test]
     fn validate_accepts_positive_max_instances_per_node_in_standalone_mode() {
         // A single local instance slot is the minimum useful standalone capacity.
         let mut config = config_with_cluster(false, 5, 16);
+        config.max_instances_per_node = 1;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_positive_max_instances_per_node_in_cluster_mode() {
+        // A clustered node with at least one local slot is valid.
+        let mut config = config_with_cluster(true, 5, 16);
         config.max_instances_per_node = 1;
         assert!(config.validate().is_ok());
     }
