@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.3] - 2026-06-19
+
+### Fixed
+
+- Config validation now rejects a zero `max_instances_per_node` when cluster
+  mode is disabled. The field caps how many `llama-server` instances a node will
+  spawn locally; in standalone mode there are no peers to forward to, so a zero
+  cap leaves the node unable to spawn any instance and therefore unable to serve
+  any request — each one waits out its queue and then fails. It deserialized
+  cleanly (the field has a default), degrading the node silently at runtime, so
+  it is now caught at startup with a clear message, like the existing gossip,
+  port, circuit-breaker, and HTTP-limit checks. A zero cap remains valid in
+  cluster mode, where a node may intentionally host nothing locally and forward
+  every request to peers (peer selection already skips a zero-capacity node when
+  choosing a forward target).
+
 ## [1.18.2] - 2026-06-15
 
 ### Fixed

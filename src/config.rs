@@ -219,6 +219,25 @@ impl NodeConfig {
             }
         }
 
+        // Validate the local instance cap against the deployment mode.
+        // `max_instances_per_node` caps how many llama-server instances this node
+        // will spawn locally. In standalone (non-cluster) mode there are no peers
+        // to forward to, so a zero cap leaves the node unable to spawn any instance
+        // and therefore unable to serve any request — every request waits out its
+        // queue and then fails. The field deserializes cleanly (it has a default),
+        // so catch the degenerate value at startup. In cluster mode a zero cap is
+        // permitted: a node may intentionally host nothing locally and forward
+        // everything to peers, and peer selection already skips a zero-capacity
+        // node when choosing a forward target.
+        if !self.cluster.enabled && self.max_instances_per_node == 0 {
+            return Err(anyhow::anyhow!(
+                "max_instances_per_node is 0 and cluster mode is disabled; the node \
+                 cannot spawn any local instance and has no peers to forward to, so it \
+                 can serve no requests. Set max_instances_per_node to at least 1, or \
+                 enable cluster mode."
+            ));
+        }
+
         // Validate HTTP server limits and timeouts. Each feeds a hyper or tokio
         // primitive directly, and a zero value deserializes cleanly but breaks
         // request handling at runtime, so catch it at startup. A zero millisecond
@@ -1283,6 +1302,35 @@ mod tests {
         let mut config = config_with_cluster(false, 5, 16);
         config.cluster.circuit_breaker.failure_threshold = 0;
         config.cluster.circuit_breaker.open_duration_base_ms = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_instances_per_node_in_standalone_mode() {
+        // With cluster mode off there are no peers to forward to, so a zero
+        // local instance cap leaves the node unable to spawn any instance and
+        // therefore unable to serve any request. It deserializes cleanly (the
+        // field has a default), so it must be caught at startup.
+        let mut config = config_with_cluster(false, 5, 16);
+        config.max_instances_per_node = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_zero_max_instances_per_node_in_cluster_mode() {
+        // In cluster mode a node may intentionally host nothing locally and
+        // forward everything to peers (peer selection already skips a
+        // zero-capacity node), so a zero cap is permitted there.
+        let mut config = config_with_cluster(true, 5, 16);
+        config.max_instances_per_node = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_positive_max_instances_per_node_in_standalone_mode() {
+        // A single local instance slot is the minimum useful standalone capacity.
+        let mut config = config_with_cluster(false, 5, 16);
+        config.max_instances_per_node = 1;
         assert!(config.validate().is_ok());
     }
 

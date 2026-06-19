@@ -34,6 +34,8 @@ max_vram_mb: 16000  # 16GB
 max_sysmem_mb: 64000  # 64GB
 
 # Maximum number of llama-server instances this node can run (default: 100)
+# Must be at least 1 in standalone mode (no peers to forward to). In cluster
+# mode, 0 is allowed: the node hosts nothing locally and forwards to peers.
 max_instances_per_node: 100
 
 # -----------------------------------------------------------------------------
