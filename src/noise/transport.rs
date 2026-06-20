@@ -290,17 +290,23 @@ pub async fn send_data(
     Ok(())
 }
 
+/// Find the byte offset of the `\r\n\r\n` header/body boundary in a raw HTTP
+/// frame, searching the raw bytes so the returned offset stays consistent with
+/// slicing the original buffer for the body.
+fn find_header_boundary(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
 /// Parse HTTP request from bytes
 fn parse_http_request(data: &[u8]) -> Result<NoiseRequest> {
-    let data_str = String::from_utf8_lossy(data);
-
-    // Find header/body boundary
-    let header_end = data_str
-        .find("\r\n\r\n")
+    // Find the header/body boundary on the raw bytes so `body_start` stays
+    // consistent with slicing `data` for the body below. Searching a
+    // String::from_utf8_lossy view would expand any non-ASCII header byte to a
+    // 3-byte U+FFFD and shift the offset relative to the original buffer.
+    let header_end = find_header_boundary(data)
         .ok_or_else(|| NoiseError::Transport("Invalid HTTP request: no header boundary".into()))?;
-
-    let header_part = &data_str[..header_end];
     let body_start = header_end + 4;
+    let header_part = String::from_utf8_lossy(&data[..header_end]);
 
     // Parse request line
     let mut lines = header_part.lines();
@@ -336,13 +342,12 @@ fn parse_http_request(data: &[u8]) -> Result<NoiseRequest> {
 }
 
 fn parse_http_response_head(data: &[u8]) -> Result<NoiseResponseHead> {
-    let data_str = String::from_utf8_lossy(data);
-    let header_end = data_str
-        .find("\r\n\r\n")
+    // Boundary on the raw bytes so `body_start` matches the original buffer
+    // (see parse_http_request).
+    let header_end = find_header_boundary(data)
         .ok_or_else(|| NoiseError::Transport("Invalid HTTP response: no header boundary".into()))?;
-
-    let header_part = &data_str[..header_end];
     let body_start = header_end + 4;
+    let header_part = String::from_utf8_lossy(&data[..header_end]);
     let mut lines = header_part.lines();
     let status_line = lines
         .next()
@@ -484,6 +489,36 @@ mod tests {
         let request = b"\r\n\r\n";
         let result = parse_http_request(request);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_http_request_non_ascii_header_byte_keeps_body_intact() {
+        // A non-ASCII byte in the header region must not shift the body slice.
+        // The header/body boundary is found on the raw bytes, so the body offset
+        // stays consistent with the original buffer. Computing it against a
+        // String::from_utf8_lossy view instead would expand each invalid byte to
+        // a 3-byte U+FFFD and slice the body in the wrong place.
+        let mut request: Vec<u8> = Vec::new();
+        request.extend_from_slice(b"POST /v1/x HTTP/1.1\r\nX-Bin: ");
+        request.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 in a header value
+        request.extend_from_slice(b"\r\n\r\nBODYDATA123");
+
+        let parsed = parse_http_request(&request).unwrap();
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.path, "/v1/x");
+        assert_eq!(parsed.body.as_ref(), b"BODYDATA123");
+    }
+
+    #[test]
+    fn test_parse_http_response_head_non_ascii_header_byte_keeps_body_intact() {
+        let mut response: Vec<u8> = Vec::new();
+        response.extend_from_slice(b"HTTP/1.1 200 OK\r\nX-Bin: ");
+        response.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8 in a header value
+        response.extend_from_slice(b"\r\n\r\nFIRSTBODY");
+
+        let parsed = parse_http_response_head(&response).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.first_body.as_ref(), b"FIRSTBODY");
     }
 
     #[test]
