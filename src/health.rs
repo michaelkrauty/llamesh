@@ -133,6 +133,7 @@ mod tests {
             logging: None,
             max_total_queue_entries: 0,
             upstream_read_timeout_ms: 600_000,
+            wedge_detector: crate::config::WedgeDetectorConfig::default(),
         }
     }
 

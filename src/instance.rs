@@ -579,6 +579,11 @@ impl Instance {
         Ok(())
     }
 
+    /// Whether the instance has finished loading and is serving requests.
+    pub fn is_ready(&self) -> bool {
+        matches!(*self.status.lock(), InstanceStatus::Ready)
+    }
+
     pub fn is_alive(&self) -> bool {
         let mut guard = self.child.lock();
 

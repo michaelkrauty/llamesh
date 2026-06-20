@@ -1,4 +1,5 @@
 use nvml_wrapper::enums::device::UsedGpuMemory;
+use nvml_wrapper::error::NvmlError;
 use nvml_wrapper::Nvml;
 use procfs::process::Process;
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,79 @@ impl MemorySampler {
         let vram = self.sample_vram(pid).unwrap_or(0);
         let sysmem = self.sample_sysmem(pid).unwrap_or(0);
         (vram, sysmem)
+    }
+
+    /// Whether NVIDIA GPU telemetry (NVML) is available on this node.
+    pub fn has_gpu(&self) -> bool {
+        self.nvml.is_some()
+    }
+
+    /// Cumulative CPU busy time (`utime + stime`, in clock ticks) for a process.
+    /// `None` when the process is gone or `/proc` is unreadable. Two readings
+    /// over a known interval give a CPU rate (see
+    /// `wedge_detector::cpu_busy_cores`).
+    pub fn sample_cpu_busy_ticks(&self, pid: u32) -> Option<u64> {
+        let proc = Process::new(pid as i32).ok()?;
+        let stat = proc.stat().ok()?;
+        Some(stat.utime + stat.stime)
+    }
+
+    /// Per-process GPU SM utilization (percent) across all visible NVIDIA GPUs.
+    ///
+    /// Returns `(by_pid, newest_ts, usable)`:
+    /// - `by_pid`: `pid -> max SM utilization` observed for that pid. NVML
+    ///   reports only processes that were *busy* in the sample window, so an
+    ///   idle process is simply absent from the map — never present with a zero.
+    /// - `newest_ts`: the newest sample timestamp seen; pass it back as
+    ///   `last_seen_ts` next call so an old activity burst is not re-counted.
+    /// - `usable`: whether this sweep gives a trustworthy "who is busy" picture
+    ///   — true only when every device returned either samples or a clean
+    ///   `NotFound` (no busy process). A `NotSupported`/`GpuLost`/other error on
+    ///   any device makes the picture incomplete (a busy process there would be
+    ///   invisible), so a caller must not read an *absent* pid as "idle" on such
+    ///   a tick. False when NVML is unavailable or no device could be queried.
+    pub fn sample_process_gpu_sm_util(
+        &self,
+        last_seen_ts: Option<u64>,
+    ) -> (HashMap<u32, u32>, Option<u64>, bool) {
+        let mut by_pid: HashMap<u32, u32> = HashMap::new();
+        let mut max_ts: Option<u64> = None;
+
+        let Some(nvml) = self.nvml.as_ref() else {
+            return (by_pid, max_ts, false);
+        };
+        let Ok(device_count) = nvml.device_count() else {
+            return (by_pid, max_ts, false);
+        };
+
+        let mut usable = device_count > 0;
+        for i in 0..device_count {
+            let Ok(device) = nvml.device_by_index(i) else {
+                usable = false;
+                continue;
+            };
+            match device.process_utilization_stats(last_seen_ts) {
+                Ok(samples) => {
+                    for s in samples {
+                        by_pid
+                            .entry(s.pid)
+                            .and_modify(|u| *u = (*u).max(s.sm_util))
+                            .or_insert(s.sm_util);
+                        max_ts = Some(max_ts.map_or(s.timestamp, |m| m.max(s.timestamp)));
+                    }
+                }
+                // No busy process since `last_seen_ts`: a clean idle reading
+                // (NVML maps NVML_ERROR_NOT_FOUND here), not a failure.
+                Err(NvmlError::NotFound) => {}
+                // NotSupported / GpuLost / etc.: per-process util is unavailable
+                // or degraded on this device, so the sweep is not trustworthy.
+                Err(_) => {
+                    usable = false;
+                }
+            }
+        }
+
+        (by_pid, max_ts, usable)
     }
 }
 

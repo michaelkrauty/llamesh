@@ -81,6 +81,22 @@ max_total_queue_entries: 0
 # positive value (e.g. 600000) only if your requests stream tokens regularly.
 upstream_read_timeout_ms: 0
 
+# Wedged-instance watchdog. A request whose llama-server accepts it then goes
+# silent — flat at ~0% CPU and ~0% GPU while still holding its slot — pins that
+# slot forever, stalling graceful drain and idle eviction (the same hang
+# upstream_read_timeout_ms bounds per-request). When enabled, a background task
+# samples per-process CPU and GPU utilization and, after an instance has shown
+# no activity while holding a slot for window_ms, stops it so the stuck request
+# errors out and the slot is released. Unlike a timeout it tells a slow-but-
+# active generation (CPU/GPU busy) apart from a true hang (both flat), so it
+# never aborts legitimate work. Per-process GPU utilization (NVML) is hardware-
+# dependent, so the watchdog is opt-in; enable it on nodes that have exhibited
+# stuck slots and complement it with upstream_read_timeout_ms.
+wedge_detector:
+  enabled: false # (default: false) opt-in; not run at all when disabled
+  window_ms: 600000 # (default: 600000) sustained no-activity time before a kill
+  sample_interval_ms: 5000 # (default: 5000) how often activity is sampled
+
 # -----------------------------------------------------------------------------
 # llama-server Port Allocation
 # -----------------------------------------------------------------------------

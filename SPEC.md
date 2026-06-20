@@ -219,6 +219,14 @@ http:
   body_read_timeout_ms: 30000            # timeout for reading request body (default: 30s)
   protocol_detect_timeout_ms: 10000      # timeout for protocol detection on new connections (default: 10s)
 
+# Wedged-instance watchdog (optional, disabled by default). Stops a local
+# instance that holds a request slot while flat at ~0% CPU and ~0% GPU — a hung
+# upstream whose slot would otherwise stay pinned forever (see Idle Eviction).
+wedge_detector:
+  enabled: false                         # opt-in; not run when disabled (default: false)
+  window_ms: 600000                      # sustained no-activity time before a kill (default: 10m)
+  sample_interval_ms: 5000               # activity sampling cadence (default: 5s)
+
 # File logging (optional, disabled by default)
 # logging:
 #   enabled: true
@@ -967,6 +975,13 @@ Each instance is a `llama-server` process spawned by the proxy:
 
   * Background task detects and removes crashed instances.
   * Background task samples memory (VRAM and system memory) every 10 seconds continuously, not just during cold-start.
+
+* Wedged-instance watchdog (`wedge_detector`, opt-in, disabled by default):
+
+  * A request whose `llama-server` accepts it then goes silent (the connection stays open but no response bytes arrive) keeps `in_flight_requests > 0` forever. That instance is never idle-eligible (idle eviction requires `in_flight_requests == 0`) and the held slot keeps `current_requests > 0`, so a graceful drain (`wait_for_drain`) cannot complete until the process is killed by hand. `upstream_read_timeout_ms` bounds this per request; the watchdog is the instance-level complement.
+  * When enabled, a background task samples each Ready, slot-holding instance's per-process CPU (procfs `utime + stime` delta) and GPU (NVML per-process `sm_util`) every `sample_interval_ms`. An instance that is flat at ~0% CPU **and** ~0% GPU while holding a slot continuously for `window_ms` is judged wedged and stopped — making the stuck upstream call error out so the slot releases through the normal request-cleanup path (the same effect as an operator killing the PID).
+  * Unlike a wall-clock timeout, the activity signal distinguishes a slow-but-active generation (CPU or GPU busy) from a true hang (both flat), so it does not abort legitimately long or non-streaming requests. A real GPU-bound decode reports `sm_util > 0` even when CPU is idle and is never flagged. On a GPU node the watchdog only trusts an *absent* per-process GPU reading as "idle" after it has seen per-process utilization report a busy process at least once on that node; until then it does not act on idle CPU alone. On a CPU-only node, idle CPU while holding a slot is itself the signal.
+  * Kills increment `proxy_wedged_instances_killed_total` and log an `instance_wedged` warning. Killing a wedged process releases *all* its slots, which is correct because a process flat on both CPU and GPU is making no progress on any of its requests.
 
 * Eviction tenure (for competing models):
 
