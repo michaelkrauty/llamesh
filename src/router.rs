@@ -350,7 +350,13 @@ fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &s
         ) {
             continue;
         }
-        forward_headers.insert(name.clone(), value.clone());
+        // `append`, not `insert`: a client may send the same header name more
+        // than once (e.g. multiple Cookie lines), and `HeaderMap::iter` yields a
+        // separate pair per value. `insert` would replace all prior values for
+        // the name, silently dropping every value but the last before forwarding
+        // to a peer. `append` preserves them all (the first occurrence still
+        // creates the entry).
+        forward_headers.append(name.clone(), value.clone());
     }
     forward_headers.insert(
         axum::http::header::HeaderName::from_static("x-llama-mesh-hops"),
@@ -2309,6 +2315,58 @@ mod tests {
     fn test_is_healable_error_body_rejects_missing_type() {
         let body = br#"{"error": {"message": "x"}}"#;
         assert!(!is_healable_error_body(body.as_slice()));
+    }
+
+    #[test]
+    fn build_forward_headers_preserves_repeated_request_headers() {
+        use axum::http::header::{HeaderName, AUTHORIZATION, CONNECTION, COOKIE, HOST};
+
+        // A client can send the same header name more than once (e.g. multiple
+        // Cookie lines, or repeated Accept-Encoding). HeaderMap::iter yields one
+        // pair per value and HeaderMap::insert replaces all prior values, so all
+        // but the last would be dropped before forwarding to a peer; append keeps
+        // every value.
+        let mut source = HeaderMap::new();
+        source.append(COOKIE, HeaderValue::from_static("a=1"));
+        source.append(COOKIE, HeaderValue::from_static("b=2"));
+        source.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+        // Hop-by-hop headers must still be stripped.
+        source.insert(HOST, HeaderValue::from_static("example.com"));
+        source.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+        // A stale hop count carried by the incoming request must be replaced by
+        // the proxy's own count, not accumulated.
+        source.insert(
+            HeaderName::from_static("x-llama-mesh-hops"),
+            HeaderValue::from_static("2"),
+        );
+
+        let forwarded = build_forward_headers(&source, 2, "req-123");
+
+        // Both repeated cookie values survive, in order.
+        let cookies: Vec<&str> = forwarded
+            .get_all(COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+
+        // Single-valued passthrough headers are preserved.
+        assert_eq!(forwarded.get(AUTHORIZATION).unwrap(), "Bearer token");
+
+        // Hop-by-hop headers are dropped.
+        assert!(forwarded.get(HOST).is_none());
+        assert!(forwarded.get(CONNECTION).is_none());
+
+        // The proxy's hop count replaces any incoming value and stays single-valued.
+        let hops: Vec<&HeaderValue> = forwarded
+            .get_all(HeaderName::from_static("x-llama-mesh-hops"))
+            .iter()
+            .collect();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(forwarded.get("x-llama-mesh-hops").unwrap(), "3");
+
+        // The request id is set.
+        assert_eq!(forwarded.get("x-request-id").unwrap(), "req-123");
     }
 
     #[test]

@@ -7,7 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.18.3] - 2026-06-19
+## [1.18.4] - 2026-06-19
+
+### Fixed
+
+- Repeated request headers are no longer dropped when forwarding to a cluster
+  peer. `build_forward_headers` copied the incoming headers with
+  `HeaderMap::insert` while iterating, but `HeaderMap::iter` yields a separate
+  entry per value and `insert` replaces all prior values for a name, so a client
+  that sent the same header more than once (e.g. multiple `Cookie` lines, or
+  repeated `Accept-Encoding`) had every value but the last silently dropped
+  before the request reached the peer. The copy now uses `append`, which
+  preserves every value; the proxy-set `x-llama-mesh-hops` and `x-request-id`
+  headers remain single-valued and authoritative. Single-valued headers (the
+  common case, including `Authorization`) are unaffected.
 
 ### Fixed
 
