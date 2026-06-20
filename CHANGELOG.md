@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.18.6] - 2026-06-19
+## [1.18.7] - 2026-06-20
+
+### Fixed
+
+- A stalled local `llama-server` request no longer holds its in-flight slot
+  forever (which could hang a graceful drain indefinitely). The shared HTTP
+  client used to reach local instances had no timeout, so a request whose
+  upstream accepted it and then went silent — connection held open, no further
+  bytes — never completed: `current_requests` stayed above zero, `is_idle()`
+  never returned true, and a restart's graceful drain waited until the process
+  was killed by hand. The client now carries an inactivity `read_timeout`,
+  configurable via `upstream_read_timeout_ms` (default 600000 = 10 minutes;
+  `0` disables it). It is a per-chunk timer — reqwest resets it on every
+  response chunk — so a slow but actively-streaming generation is unaffected;
+  only a genuinely silent upstream is aborted, which releases the slot. The
+  default is generous enough to cover large-context prefill. The cluster
+  peer-forward paths share the same exposure and are tracked separately.
 
 ### Fixed
 

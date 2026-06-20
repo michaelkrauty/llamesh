@@ -52,6 +52,16 @@ pub struct NodeConfig {
     /// 0 = no global limit (only per-model limits apply).
     #[serde(default = "default_max_total_queue_entries")]
     pub max_total_queue_entries: usize,
+    /// Inactivity (read) timeout in milliseconds for outbound requests to a
+    /// local `llama-server` instance. reqwest resets this on every received
+    /// response chunk, so it bounds *silence* from a stalled upstream (a process
+    /// that accepted the request but then stops sending, e.g. a hung instance at
+    /// 0% CPU) without affecting a slow-but-active stream. Without it, such a
+    /// request holds its in-flight slot forever, which (among other things)
+    /// blocks graceful drain on shutdown. Set generously (the default tolerates
+    /// large-context prefill); `0` disables it.
+    #[serde(default = "default_upstream_read_timeout_ms")]
+    pub upstream_read_timeout_ms: u64,
 }
 
 fn default_shutdown_grace_period_seconds() -> u64 {
@@ -64,6 +74,10 @@ fn default_max_hops() -> usize {
 
 fn default_max_total_queue_entries() -> usize {
     0 // 0 = no global limit (only per-model limits apply)
+}
+
+fn default_upstream_read_timeout_ms() -> u64 {
+    600_000 // 10 minutes: generous enough for large-context prefill, bounds a stalled upstream
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1075,6 +1089,7 @@ mod tests {
             max_hops: 10,
             logging: None,
             max_total_queue_entries: 0,
+            upstream_read_timeout_ms: 600_000,
         };
 
         assert!(config.validate().is_err());
@@ -1132,6 +1147,7 @@ mod tests {
             max_hops: 10,
             logging: None,
             max_total_queue_entries: 0,
+            upstream_read_timeout_ms: 600_000,
         }
     }
 
@@ -1590,6 +1606,10 @@ models:
         assert_eq!(config.llama_cpp.repo_path, default_repo_path());
         assert_eq!(config.llama_cpp.build_path, default_build_path());
         assert_eq!(config.llama_cpp.binary_path, default_binary_path());
+        assert_eq!(
+            config.upstream_read_timeout_ms,
+            default_upstream_read_timeout_ms()
+        );
 
         let cookbook =
             load_cookbook(Path::new("cookbook.example.yaml")).expect("cookbook.example.yaml loads");
