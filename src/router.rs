@@ -1228,8 +1228,21 @@ pub async fn route_request(
                             Ok(if response_streaming {
                                 build_streaming_response(resp, cleanup_fut, tokens_counter)
                             } else {
-                                handle_non_streaming_response(resp, cleanup_fut, tokens_counter)
-                                    .await
+                                let (resp, body_read_failed) = handle_non_streaming_response(
+                                    resp,
+                                    cleanup_fut,
+                                    tokens_counter,
+                                )
+                                .await;
+                                if body_read_failed {
+                                    // A read timeout / reset while reading the local
+                                    // body surfaces here as a 502; count it like the
+                                    // send-error case above (the guard handles the
+                                    // in-flight/current-request cleanup).
+                                    state.metrics.inc_errors();
+                                    hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                                }
+                                resp
                             })
                         }
                         Err(e) => {
@@ -1689,11 +1702,16 @@ pub async fn route_request(
     .await
 }
 
+/// Reads a non-streaming upstream response and builds the client response. The
+/// returned `bool` is `true` when reading the upstream body failed (e.g. the
+/// upstream went silent and the client's read timeout fired, or the connection
+/// reset mid-body); the caller is responsible for recording that as an error,
+/// since this failure mode is otherwise invisible to the error metrics.
 async fn handle_non_streaming_response(
     resp: reqwest::Response,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
-) -> Response<Body> {
+) -> (Response<Body>, bool) {
     // `AutoCleanup` guarantees `cleanup` runs exactly once — either when this
     // function returns normally, or if the enclosing task is cancelled while
     // awaiting the body (e.g. client disconnect mid-read). Without this
@@ -1710,12 +1728,17 @@ async fn handle_non_streaming_response(
         Ok(b) => b,
         Err(e) => {
             error!("Failed to read upstream response body: {}", e);
-            return AppError::upstream_error(format!("Failed to read upstream response body: {e}"))
-                .into_response();
+            let resp =
+                AppError::upstream_error(format!("Failed to read upstream response body: {e}"))
+                    .into_response();
+            return (resp, true);
         }
     };
 
-    build_non_streaming_body_response(status, headers, bytes, tokens_generated)
+    (
+        build_non_streaming_body_response(status, headers, bytes, tokens_generated),
+        false,
+    )
 }
 
 fn build_non_streaming_body_response(
@@ -1829,7 +1852,11 @@ async fn peer_response_to_client(
             if stream_requested {
                 build_streaming_response(resp, cleanup, tokens_generated)
             } else {
-                handle_non_streaming_response(resp, cleanup, tokens_generated).await
+                // Peer body-read failures are accounted for on the forward path
+                // (`attempt_peer_forward`), so the error flag is ignored here.
+                handle_non_streaming_response(resp, cleanup, tokens_generated)
+                    .await
+                    .0
             }
         }
         PeerResponse::Noise {

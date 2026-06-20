@@ -22,8 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0` disables it). It is a per-chunk timer — reqwest resets it on every
   response chunk — so a slow but actively-streaming generation is unaffected;
   only a genuinely silent upstream is aborted, which releases the slot. The
-  default is generous enough to cover large-context prefill. The cluster
-  peer-forward paths share the same exposure and are tracked separately.
+  default is generous enough to cover large-context prefill. A local body-read
+  failure (which this timeout now makes reachable) is also recorded in the
+  request error metrics, matching the existing send-failure and peer-forward
+  accounting. The cluster peer-forward paths share the same exposure and are
+  tracked separately.
 
 ## [1.18.6] - 2026-06-19
 
