@@ -9,23 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.18.7] - 2026-06-20
 
-### Fixed
+### Added
 
-- A stalled local `llama-server` request no longer holds its in-flight slot
-  forever (which could hang a graceful drain indefinitely). The shared HTTP
-  client used to reach local instances had no timeout, so a request whose
-  upstream accepted it and then went silent — connection held open, no further
-  bytes — never completed: `current_requests` stayed above zero, `is_idle()`
-  never returned true, and a restart's graceful drain waited until the process
-  was killed by hand. The client now carries an inactivity `read_timeout`,
-  configurable via `upstream_read_timeout_ms` (default 600000 = 10 minutes;
-  `0` disables it). It is a per-chunk timer — reqwest resets it on every
-  response chunk — so a slow but actively-streaming generation is unaffected;
-  only a genuinely silent upstream is aborted, which releases the slot. The
-  default is generous enough to cover large-context prefill. A local body-read
-  failure (which this timeout now makes reachable) is also recorded in the
-  request error metrics, matching the existing send-failure and peer-forward
-  accounting. The cluster peer-forward paths share the same exposure and are
+- New `upstream_read_timeout_ms` option: an inactivity (read) timeout for
+  outbound requests to a local `llama-server`. A stalled upstream — one that
+  accepts a request and then goes silent (connection held open, no further
+  bytes) — otherwise holds its in-flight slot forever, so `current_requests`
+  never returns to zero and a graceful drain can hang until the process is
+  killed by hand. With this set, the request is aborted after the configured
+  silence and the slot is released. It is a per-chunk timer (reqwest resets it
+  on every response chunk), so an actively-streaming generation is unaffected.
+  Disabled by default (`0`): the timer also covers the wait for the first body
+  bytes, and a `stream: false` response only arrives once generation finishes,
+  so a non-zero value shorter than a request's full generation time would abort
+  a legitimate request — enable it only for deployments whose requests stream
+  tokens regularly. The cluster peer-forward paths share the exposure and are
   tracked separately.
 
 ## [1.18.6] - 2026-06-19

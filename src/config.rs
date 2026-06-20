@@ -53,13 +53,17 @@ pub struct NodeConfig {
     #[serde(default = "default_max_total_queue_entries")]
     pub max_total_queue_entries: usize,
     /// Inactivity (read) timeout in milliseconds for outbound requests to a
-    /// local `llama-server` instance. reqwest resets this on every received
-    /// response chunk, so it bounds *silence* from a stalled upstream (a process
-    /// that accepted the request but then stops sending, e.g. a hung instance at
-    /// 0% CPU) without affecting a slow-but-active stream. Without it, such a
-    /// request holds its in-flight slot forever, which (among other things)
-    /// blocks graceful drain on shutdown. Set generously (the default tolerates
-    /// large-context prefill); `0` disables it.
+    /// local `llama-server` instance. A stalled upstream (one that accepted the
+    /// request then stops sending, e.g. a hung instance at 0% CPU) otherwise
+    /// holds its in-flight slot forever, which can hang a graceful drain. reqwest
+    /// resets this on every received chunk, so for a streaming response it bounds
+    /// silence between tokens without affecting an actively-streaming generation.
+    /// Disabled by default (`0`): the timer also covers the wait for the first
+    /// body bytes — and for `stream: false` the body arrives only when generation
+    /// finishes — so any non-zero value shorter than a request's full generation
+    /// time would abort a legitimate long or non-streaming request. Enable it
+    /// (a positive ms) when requests stream tokens regularly and stalled
+    /// upstreams should be bounded.
     #[serde(default = "default_upstream_read_timeout_ms")]
     pub upstream_read_timeout_ms: u64,
 }
@@ -77,7 +81,8 @@ fn default_max_total_queue_entries() -> usize {
 }
 
 fn default_upstream_read_timeout_ms() -> u64 {
-    600_000 // 10 minutes: generous enough for large-context prefill, bounds a stalled upstream
+    0 // disabled by default; a non-zero default would abort legitimate long /
+      // non-streaming requests (see the field doc). Opt in per deployment.
 }
 
 #[derive(Debug, Deserialize, Clone)]

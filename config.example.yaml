@@ -70,13 +70,16 @@ model_defaults:
 # pressure from queued requests. (default: 0)
 max_total_queue_entries: 0
 
-# Inactivity timeout (ms) for outbound requests to a local llama-server. This is
-# a per-chunk read timeout, NOT a total deadline: it resets on every response
-# chunk, so a slow-but-active stream is unaffected while a stalled upstream (a
-# process that stops sending mid-response) is aborted instead of holding its
-# in-flight slot forever (which would block graceful drain). Set generously
-# enough to cover large-context prefill; 0 disables it. (default: 600000 = 10m)
-upstream_read_timeout_ms: 600000
+# Inactivity (read) timeout in ms for outbound requests to a local llama-server.
+# A stalled upstream (one that stops sending mid-response) otherwise holds its
+# in-flight slot forever, which can hang a graceful drain. It is a per-chunk
+# timer (reset on every chunk), so it bounds silence between streamed tokens
+# without aborting an actively-streaming generation. DISABLED by default (0): the
+# timer also covers the wait for the first body bytes, and a `stream: false`
+# response arrives only when generation finishes, so any non-zero value shorter
+# than a request's full generation time would abort a legitimate request. Set a
+# positive value (e.g. 600000) only if your requests stream tokens regularly.
+upstream_read_timeout_ms: 0
 
 # -----------------------------------------------------------------------------
 # llama-server Port Allocation
