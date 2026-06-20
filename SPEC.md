@@ -159,7 +159,7 @@ llama_cpp:
   repo_url: "https://github.com/ggml-org/llama.cpp.git"
   repo_path: "./llama.cpp"
   build_path: "./llama.cpp/build"
-  binary_path: "./llama.cpp/build/bin/llama-server"
+  binary_path: "./llama.cpp/bin/llama-server"
   branch: "master"                       # use release tag (e.g., "b6115") to pin version
   build_args:
     - "-DGGML_CUDA=ON"
@@ -961,7 +961,7 @@ Each instance is a `llama-server` process spawned by the proxy:
   * If `now - last_activity_time > idle_timeout_seconds` and `in_flight_requests == 0`:
 
     * Terminate instance gracefully.
-  * Fallback timeout of 600 seconds is applied if no profile-specific timeout is set.
+  * Fallback timeout of 300 seconds is applied if no profile-specific timeout is set.
 
 * Background monitoring:
 

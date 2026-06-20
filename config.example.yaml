@@ -95,7 +95,7 @@ llama_cpp:
   # Local paths (defaults shown)
   repo_path: "./llama.cpp"
   build_path: "./llama.cpp/build"
-  binary_path: "./llama.cpp/build/bin/llama-server"
+  binary_path: "./llama.cpp/bin/llama-server"
 
   # Branch, tag, or commit to build
   # Use release tags (e.g., "b6115") for stability, "master" for latest

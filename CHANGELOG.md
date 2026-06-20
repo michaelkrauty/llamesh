@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.5] - 2026-06-19
+
+### Documentation
+
+- Corrected two reference values in the example config and `SPEC.md` that did
+  not match the code. Under "Local paths (defaults shown)", `llama_cpp.binary_path`
+  carried a stray `build/` segment (`./llama.cpp/build/bin/llama-server`) where
+  the actual default is `./llama.cpp/bin/llama-server`; the sibling `repo_path`
+  and `build_path` already matched their defaults, so deleting the line yielded a
+  different path than the comment promised. And the idle-eviction "fallback
+  timeout" prose in `SPEC.md` said 600 seconds where the default is 300 (the same
+  document's example config already noted "default 300"). The
+  example-validation test now asserts the documented local paths equal their
+  `default_*()` functions, so they cannot silently drift again.
+
 ## [1.18.4] - 2026-06-19
 
 ### Fixed
