@@ -1585,6 +1585,12 @@ models:
         assert_eq!(config.http.body_read_timeout_ms, 30_000);
         assert_eq!(config.http.protocol_detect_timeout_ms, 10_000);
 
+        // The "# Local paths (defaults shown)" block must actually show the
+        // defaults, so deleting any of these lines yields the documented path.
+        assert_eq!(config.llama_cpp.repo_path, default_repo_path());
+        assert_eq!(config.llama_cpp.build_path, default_build_path());
+        assert_eq!(config.llama_cpp.binary_path, default_binary_path());
+
         let cookbook =
             load_cookbook(Path::new("cookbook.example.yaml")).expect("cookbook.example.yaml loads");
         cookbook
