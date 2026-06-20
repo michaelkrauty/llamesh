@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default is generous enough to cover large-context prefill. The cluster
   peer-forward paths share the same exposure and are tracked separately.
 
+## [1.18.6] - 2026-06-19
+
 ### Fixed
 
 - Noise HTTP frame parsing now locates the header/body boundary on the raw
