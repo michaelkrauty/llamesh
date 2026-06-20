@@ -988,6 +988,24 @@ async fn handle_noise_gossip(
     }
 }
 
+/// Rebuild an Axum request `HeaderMap` from a Noise request's parsed
+/// `(name, value)` header list. Uses `append` so a header the client sent more
+/// than once (e.g. multiple `Cookie` lines, which the Noise transport carries as
+/// separate lines) keeps every value; `insert` would drop all but the last,
+/// re-collapsing the duplicates the sender preserved.
+fn build_noise_request_headers(raw: &[(String, String)]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in raw {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            headers.append(name, value);
+        }
+    }
+    headers
+}
+
 async fn handle_noise_http_request(
     state: Arc<NodeState>,
     request: crate::noise::transport::NoiseRequest,
@@ -997,14 +1015,7 @@ async fn handle_noise_http_request(
         .uri(request.path.as_str());
 
     if let Some(headers) = builder.headers_mut() {
-        for (name, value) in request.headers {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                axum::http::HeaderValue::from_str(&value),
-            ) {
-                headers.insert(name, value);
-            }
-        }
+        *headers = build_noise_request_headers(&request.headers);
     }
 
     let req = match builder.body(Body::from(request.body)) {
@@ -1092,6 +1103,31 @@ mod tests {
         let payload = version_payload("1.2.3", Some("abc1234"));
         assert_eq!(payload["version"], "1.2.3");
         assert_eq!(payload["llama_cpp_version"], "abc1234");
+    }
+
+    #[test]
+    fn build_noise_request_headers_preserves_repeated_cookie() {
+        use axum::http::header::{AUTHORIZATION, COOKIE};
+
+        // A Noise-forwarded request carries headers as separate (name, value)
+        // pairs (the sender preserves each repeated value as its own line).
+        // Rebuilding the Axum request with insert would re-collapse them;
+        // append keeps every value so the downstream handler sees them all.
+        let raw = vec![
+            ("Cookie".to_string(), "a=1".to_string()),
+            ("Authorization".to_string(), "Bearer x".to_string()),
+            ("Cookie".to_string(), "b=2".to_string()),
+        ];
+
+        let headers = build_noise_request_headers(&raw);
+
+        let cookies: Vec<&str> = headers
+            .get_all(COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer x");
     }
 
     #[test]

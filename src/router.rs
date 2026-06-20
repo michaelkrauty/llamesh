@@ -350,7 +350,13 @@ fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &s
         ) {
             continue;
         }
-        forward_headers.insert(name.clone(), value.clone());
+        // `append`, not `insert`: a client may send the same header name more
+        // than once (e.g. multiple Cookie lines), and `HeaderMap::iter` yields a
+        // separate pair per value. `insert` would replace all prior values for
+        // the name, silently dropping every value but the last before forwarding
+        // to a peer. `append` preserves them all (the first occurrence still
+        // creates the entry).
+        forward_headers.append(name.clone(), value.clone());
     }
     forward_headers.insert(
         axum::http::header::HeaderName::from_static("x-llama-mesh-hops"),
@@ -364,6 +370,25 @@ fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &s
         );
     }
     forward_headers
+}
+
+/// Build the client-facing response header map from a peer's parsed response
+/// headers. The Noise transport delivers headers as `(name, value)` pairs (one
+/// per header line), so this rebuilds a `HeaderMap` from them — using `append`
+/// so a repeated response header (e.g. multiple `Set-Cookie` lines) keeps every
+/// value. The reqwest forward path clones the upstream `HeaderMap` wholesale and
+/// so already preserves repeated values; this keeps the Noise path consistent.
+fn build_peer_response_headers(raw: &[(String, String)]) -> HeaderMap {
+    let mut response_headers = HeaderMap::new();
+    for (name, value) in raw {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            response_headers.append(name, value);
+        }
+    }
+    response_headers
 }
 
 async fn send_peer_request(
@@ -396,15 +421,7 @@ async fn send_peer_request(
         let status = StatusCode::from_u16(response.head.status).map_err(|e| {
             AppError::internal_server_error(format!("Invalid peer response status: {e}"))
         })?;
-        let mut response_headers = HeaderMap::new();
-        for (name, value) in &response.head.headers {
-            if let (Ok(name), Ok(value)) = (
-                axum::http::HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                response_headers.insert(name, value);
-            }
-        }
+        let response_headers = build_peer_response_headers(&response.head.headers);
 
         Ok(PeerResponse::Noise {
             status,
@@ -2309,6 +2326,83 @@ mod tests {
     fn test_is_healable_error_body_rejects_missing_type() {
         let body = br#"{"error": {"message": "x"}}"#;
         assert!(!is_healable_error_body(body.as_slice()));
+    }
+
+    #[test]
+    fn build_forward_headers_preserves_repeated_request_headers() {
+        use axum::http::header::{HeaderName, AUTHORIZATION, CONNECTION, COOKIE, HOST};
+
+        // A client can send the same header name more than once (e.g. multiple
+        // Cookie lines, or repeated Accept-Encoding). HeaderMap::iter yields one
+        // pair per value and HeaderMap::insert replaces all prior values, so all
+        // but the last would be dropped before forwarding to a peer; append keeps
+        // every value.
+        let mut source = HeaderMap::new();
+        source.append(COOKIE, HeaderValue::from_static("a=1"));
+        source.append(COOKIE, HeaderValue::from_static("b=2"));
+        source.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+        // Hop-by-hop headers must still be stripped.
+        source.insert(HOST, HeaderValue::from_static("example.com"));
+        source.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+        // A stale hop count carried by the incoming request must be replaced by
+        // the proxy's own count, not accumulated.
+        source.insert(
+            HeaderName::from_static("x-llama-mesh-hops"),
+            HeaderValue::from_static("2"),
+        );
+
+        let forwarded = build_forward_headers(&source, 2, "req-123");
+
+        // Both repeated cookie values survive, in order.
+        let cookies: Vec<&str> = forwarded
+            .get_all(COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+
+        // Single-valued passthrough headers are preserved.
+        assert_eq!(forwarded.get(AUTHORIZATION).unwrap(), "Bearer token");
+
+        // Hop-by-hop headers are dropped.
+        assert!(forwarded.get(HOST).is_none());
+        assert!(forwarded.get(CONNECTION).is_none());
+
+        // The proxy's hop count replaces any incoming value and stays single-valued.
+        let hops: Vec<&HeaderValue> = forwarded
+            .get_all(HeaderName::from_static("x-llama-mesh-hops"))
+            .iter()
+            .collect();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(forwarded.get("x-llama-mesh-hops").unwrap(), "3");
+
+        // The request id is set.
+        assert_eq!(forwarded.get("x-request-id").unwrap(), "req-123");
+    }
+
+    #[test]
+    fn build_peer_response_headers_preserves_repeated_set_cookie() {
+        use axum::http::header::{CONTENT_TYPE, SET_COOKIE};
+
+        // A peer's response can carry the same header more than once — most
+        // commonly several Set-Cookie lines. The Noise transport delivers these
+        // as separate (name, value) pairs; rebuilding with insert would keep
+        // only the last, append keeps them all.
+        let raw = vec![
+            ("Set-Cookie".to_string(), "a=1".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Set-Cookie".to_string(), "b=2".to_string()),
+        ];
+
+        let headers = build_peer_response_headers(&raw);
+
+        let cookies: Vec<&str> = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
     }
 
     #[test]

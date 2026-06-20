@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.4] - 2026-06-19
+
+### Fixed
+
+- Repeated headers are no longer dropped when relaying between clients and
+  cluster peers. Several places rebuilt a `HeaderMap` from a header list (or
+  another map) with `HeaderMap::insert` while iterating; because `iter` yields a
+  separate entry per value and `insert` replaces all prior values for a name, a
+  header sent more than once lost every value but the last. This affected the
+  outgoing request copy (`build_forward_headers`), the encrypted-peer request
+  receiver that rebuilds the Axum request, and the encrypted-peer response relay,
+  so a request with several `Cookie` lines — or a response with several
+  `Set-Cookie` lines — was silently collapsed to a single value end to end. All
+  three now use `append`, which preserves every value; the proxy-set
+  `x-llama-mesh-hops` and `x-request-id` request headers stay single-valued and
+  authoritative. The reqwest forward path already cloned the upstream map and was
+  unaffected. Single-valued headers (the common case, including `Authorization`)
+  are unchanged.
+
 ## [1.18.3] - 2026-06-19
 
 ### Fixed
