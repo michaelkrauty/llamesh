@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unaffected. Single-valued headers (the common case, including `Authorization`)
   are unchanged.
 
+## [1.18.3] - 2026-06-19
+
 ### Fixed
 
 - Config validation now rejects a zero `max_instances_per_node` at startup. The
