@@ -12,20 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Repeated headers are no longer dropped when relaying between clients and
-  cluster peers. Both the outgoing request headers (`build_forward_headers`) and
-  the peer's response headers (rebuilt from the Noise transport's parsed header
-  list) were copied into a fresh `HeaderMap` with `HeaderMap::insert` while
-  iterating, but `HeaderMap::iter` yields a separate entry per value and `insert`
-  replaces all prior values for a name. A request that repeated a header (e.g.
-  multiple `Cookie` lines, or repeated `Accept-Encoding`) lost every value but
-  the last on the way to the peer, and a response that repeated one (most
-  commonly several `Set-Cookie` lines) lost every value but the last on the way
-  back to the client. Both copies now use `append`, which preserves every value;
-  the proxy-set `x-llama-mesh-hops` and `x-request-id` request headers stay
-  single-valued and authoritative. The reqwest forward path already preserved
-  repeated values (it clones the upstream map), so this brings the Noise path in
-  line. Single-valued headers (the common case, including `Authorization`) are
-  unaffected.
+  cluster peers. Several places rebuilt a `HeaderMap` from a header list (or
+  another map) with `HeaderMap::insert` while iterating; because `iter` yields a
+  separate entry per value and `insert` replaces all prior values for a name, a
+  header sent more than once lost every value but the last. This affected the
+  outgoing request copy (`build_forward_headers`), the encrypted-peer request
+  receiver that rebuilds the Axum request, and the encrypted-peer response relay,
+  so a request with several `Cookie` lines — or a response with several
+  `Set-Cookie` lines — was silently collapsed to a single value end to end. All
+  three now use `append`, which preserves every value; the proxy-set
+  `x-llama-mesh-hops` and `x-request-id` request headers stay single-valued and
+  authoritative. The reqwest forward path already cloned the upstream map and was
+  unaffected. Single-valued headers (the common case, including `Authorization`)
+  are unchanged.
 
 ### Fixed
 
