@@ -31,8 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only a stream whose client consumes nothing for the full window is treated as
   wedged. On a GPU node an absent
   per-process GPU reading is trusted as "idle" only after per-process
-  utilization has been observed working on that node at least once; on a
-  CPU-only node, idle CPU while holding a slot is the signal. Disabled by
+  utilization has been observed working on that node at least once and the
+  current NVML sweep is not degraded; a node with no NVML GPU is treated as
+  "GPU activity unknown" (so a non-NVIDIA GPU is never wrongly flagged) unless
+  `wedge_detector.cpu_only` is set to assert the node has no GPU. Disabled by
   default — the per-process GPU signal is hardware-dependent — and complements
   `upstream_read_timeout_ms` rather than replacing it. Kills are counted by the
   new `proxy_wedged_instances_killed_total` metric and logged as

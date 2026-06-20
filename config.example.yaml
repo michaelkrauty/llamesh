@@ -98,6 +98,11 @@ wedge_detector:
   enabled: false # (default: false) opt-in; not run at all when disabled
   window_ms: 600000 # (default: 600000) sustained no-activity time before a kill
   sample_interval_ms: 5000 # (default: 5000) how often activity is sampled
+  # Assert this node runs inference on CPU only (no GPU of any vendor). Only then
+  # is idle CPU, with no NVIDIA/NVML GPU present, treated as a wedge. Leave false
+  # on any node with a GPU — including non-NVIDIA GPUs (Metal/ROCm/Vulkan) whose
+  # activity NVML cannot see — so a healthy GPU decode is never wrongly flagged.
+  cpu_only: false # (default: false)
 
 # -----------------------------------------------------------------------------
 # llama-server Port Allocation

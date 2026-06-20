@@ -3432,7 +3432,7 @@ impl NodeState {
         // 1. Snapshot Ready, in-flight, local instances and their pids. A still-
         //    loading instance is excluded so a slow model load is never mistaken
         //    for a wedge; an instance with no slot held cannot be wedged.
-        let candidates: Vec<(String, u32, usize)> = {
+        let candidates: Vec<(String, u32, usize, Instant)> = {
             let instances = self.instances.read().await;
             let mut v = Vec::new();
             for (id, inst_lock) in instances.iter() {
@@ -3441,7 +3441,10 @@ impl NodeState {
                     continue;
                 }
                 if let Some(pid) = inst.get_pid() {
-                    v.push((id.clone(), pid, inst.in_flight_requests));
+                    // last_activity is set on each new slot assignment, so it
+                    // identifies the work that is wedging — captured here to
+                    // re-verify the same request still holds the slot at kill.
+                    v.push((id.clone(), pid, inst.in_flight_requests, inst.last_activity));
                 }
             }
             v
@@ -3453,7 +3456,7 @@ impl NodeState {
         //    per-pid /proc read; GPU is a single NVML sweep covering all pids.
         let cpu_now: HashMap<String, Option<u64>> = candidates
             .iter()
-            .map(|(id, pid, _)| (id.clone(), self.memory_sampler.sample_cpu_busy_ticks(*pid)))
+            .map(|(id, pid, _, _)| (id.clone(), self.memory_sampler.sample_cpu_busy_ticks(*pid)))
             .collect();
         let prev_gpu_ts = self.wedge_state.lock().unwrap().gpu_last_seen_ts;
         let (gpu_util, gpu_new_ts, gpu_usable) =
@@ -3470,8 +3473,9 @@ impl NodeState {
         let now = Instant::now();
 
         // 3. Decide per instance under the leaf lock; collect confirmed kills
-        //    along with the slot count observed this tick (for a TOCTOU recheck).
-        let mut to_kill: Vec<(String, u32, Duration, usize)> = Vec::new();
+        //    along with last_activity observed this tick (for a TOCTOU recheck
+        //    that the same request still holds the slot).
+        let mut to_kill: Vec<(String, u32, Duration, Instant)> = Vec::new();
         {
             let mut state = self.wedge_state.lock().unwrap();
 
@@ -3490,10 +3494,10 @@ impl NodeState {
             let gpu_util_trusted = state.gpu_util_trusted && gpu_usable;
 
             // Prune bookkeeping for instances no longer holding a slot.
-            let live: HashSet<&String> = candidates.iter().map(|(id, _, _)| id).collect();
+            let live: HashSet<&String> = candidates.iter().map(|(id, _, _, _)| id).collect();
             state.per_instance.retain(|id, _| live.contains(id));
 
-            for (id, pid, in_flight) in &candidates {
+            for (id, pid, in_flight, last_activity) in &candidates {
                 let busy_now = cpu_now.get(id).copied().flatten();
 
                 // CPU rate against the previous sample for this exact pid.
@@ -3515,8 +3519,16 @@ impl NodeState {
                 let verdict = evaluate_wedge(&WedgeInputs {
                     in_flight: *in_flight,
                     cpu_busy_cores: cpu_busy,
-                    gpu_sm_util: gpu_util.get(pid).copied(),
+                    // On a degraded sweep, suppress per-pid readings entirely: a
+                    // Some(low) from a working device could otherwise mask a busy
+                    // process on a device whose query failed (multi-GPU node).
+                    gpu_sm_util: if gpu_usable {
+                        gpu_util.get(pid).copied()
+                    } else {
+                        None
+                    },
                     gpu_present,
+                    cpu_only: self.config.wedge_detector.cpu_only,
                     gpu_util_trusted,
                     cpu_eps_cores: CPU_EPS_CORES,
                     gpu_eps_util: GPU_EPS_UTIL,
@@ -3542,7 +3554,7 @@ impl NodeState {
                         let since = *st.wedged_since.get_or_insert(now);
                         let wedged_for = now.duration_since(since);
                         if wedged_for >= window {
-                            to_kill.push((id.clone(), *pid, wedged_for, *in_flight));
+                            to_kill.push((id.clone(), *pid, wedged_for, *last_activity));
                         }
                     }
                     WedgeVerdict::NotWedged => {
@@ -3559,8 +3571,8 @@ impl NodeState {
         }
 
         // 4. Stop the confirmed-wedged instances (escalates to the write lock).
-        for (id, pid, wedged_for, sampled_in_flight) in to_kill {
-            self.kill_wedged_instance(&id, pid, wedged_for, sampled_in_flight)
+        for (id, pid, wedged_for, sampled_last_activity) in to_kill {
+            self.kill_wedged_instance(&id, pid, wedged_for, sampled_last_activity)
                 .await;
         }
     }
@@ -3574,7 +3586,7 @@ impl NodeState {
         id: &str,
         expected_pid: u32,
         wedged_for: Duration,
-        sampled_in_flight: usize,
+        sampled_last_activity: Instant,
     ) {
         let inst_lock = {
             let mut instances = self.instances.write().await;
@@ -3582,17 +3594,17 @@ impl NodeState {
                 return; // already gone
             };
             // Re-verify under the write lock: still the same process, still
-            // holding a slot, and no *additional* request was assigned since the
-            // wedge sample. If the slot count rose, a fresh request grabbed the
-            // instance after the sample — its work is not described by the stale
-            // wedge verdict — so back off and let the next cycle re-confirm. A
-            // count that held steady or fell still describes the same wedge.
+            // holding a slot, and the same request is still on it. `last_activity`
+            // is stamped on every new slot assignment, so if it advanced, the
+            // wedged request was released and fresh work took the instance (even
+            // if the slot count is unchanged) — its work is not described by the
+            // stale wedge verdict, so back off and let the next cycle re-confirm.
             let (still_wedged, port) = {
                 let inst = inst_lock.read().await;
                 (
                     inst.in_flight_requests > 0
-                        && inst.in_flight_requests <= sampled_in_flight
-                        && inst.get_pid() == Some(expected_pid),
+                        && inst.get_pid() == Some(expected_pid)
+                        && inst.last_activity == sampled_last_activity,
                     inst.port,
                 )
             };

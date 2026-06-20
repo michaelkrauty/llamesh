@@ -37,8 +37,16 @@ pub struct WedgeInputs {
     /// `None` is therefore ambiguous and is resolved using `gpu_present` /
     /// `gpu_util_trusted` below.
     pub gpu_sm_util: Option<u32>,
-    /// Whether this node has a working NVML handle at all (i.e. has a GPU).
+    /// Whether this node has at least one visible NVML (NVIDIA) GPU. When
+    /// false the node may still have a non-NVIDIA GPU (Metal/ROCm/Vulkan) whose
+    /// activity we cannot see, so idle CPU alone is not proof of a wedge unless
+    /// `cpu_only` is asserted.
     pub gpu_present: bool,
+    /// Operator assertion that this node runs inference on CPU only (no GPU of
+    /// any vendor). Only then does idle CPU while holding a slot, with no NVML
+    /// GPU present, count as a wedge. Defaults off so a node with a non-NVIDIA
+    /// GPU is never wrongly flagged.
+    pub cpu_only: bool,
     /// Whether per-process GPU utilization has been observed working on this
     /// node at least once (some process reported `sm_util > GPU_EPS_UTIL`).
     /// Until proven, a `None` reading on a GPU node is untrustworthy — the
@@ -94,18 +102,26 @@ pub fn evaluate_wedge(i: &WedgeInputs) -> WedgeVerdict {
         }
         // No per-process GPU reading for this pid.
         None => {
-            if !i.gpu_present {
-                // CPU-only node: there is no GPU to do the work, so an idle CPU
-                // while holding a slot is itself the wedge signal.
-                WedgeVerdict::WedgedThisTick
-            } else if i.gpu_util_trusted {
-                // GPU node where per-process util is known to work: absence from
-                // the sample means genuinely zero GPU activity → wedged.
+            if i.gpu_present {
+                if i.gpu_util_trusted {
+                    // NVIDIA GPU node where per-process util is known to work and
+                    // this tick's sweep was usable: absence means genuinely zero
+                    // GPU activity → wedged.
+                    WedgeVerdict::WedgedThisTick
+                } else {
+                    // Per-process util has not proven itself (or the sweep was
+                    // degraded): an absent reading is not trustworthy, so do not
+                    // flag on CPU alone.
+                    WedgeVerdict::NotWedged
+                }
+            } else if i.cpu_only {
+                // Operator asserts no GPU does inference here, so idle CPU while
+                // holding a slot is itself the wedge signal.
                 WedgeVerdict::WedgedThisTick
             } else {
-                // GPU node where we have never seen per-process util report a
-                // busy process: the signal may be unavailable on this hardware,
-                // so absence is not trustworthy. Do not flag on CPU alone.
+                // No NVML GPU and no CPU-only assertion: a non-NVIDIA GPU could
+                // be doing the work invisibly, so idle CPU is not proof of a
+                // wedge.
                 WedgeVerdict::NotWedged
             }
         }
@@ -135,18 +151,21 @@ pub fn cpu_busy_cores(
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn inputs(
         in_flight: usize,
         cpu: Option<f64>,
         gpu: Option<u32>,
         gpu_present: bool,
         gpu_util_trusted: bool,
+        cpu_only: bool,
     ) -> WedgeInputs {
         WedgeInputs {
             in_flight,
             cpu_busy_cores: cpu,
             gpu_sm_util: gpu,
             gpu_present,
+            cpu_only,
             gpu_util_trusted,
             cpu_eps_cores: CPU_EPS_CORES,
             gpu_eps_util: GPU_EPS_UTIL,
@@ -158,11 +177,11 @@ mod tests {
         // Even flat 0/0 on a trusted GPU node: an idle instance holding no slot
         // is expected to be quiet and must never be flagged.
         assert_eq!(
-            evaluate_wedge(&inputs(0, Some(0.0), Some(0), true, true)),
+            evaluate_wedge(&inputs(0, Some(0.0), Some(0), true, true, false)),
             WedgeVerdict::NotWedged
         );
         assert_eq!(
-            evaluate_wedge(&inputs(0, None, None, false, false)),
+            evaluate_wedge(&inputs(0, None, None, false, false, false)),
             WedgeVerdict::NotWedged
         );
     }
@@ -170,11 +189,11 @@ mod tests {
     #[test]
     fn first_tick_without_cpu_delta_is_not_wedged() {
         assert_eq!(
-            evaluate_wedge(&inputs(1, None, Some(0), true, true)),
+            evaluate_wedge(&inputs(1, None, Some(0), true, true, false)),
             WedgeVerdict::NotWedged
         );
         assert_eq!(
-            evaluate_wedge(&inputs(1, None, None, false, false)),
+            evaluate_wedge(&inputs(1, None, None, false, false, false)),
             WedgeVerdict::NotWedged
         );
     }
@@ -183,11 +202,11 @@ mod tests {
     fn busy_cpu_is_not_wedged() {
         // CPU above epsilon → working, regardless of the GPU signal.
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(2.5), Some(0), true, true)),
+            evaluate_wedge(&inputs(1, Some(2.5), Some(0), true, true, false)),
             WedgeVerdict::NotWedged
         );
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.5), None, false, false)),
+            evaluate_wedge(&inputs(1, Some(0.5), None, false, false, false)),
             WedgeVerdict::NotWedged
         );
     }
@@ -196,7 +215,7 @@ mod tests {
     fn gpu_busy_with_idle_cpu_is_not_wedged() {
         // The critical false-positive guard: a GPU-bound decode (CPU idle, GPU hot).
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.0), Some(45), true, true)),
+            evaluate_wedge(&inputs(1, Some(0.0), Some(45), true, true, false)),
             WedgeVerdict::NotWedged
         );
     }
@@ -205,7 +224,7 @@ mod tests {
     fn flat_cpu_and_gpu_on_gpu_node_is_wedged() {
         // The textbook fingerprint: holds a slot, CPU idle, a real GPU reading of 0.
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.0), Some(0), true, true)),
+            evaluate_wedge(&inputs(1, Some(0.0), Some(0), true, true, false)),
             WedgeVerdict::WedgedThisTick
         );
     }
@@ -214,11 +233,18 @@ mod tests {
     fn gpu_eps_boundary() {
         // At/below the GPU epsilon counts as idle; just above counts as busy.
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.0), Some(GPU_EPS_UTIL), true, true)),
+            evaluate_wedge(&inputs(1, Some(0.0), Some(GPU_EPS_UTIL), true, true, false)),
             WedgeVerdict::WedgedThisTick
         );
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.0), Some(GPU_EPS_UTIL + 1), true, true)),
+            evaluate_wedge(&inputs(
+                1,
+                Some(0.0),
+                Some(GPU_EPS_UTIL + 1),
+                true,
+                true,
+                false
+            )),
             WedgeVerdict::NotWedged
         );
     }
@@ -227,21 +253,39 @@ mod tests {
     fn cpu_eps_boundary() {
         // Exactly at the CPU epsilon is still "idle" (<=); just above is "busy".
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(CPU_EPS_CORES), Some(0), true, true)),
+            evaluate_wedge(&inputs(1, Some(CPU_EPS_CORES), Some(0), true, true, false)),
             WedgeVerdict::WedgedThisTick
         );
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(CPU_EPS_CORES + 1e-9), Some(0), true, true)),
+            evaluate_wedge(&inputs(
+                1,
+                Some(CPU_EPS_CORES + 1e-9),
+                Some(0),
+                true,
+                true,
+                false
+            )),
             WedgeVerdict::NotWedged
         );
     }
 
     #[test]
     fn cpu_only_node_flat_cpu_is_wedged() {
-        // No GPU present: idle CPU while holding a slot is the wedge signal.
+        // No NVML GPU and the operator asserts cpu_only: idle CPU while holding
+        // a slot is the wedge signal.
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.0), None, false, false)),
+            evaluate_wedge(&inputs(1, Some(0.0), None, false, false, true)),
             WedgeVerdict::WedgedThisTick
+        );
+    }
+
+    #[test]
+    fn no_nvml_without_cpu_only_assertion_is_not_wedged() {
+        // No NVML GPU and cpu_only NOT asserted: a non-NVIDIA GPU (Metal/ROCm/
+        // Vulkan) could be doing the work invisibly, so idle CPU is not proof.
+        assert_eq!(
+            evaluate_wedge(&inputs(1, Some(0.0), None, false, false, false)),
+            WedgeVerdict::NotWedged
         );
     }
 
@@ -249,7 +293,7 @@ mod tests {
     fn gpu_node_with_untrusted_util_does_not_flag_on_cpu_alone() {
         // GPU present but per-process util never proven working: None is ambiguous.
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.0), None, true, false)),
+            evaluate_wedge(&inputs(1, Some(0.0), None, true, false, false)),
             WedgeVerdict::NotWedged
         );
     }
@@ -258,7 +302,7 @@ mod tests {
     fn gpu_node_with_trusted_util_flags_absent_pid() {
         // GPU present, util proven working, pid absent from the sample → idle GPU.
         assert_eq!(
-            evaluate_wedge(&inputs(1, Some(0.0), None, true, true)),
+            evaluate_wedge(&inputs(1, Some(0.0), None, true, true, false)),
             WedgeVerdict::WedgedThisTick
         );
     }

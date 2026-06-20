@@ -95,6 +95,13 @@ pub struct WedgeDetectorConfig {
     /// How often (ms) the watchdog samples instance activity.
     #[serde(default = "default_wedge_sample_interval_ms")]
     pub sample_interval_ms: u64,
+    /// Assert that this node runs inference on CPU only (no GPU of any vendor).
+    /// Only then is idle CPU, on a node with no NVIDIA/NVML GPU, treated as a
+    /// wedge. Leave false on any node with a GPU — including non-NVIDIA GPUs
+    /// (Metal/ROCm/Vulkan) whose activity NVML cannot see — so a healthy
+    /// GPU-bound decode (which can sit near 0% CPU) is never wrongly flagged.
+    #[serde(default)]
+    pub cpu_only: bool,
 }
 
 impl Default for WedgeDetectorConfig {
@@ -103,6 +110,7 @@ impl Default for WedgeDetectorConfig {
             enabled: false,
             window_ms: default_wedge_window_ms(),
             sample_interval_ms: default_wedge_sample_interval_ms(),
+            cpu_only: false,
         }
     }
 }
@@ -360,15 +368,9 @@ impl NodeConfig {
                      and would spin the sampler. Set a positive interval (e.g. 5000)."
                 ));
             }
-            if self.wedge_detector.sample_interval_ms > self.wedge_detector.window_ms {
-                return Err(anyhow::anyhow!(
-                    "wedge_detector.sample_interval_ms ({}) is greater than window_ms ({}); the \
-                     watchdog samples less often than the window it must confirm, so it could \
-                     never observe a sustained wedge. Set sample_interval_ms <= window_ms.",
-                    self.wedge_detector.sample_interval_ms,
-                    self.wedge_detector.window_ms
-                ));
-            }
+            // A sample interval larger than the window is allowed: it does not
+            // make confirmation impossible, it only raises detection latency
+            // (the sustained-wedge check still accumulates across samples).
         }
 
         Ok(())
@@ -1438,13 +1440,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_wedge_sample_interval_above_window() {
-        // Sampling coarser than the window can never confirm a sustained wedge.
+    fn validate_accepts_wedge_sample_interval_above_window() {
+        // A coarse interval only raises detection latency; it does not make a
+        // sustained wedge unobservable, so it is valid.
         let mut config = config_with_ports(None);
         config.wedge_detector.enabled = true;
         config.wedge_detector.window_ms = 5_000;
         config.wedge_detector.sample_interval_ms = 10_000;
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1746,6 +1749,7 @@ models:
             default_upstream_read_timeout_ms()
         );
         assert!(!config.wedge_detector.enabled);
+        assert!(!config.wedge_detector.cpu_only);
         assert_eq!(config.wedge_detector.window_ms, default_wedge_window_ms());
         assert_eq!(
             config.wedge_detector.sample_interval_ms,
