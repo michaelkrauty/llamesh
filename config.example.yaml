@@ -91,7 +91,9 @@ upstream_read_timeout_ms: 0
 # active generation (CPU/GPU busy) apart from a true hang (both flat), so it
 # never aborts legitimate work. Per-process GPU utilization (NVML) is hardware-
 # dependent, so the watchdog is opt-in; enable it on nodes that have exhibited
-# stuck slots and complement it with upstream_read_timeout_ms.
+# stuck slots and complement it with upstream_read_timeout_ms. Note: a streaming
+# response stays "active" only while its client keeps consuming; raise window_ms
+# if you serve very long streams to clients that may pause for many minutes.
 wedge_detector:
   enabled: false # (default: false) opt-in; not run at all when disabled
   window_ms: 600000 # (default: 600000) sustained no-activity time before a kill

@@ -165,9 +165,15 @@ impl MemorySampler {
         (vram, sysmem)
     }
 
-    /// Whether NVIDIA GPU telemetry (NVML) is available on this node.
+    /// Whether this node has at least one visible NVIDIA GPU via NVML. Requires
+    /// a device to actually be present, not merely a usable NVML library: a
+    /// CPU-only host that still has the NVML library/driver returns zero
+    /// devices, and must take the CPU-only activity path, not the GPU one.
     pub fn has_gpu(&self) -> bool {
-        self.nvml.is_some()
+        self.nvml
+            .as_ref()
+            .and_then(|nvml| nvml.device_count().ok())
+            .is_some_and(|count| count > 0)
     }
 
     /// Cumulative CPU busy time (`utime + stime`, in clock ticks) for a process.

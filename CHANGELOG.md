@@ -26,7 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Unlike a wall-clock timeout, the activity signal distinguishes a slow-but-
   active generation (CPU or GPU busy) from a true hang (both flat), so it never
   aborts a legitimately long or non-streaming request; a GPU-bound decode
-  reports `sm_util > 0` and is never flagged. On a GPU node an absent
+  reports `sm_util > 0` and is never flagged. A streaming response stays active
+  as long as its client keeps consuming (each chunk drives more generation);
+  only a stream whose client consumes nothing for the full window is treated as
+  wedged. On a GPU node an absent
   per-process GPU reading is trusted as "idle" only after per-process
   utilization has been observed working on that node at least once; on a
   CPU-only node, idle CPU while holding a slot is the signal. Disabled by

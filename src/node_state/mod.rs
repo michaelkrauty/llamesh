@@ -3469,8 +3469,9 @@ impl NodeState {
         let window = Duration::from_millis(self.config.wedge_detector.window_ms);
         let now = Instant::now();
 
-        // 3. Decide per instance under the leaf lock; collect confirmed kills.
-        let mut to_kill: Vec<(String, u32, Duration)> = Vec::new();
+        // 3. Decide per instance under the leaf lock; collect confirmed kills
+        //    along with the slot count observed this tick (for a TOCTOU recheck).
+        let mut to_kill: Vec<(String, u32, Duration, usize)> = Vec::new();
         {
             let mut state = self.wedge_state.lock().unwrap();
 
@@ -3541,7 +3542,7 @@ impl NodeState {
                         let since = *st.wedged_since.get_or_insert(now);
                         let wedged_for = now.duration_since(since);
                         if wedged_for >= window {
-                            to_kill.push((id.clone(), *pid, wedged_for));
+                            to_kill.push((id.clone(), *pid, wedged_for, *in_flight));
                         }
                     }
                     WedgeVerdict::NotWedged => {
@@ -3558,8 +3559,9 @@ impl NodeState {
         }
 
         // 4. Stop the confirmed-wedged instances (escalates to the write lock).
-        for (id, pid, wedged_for) in to_kill {
-            self.kill_wedged_instance(&id, pid, wedged_for).await;
+        for (id, pid, wedged_for, sampled_in_flight) in to_kill {
+            self.kill_wedged_instance(&id, pid, wedged_for, sampled_in_flight)
+                .await;
         }
     }
 
@@ -3567,26 +3569,37 @@ impl NodeState {
     /// `check_idle_instances`: re-verify under the write lock (it may have
     /// recovered or respawned since the sample), remove it from the map,
     /// release its port, then stop the process and wake any queued waiters.
-    async fn kill_wedged_instance(&self, id: &str, expected_pid: u32, wedged_for: Duration) {
+    async fn kill_wedged_instance(
+        &self,
+        id: &str,
+        expected_pid: u32,
+        wedged_for: Duration,
+        sampled_in_flight: usize,
+    ) {
         let inst_lock = {
             let mut instances = self.instances.write().await;
             let Some(inst_lock) = instances.get(id).cloned() else {
                 return; // already gone
             };
-            // Re-verify under the write lock: still the same process, and still
-            // holding a slot. If the request completed (slot released) or the
-            // instance respawned between the sample and now, leave it alone.
+            // Re-verify under the write lock: still the same process, still
+            // holding a slot, and no *additional* request was assigned since the
+            // wedge sample. If the slot count rose, a fresh request grabbed the
+            // instance after the sample — its work is not described by the stale
+            // wedge verdict — so back off and let the next cycle re-confirm. A
+            // count that held steady or fell still describes the same wedge.
             let (still_wedged, port) = {
                 let inst = inst_lock.read().await;
                 (
-                    inst.in_flight_requests > 0 && inst.get_pid() == Some(expected_pid),
+                    inst.in_flight_requests > 0
+                        && inst.in_flight_requests <= sampled_in_flight
+                        && inst.get_pid() == Some(expected_pid),
                     inst.port,
                 )
             };
             if !still_wedged {
                 info!(
                     instance_id = %id,
-                    "Wedged instance recovered or respawned before kill; skipping"
+                    "Wedged instance recovered, respawned, or took new work before kill; skipping"
                 );
                 return;
             }
