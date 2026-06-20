@@ -396,7 +396,19 @@ impl NodeState {
         build_manager: BuildManager,
     ) -> Result<Self> {
         let cluster_client = security::build_cluster_client(&config.cluster_tls)?;
-        let http_client = reqwest::Client::builder().build()?;
+        // `read_timeout` bounds inactivity (silence) from a local llama-server,
+        // not total duration: reqwest resets it on every received chunk, so a
+        // slow-but-active stream is unaffected while a stalled upstream (which
+        // would otherwise hold its in-flight slot forever and block graceful
+        // drain) is aborted. 0 disables it.
+        let http_client = {
+            let mut builder = reqwest::Client::builder();
+            if config.upstream_read_timeout_ms > 0 {
+                builder =
+                    builder.read_timeout(Duration::from_millis(config.upstream_read_timeout_ms));
+            }
+            builder.build()?
+        };
 
         let metrics = Metrics::load(std::path::Path::new(&config.metrics_path)).await;
         let model_index = Arc::new(ModelIndex::new(&cookbook));
@@ -3788,6 +3800,7 @@ mod tests {
             max_hops: 10,
             logging: None,
             max_total_queue_entries: 0,
+            upstream_read_timeout_ms: 600_000,
         }
     }
 

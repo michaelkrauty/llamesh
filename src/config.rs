@@ -52,6 +52,20 @@ pub struct NodeConfig {
     /// 0 = no global limit (only per-model limits apply).
     #[serde(default = "default_max_total_queue_entries")]
     pub max_total_queue_entries: usize,
+    /// Inactivity (read) timeout in milliseconds for outbound requests to a
+    /// local `llama-server` instance. A stalled upstream (one that accepted the
+    /// request then stops sending, e.g. a hung instance at 0% CPU) otherwise
+    /// holds its in-flight slot forever, which can hang a graceful drain. reqwest
+    /// resets this on every received chunk, so for a streaming response it bounds
+    /// silence between tokens without affecting an actively-streaming generation.
+    /// Disabled by default (`0`): the timer also covers the wait for the first
+    /// body bytes — and for `stream: false` the body arrives only when generation
+    /// finishes — so any non-zero value shorter than a request's full generation
+    /// time would abort a legitimate long or non-streaming request. Enable it
+    /// (a positive ms) when requests stream tokens regularly and stalled
+    /// upstreams should be bounded.
+    #[serde(default = "default_upstream_read_timeout_ms")]
+    pub upstream_read_timeout_ms: u64,
 }
 
 fn default_shutdown_grace_period_seconds() -> u64 {
@@ -64,6 +78,11 @@ fn default_max_hops() -> usize {
 
 fn default_max_total_queue_entries() -> usize {
     0 // 0 = no global limit (only per-model limits apply)
+}
+
+fn default_upstream_read_timeout_ms() -> u64 {
+    0 // disabled by default; a non-zero default would abort legitimate long /
+      // non-streaming requests (see the field doc). Opt in per deployment.
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1075,6 +1094,7 @@ mod tests {
             max_hops: 10,
             logging: None,
             max_total_queue_entries: 0,
+            upstream_read_timeout_ms: 600_000,
         };
 
         assert!(config.validate().is_err());
@@ -1132,6 +1152,7 @@ mod tests {
             max_hops: 10,
             logging: None,
             max_total_queue_entries: 0,
+            upstream_read_timeout_ms: 600_000,
         }
     }
 
@@ -1590,6 +1611,10 @@ models:
         assert_eq!(config.llama_cpp.repo_path, default_repo_path());
         assert_eq!(config.llama_cpp.build_path, default_build_path());
         assert_eq!(config.llama_cpp.binary_path, default_binary_path());
+        assert_eq!(
+            config.upstream_read_timeout_ms,
+            default_upstream_read_timeout_ms()
+        );
 
         let cookbook =
             load_cookbook(Path::new("cookbook.example.yaml")).expect("cookbook.example.yaml loads");

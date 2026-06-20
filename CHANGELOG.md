@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.7] - 2026-06-20
+
+### Added
+
+- New `upstream_read_timeout_ms` option: an inactivity (read) timeout for
+  outbound requests to a local `llama-server`. A stalled upstream — one that
+  accepts a request and then goes silent (connection held open, no further
+  bytes) — otherwise holds its in-flight slot forever, so `current_requests`
+  never returns to zero and a graceful drain can hang until the process is
+  killed by hand. With this set, the request is aborted after the configured
+  silence and the slot is released. It is a per-chunk timer (reqwest resets it
+  on every response chunk), so an actively-streaming generation is unaffected.
+  Disabled by default (`0`): the timer also covers the wait for the first body
+  bytes, and a `stream: false` response only arrives once generation finishes,
+  so a non-zero value shorter than a request's full generation time would abort
+  a legitimate request — enable it only for deployments whose requests stream
+  tokens regularly. The cluster peer-forward paths share the exposure and are
+  tracked separately.
+
 ## [1.18.6] - 2026-06-19
 
 ### Fixed
