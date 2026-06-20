@@ -66,6 +66,61 @@ pub struct NodeConfig {
     /// upstreams should be bounded.
     #[serde(default = "default_upstream_read_timeout_ms")]
     pub upstream_read_timeout_ms: u64,
+    /// Activity-based watchdog for hung local `llama-server` instances. A
+    /// request whose instance accepts it then goes silent — flat at ~0% CPU and
+    /// ~0% GPU while still holding its slot — otherwise pins that slot forever,
+    /// stalling graceful drain and idle eviction. When enabled, a background
+    /// task samples per-process CPU and GPU utilization and, after an instance
+    /// has shown no activity while holding a slot for `window_ms`, stops it so
+    /// the stuck request errors out and the slot is released. Disabled by
+    /// default; complements (does not replace) `upstream_read_timeout_ms`.
+    #[serde(default)]
+    pub wedge_detector: WedgeDetectorConfig,
+}
+
+/// Configuration for the wedged-instance watchdog (see `wedge_detector`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct WedgeDetectorConfig {
+    /// Whether the watchdog runs. Off by default: it kills instances, and the
+    /// per-process GPU-utilization signal it relies on is hardware-dependent, so
+    /// it is opt-in per deployment.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long (ms) an instance must continuously show no CPU and no GPU
+    /// activity while holding a request slot before it is judged wedged and
+    /// stopped. Kept generous so a legitimately long prefill or a slow-but-
+    /// active generation is never mistaken for a hang.
+    #[serde(default = "default_wedge_window_ms")]
+    pub window_ms: u64,
+    /// How often (ms) the watchdog samples instance activity.
+    #[serde(default = "default_wedge_sample_interval_ms")]
+    pub sample_interval_ms: u64,
+    /// Assert that this node runs inference on CPU only (no GPU of any vendor).
+    /// Only then is idle CPU, on a node with no NVIDIA/NVML GPU, treated as a
+    /// wedge. Leave false on any node with a GPU — including non-NVIDIA GPUs
+    /// (Metal/ROCm/Vulkan) whose activity NVML cannot see — so a healthy
+    /// GPU-bound decode (which can sit near 0% CPU) is never wrongly flagged.
+    #[serde(default)]
+    pub cpu_only: bool,
+}
+
+impl Default for WedgeDetectorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_ms: default_wedge_window_ms(),
+            sample_interval_ms: default_wedge_sample_interval_ms(),
+            cpu_only: false,
+        }
+    }
+}
+
+fn default_wedge_window_ms() -> u64 {
+    600_000 // 10 minutes: longer than any plausible single-token gap or prefill.
+}
+
+fn default_wedge_sample_interval_ms() -> u64 {
+    5_000
 }
 
 fn default_shutdown_grace_period_seconds() -> u64 {
@@ -290,6 +345,32 @@ impl NodeConfig {
                  every connection's protocol detection would time out. Set a positive timeout, \
                  or omit it for the default."
             ));
+        }
+
+        // Validate the wedged-instance watchdog tuning, but only when it is
+        // enabled: the fields have defaults, so a disabled watchdog with stray
+        // zeros is harmless (the task never runs). A zero millisecond value
+        // elapses immediately rather than meaning "disabled", and a sampling
+        // interval coarser than the window can never accumulate enough no-
+        // activity samples to confirm a wedge — both deserialize cleanly but
+        // break the watchdog at runtime.
+        if self.wedge_detector.enabled {
+            if self.wedge_detector.window_ms == 0 {
+                return Err(anyhow::anyhow!(
+                    "wedge_detector.window_ms is 0; a zero window would flag an instance as \
+                     wedged on its first no-activity sample, killing legitimately-idle-between-\
+                     tokens instances. Set a positive window (e.g. 600000 for 10 minutes)."
+                ));
+            }
+            if self.wedge_detector.sample_interval_ms == 0 {
+                return Err(anyhow::anyhow!(
+                    "wedge_detector.sample_interval_ms is 0; a zero interval elapses immediately \
+                     and would spin the sampler. Set a positive interval (e.g. 5000)."
+                ));
+            }
+            // A sample interval larger than the window is allowed: it does not
+            // make confirmation impossible, it only raises detection latency
+            // (the sustained-wedge check still accumulates across samples).
         }
 
         Ok(())
@@ -1095,6 +1176,7 @@ mod tests {
             logging: None,
             max_total_queue_entries: 0,
             upstream_read_timeout_ms: 600_000,
+            wedge_detector: WedgeDetectorConfig::default(),
         };
 
         assert!(config.validate().is_err());
@@ -1153,6 +1235,7 @@ mod tests {
             logging: None,
             max_total_queue_entries: 0,
             upstream_read_timeout_ms: 600_000,
+            wedge_detector: WedgeDetectorConfig::default(),
         }
     }
 
@@ -1325,6 +1408,56 @@ mod tests {
         let mut config = config_with_cluster(false, 5, 16);
         config.cluster.circuit_breaker.failure_threshold = 0;
         config.cluster.circuit_breaker.open_duration_base_ms = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_valid_wedge_detector_when_enabled() {
+        let mut config = config_with_ports(None);
+        config.wedge_detector.enabled = true;
+        config.wedge_detector.window_ms = 600_000;
+        config.wedge_detector.sample_interval_ms = 5_000;
+        assert!(config.validate().is_ok());
+        // Equal interval and window is the boundary and is accepted.
+        config.wedge_detector.sample_interval_ms = 600_000;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_wedge_window_ms_when_enabled() {
+        let mut config = config_with_ports(None);
+        config.wedge_detector.enabled = true;
+        config.wedge_detector.window_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_wedge_sample_interval_when_enabled() {
+        let mut config = config_with_ports(None);
+        config.wedge_detector.enabled = true;
+        config.wedge_detector.sample_interval_ms = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_wedge_sample_interval_above_window() {
+        // A coarse interval only raises detection latency; it does not make a
+        // sustained wedge unobservable, so it is valid.
+        let mut config = config_with_ports(None);
+        config.wedge_detector.enabled = true;
+        config.wedge_detector.window_ms = 5_000;
+        config.wedge_detector.sample_interval_ms = 10_000;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_ignores_wedge_detector_tuning_when_disabled() {
+        // The watchdog never runs when disabled, so stray zeros must not be
+        // rejected (avoids breaking configs that leave the block at defaults).
+        let mut config = config_with_ports(None);
+        config.wedge_detector.enabled = false;
+        config.wedge_detector.window_ms = 0;
+        config.wedge_detector.sample_interval_ms = 0;
         assert!(config.validate().is_ok());
     }
 
@@ -1614,6 +1747,13 @@ models:
         assert_eq!(
             config.upstream_read_timeout_ms,
             default_upstream_read_timeout_ms()
+        );
+        assert!(!config.wedge_detector.enabled);
+        assert!(!config.wedge_detector.cpu_only);
+        assert_eq!(config.wedge_detector.window_ms, default_wedge_window_ms());
+        assert_eq!(
+            config.wedge_detector.sample_interval_ms,
+            default_wedge_sample_interval_ms()
         );
 
         let cookbook =

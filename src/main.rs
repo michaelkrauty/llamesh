@@ -18,6 +18,7 @@ mod protocol_detect;
 mod router;
 mod security;
 mod util;
+mod wedge_detector;
 
 use clap::Parser;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -475,6 +476,30 @@ async fn main() -> anyhow::Result<()> {
                         drain_state.drain_instances_for_binary_update().await;
                         last_gen = current_gen;
                     }
+                }
+            }
+            .instrument(span.clone()),
+        );
+    }
+
+    // Wedged-instance watchdog — stops a local instance that holds a request
+    // slot while flat at ~0% CPU and ~0% GPU (a hung upstream), releasing the
+    // stuck slot. Opt-in; not spawned at all when disabled (zero overhead).
+    if node_state.config.wedge_detector.enabled {
+        let detector_state = node_state.clone();
+        let interval_ms = node_state.config.wedge_detector.sample_interval_ms;
+        info!(
+            window_ms = node_state.config.wedge_detector.window_ms,
+            sample_interval_ms = interval_ms,
+            "Wedged-instance watchdog enabled"
+        );
+        tokio::spawn(
+            async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    detector_state.detect_and_kill_wedged_instances().await;
                 }
             }
             .instrument(span.clone()),

@@ -81,6 +81,29 @@ max_total_queue_entries: 0
 # positive value (e.g. 600000) only if your requests stream tokens regularly.
 upstream_read_timeout_ms: 0
 
+# Wedged-instance watchdog. A request whose llama-server accepts it then goes
+# silent — flat at ~0% CPU and ~0% GPU while still holding its slot — pins that
+# slot forever, stalling graceful drain and idle eviction (the same hang
+# upstream_read_timeout_ms bounds per-request). When enabled, a background task
+# samples per-process CPU and GPU utilization and, after an instance has shown
+# no activity while holding a slot for window_ms, stops it so the stuck request
+# errors out and the slot is released. Unlike a timeout it tells a slow-but-
+# active generation (CPU/GPU busy) apart from a true hang (both flat), so it
+# never aborts legitimate work. Per-process GPU utilization (NVML) is hardware-
+# dependent, so the watchdog is opt-in; enable it on nodes that have exhibited
+# stuck slots and complement it with upstream_read_timeout_ms. Note: a streaming
+# response stays "active" only while its client keeps consuming; raise window_ms
+# if you serve very long streams to clients that may pause for many minutes.
+wedge_detector:
+  enabled: false # (default: false) opt-in; not run at all when disabled
+  window_ms: 600000 # (default: 600000) sustained no-activity time before a kill
+  sample_interval_ms: 5000 # (default: 5000) how often activity is sampled
+  # Assert this node runs inference on CPU only (no GPU of any vendor). Only then
+  # is idle CPU, with no NVIDIA/NVML GPU present, treated as a wedge. Leave false
+  # on any node with a GPU — including non-NVIDIA GPUs (Metal/ROCm/Vulkan) whose
+  # activity NVML cannot see — so a healthy GPU decode is never wrongly flagged.
+  cpu_only: false # (default: false)
+
 # -----------------------------------------------------------------------------
 # llama-server Port Allocation
 # -----------------------------------------------------------------------------

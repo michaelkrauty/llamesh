@@ -189,6 +189,10 @@ pub struct Metrics {
     /// (`max_total_queue_entries`) was reached. Cumulative; persisted across
     /// restarts.
     pub queue_drops_global_limit: AtomicU64,
+    /// Local instances stopped by the wedged-instance watchdog because they
+    /// held a request slot while flat at ~0% CPU and ~0% GPU. Cumulative;
+    /// persisted across restarts.
+    pub wedged_instances_killed_total: AtomicU64,
 
     // Per-hash metrics: args_hash -> HashMetrics
     pub hash_metrics: RwLock<HashMap<String, Arc<HashMetrics>>>,
@@ -253,6 +257,11 @@ pub struct MetricsSnapshot {
     pub queue_drops_timeout: u64,
     #[serde(default)]
     pub queue_drops_global_limit: u64,
+    /// Local instances stopped by the wedged-instance watchdog. Cumulative
+    /// counter, restored on load like the queue-drop counters.
+    /// `#[serde(default)]` keeps snapshots written by older versions loadable.
+    #[serde(default)]
+    pub wedged_instances_killed_total: u64,
     /// In-flight queue tokens (pending slot reservations awaiting a notified
     /// waiter). Runtime gauge mirrored here so `/metrics/json` matches the
     /// Prometheus `proxy_queue_pending_tokens`; like `queue_length` it starts
@@ -439,6 +448,7 @@ impl Metrics {
             queue_drops_full: AtomicU64::new(snapshot.queue_drops_full),
             queue_drops_timeout: AtomicU64::new(snapshot.queue_drops_timeout),
             queue_drops_global_limit: AtomicU64::new(snapshot.queue_drops_global_limit),
+            wedged_instances_killed_total: AtomicU64::new(snapshot.wedged_instances_killed_total),
             hash_metrics: RwLock::new(map),
             node_llamesh_vram_mb: AtomicU64::new(0),
             node_llamesh_sysmem_mb: AtomicU64::new(0),
@@ -644,6 +654,9 @@ impl Metrics {
             queue_drops_full: self.queue_drops_full.load(Ordering::Relaxed),
             queue_drops_timeout: self.queue_drops_timeout.load(Ordering::Relaxed),
             queue_drops_global_limit: self.queue_drops_global_limit.load(Ordering::Relaxed),
+            wedged_instances_killed_total: self
+                .wedged_instances_killed_total
+                .load(Ordering::Relaxed),
             queue_pending_tokens: self.queue_pending_tokens.load(Ordering::Relaxed),
             queue_wait_total_ms: self.queue_wait_total_ms.load(Ordering::Relaxed),
             queue_wait_count: self.queue_wait_count.load(Ordering::Relaxed),
@@ -860,6 +873,16 @@ pub async fn render_prometheus_with_circuit_breaker(
     out.push_str(&format!(
         "proxy_queue_drops_total{{reason=\"global_limit\"}} {}\n",
         metrics.queue_drops_global_limit.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP proxy_wedged_instances_killed_total Local instances stopped by the wedged-instance watchdog.\n",
+    );
+    out.push_str("# TYPE proxy_wedged_instances_killed_total counter\n");
+    out.push_str(&format!(
+        "proxy_wedged_instances_killed_total {}\n",
+        metrics
+            .wedged_instances_killed_total
+            .load(Ordering::Relaxed)
     ));
     out.push_str("# HELP proxy_token_counting_disabled_total Times token counting was disabled.\n");
     out.push_str("# TYPE proxy_token_counting_disabled_total counter\n");
@@ -1238,6 +1261,30 @@ mod tests {
         assert_eq!(snapshot.skipped_stream_cleanups_total, 0);
         // started_at_unix, added in 1.17.0, defaults when absent too.
         assert_eq!(snapshot.started_at_unix, 0);
+        // wedged_instances_killed_total, added in 1.19.0, defaults when absent.
+        assert_eq!(snapshot.wedged_instances_killed_total, 0);
+    }
+
+    #[tokio::test]
+    async fn wedged_instances_killed_counter_round_trips_through_snapshot() {
+        let metrics = Metrics::new();
+        metrics
+            .wedged_instances_killed_total
+            .fetch_add(3, Ordering::Relaxed);
+
+        let snapshot = metrics
+            .snapshot("n".into(), "v".into(), None, 1_700_000_000)
+            .await;
+        assert_eq!(snapshot.wedged_instances_killed_total, 3);
+
+        // Cumulative: survives a restart like the queue-drop counters.
+        let restored = Metrics::from_snapshot(snapshot);
+        assert_eq!(
+            restored
+                .wedged_instances_killed_total
+                .load(Ordering::Relaxed),
+            3
+        );
     }
 
     #[tokio::test]

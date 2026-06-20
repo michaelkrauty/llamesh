@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-06-20
+
+### Added
+
+- New opt-in `wedge_detector` watchdog that stops a local `llama-server`
+  instance which holds a request slot while flat at ~0% CPU and ~0% GPU. A
+  request whose instance accepts it and then goes silent keeps
+  `in_flight_requests > 0` forever: the instance is never idle-evictable
+  (eviction requires no in-flight requests) and the held slot keeps
+  `current_requests > 0`, so a graceful drain hangs until the process is killed
+  by hand. When enabled, a background task samples each Ready, slot-holding
+  instance's per-process CPU (procfs) and GPU (NVML `sm_util`) every
+  `sample_interval_ms`; an instance flat on both while holding a slot
+  continuously for `window_ms` (default 10 minutes) is stopped, which makes the
+  stuck upstream call error out and releases the slot through the normal
+  request-cleanup path — the same effect as an operator killing the PID.
+  Unlike a wall-clock timeout, the activity signal distinguishes a slow-but-
+  active generation (CPU or GPU busy) from a true hang (both flat), so it never
+  aborts a legitimately long or non-streaming request; a GPU-bound decode
+  reports `sm_util > 0` and is never flagged. A streaming response stays active
+  as long as its client keeps consuming (each chunk drives more generation);
+  only a stream whose client consumes nothing for the full window is treated as
+  wedged. On a GPU node an absent
+  per-process GPU reading is trusted as "idle" only after per-process
+  utilization has been observed working on that node at least once and the
+  current NVML sweep is not degraded; a node with no NVML GPU is treated as
+  "GPU activity unknown" (so a non-NVIDIA GPU is never wrongly flagged) unless
+  `wedge_detector.cpu_only` is set to assert the node has no GPU. Disabled by
+  default — the per-process GPU signal is hardware-dependent — and complements
+  `upstream_read_timeout_ms` rather than replacing it. Kills are counted by the
+  new `proxy_wedged_instances_killed_total` metric and logged as
+  `instance_wedged`.
+
 ## [1.18.7] - 2026-06-20
 
 ### Added

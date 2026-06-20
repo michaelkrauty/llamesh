@@ -15,10 +15,13 @@ use crate::instance::{compute_args_hash, Instance, InstanceStatus};
 use crate::memory_sampler::{GpuMemorySnapshot, MemorySampler};
 use crate::metrics::{Metrics, NodeResourceMetricsSnapshot};
 use crate::noise::NoiseContext;
+use crate::wedge_detector::{
+    cpu_busy_cores, evaluate_wedge, WedgeInputs, WedgeVerdict, CPU_EPS_CORES, GPU_EPS_UTIL,
+};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Notify, RwLock};
 use tracing::{error, info, warn};
 use ulid::Ulid;
@@ -56,6 +59,39 @@ pub enum NodeError {
 }
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// Per-instance bookkeeping for the wedged-instance watchdog, keyed by
+/// instance id. Holds the previous CPU sample (to derive a rate) and how long
+/// the instance has continuously looked wedged.
+#[derive(Debug)]
+struct InstanceWedgeState {
+    /// PID the stored CPU reading belongs to. A change means the instance
+    /// respawned, so the previous tick count is stale and must be reset.
+    pid: u32,
+    /// Cumulative CPU busy ticks (`utime + stime`) at the previous sample.
+    prev_busy_ticks: u64,
+    /// When the previous sample was taken, for the true elapsed interval.
+    prev_sample_at: Instant,
+    /// When this instance first looked wedged in the current streak; cleared
+    /// whenever it shows activity. A kill fires once this exceeds `window_ms`.
+    wedged_since: Option<Instant>,
+}
+
+/// Mutable state for the wedged-instance watchdog. One per node, behind a
+/// synchronous leaf mutex held only for the per-tick update (never across an
+/// `.await`).
+#[derive(Debug, Default)]
+struct WedgeDetectorState {
+    per_instance: HashMap<String, InstanceWedgeState>,
+    /// Newest NVML per-process sample timestamp seen so far, passed back as
+    /// `last_seen_ts` next tick so an old activity burst is not re-counted.
+    gpu_last_seen_ts: Option<u64>,
+    /// Whether per-process GPU utilization has ever reported a busy process on
+    /// this node. Until it has, an absent GPU reading on a GPU node is
+    /// untrustworthy (the driver may not surface per-process util on this
+    /// hardware), so the watchdog will not flag on idle CPU alone.
+    gpu_util_trusted: bool,
+}
 
 /// NodeState holds all runtime state for a mesh proxy node.
 ///
@@ -162,6 +198,10 @@ pub struct NodeState {
     /// synchronous leaf mutex, held only for the map read/insert/remove and never
     /// across `.await`, so it is outside the async lock ordering documented above.
     pub logged_peer_versions: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Bookkeeping for the wedged-instance watchdog (`detect_and_kill_wedged_instances`).
+    /// Synchronous leaf mutex, only touched by the single detector task and
+    /// never held across an `.await`, so it is outside the async lock ordering.
+    wedge_state: Arc<std::sync::Mutex<WedgeDetectorState>>,
 }
 
 use crate::security;
@@ -505,6 +545,7 @@ impl NodeState {
             gossip_trigger: Arc::new(Notify::new()),
             peer_pending_forwards: Arc::new(RwLock::new(HashMap::new())),
             logged_peer_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            wedge_state: Arc::new(std::sync::Mutex::new(WedgeDetectorState::default())),
         })
     }
 
@@ -3377,6 +3418,226 @@ impl NodeState {
         Ok(())
     }
 
+    /// Detect and stop local instances that are wedged: holding a request slot
+    /// while flat at ~0% CPU and ~0% GPU. Such an instance can never finish the
+    /// request, so its slot stays pinned forever — stalling graceful drain and
+    /// blocking idle eviction. Stopping the process makes the stuck upstream
+    /// call error out, releasing the slot through the normal request-cleanup
+    /// path (exactly the effect of an operator killing the PID by hand).
+    ///
+    /// Runs as a background task only when `wedge_detector.enabled`; it is out
+    /// of the request hot path entirely, sampling instance activity on its own
+    /// interval and acting only after a sustained no-activity window.
+    pub async fn detect_and_kill_wedged_instances(&self) {
+        // 1. Snapshot Ready, in-flight, local instances and their pids. A still-
+        //    loading instance is excluded so a slow model load is never mistaken
+        //    for a wedge; an instance with no slot held cannot be wedged.
+        let candidates: Vec<(String, u32, usize, Instant)> = {
+            let instances = self.instances.read().await;
+            let mut v = Vec::new();
+            for (id, inst_lock) in instances.iter() {
+                let inst = inst_lock.read().await;
+                if inst.in_flight_requests == 0 || !inst.is_ready() {
+                    continue;
+                }
+                if let Some(pid) = inst.get_pid() {
+                    // last_activity is set on each new slot assignment, so it
+                    // identifies the work that is wedging — captured here to
+                    // re-verify the same request still holds the slot at kill.
+                    v.push((id.clone(), pid, inst.in_flight_requests, inst.last_activity));
+                }
+            }
+            v
+        };
+
+        let gpu_present = self.memory_sampler.has_gpu();
+
+        // 2. Sample activity for the candidate pids with no locks held: CPU is a
+        //    per-pid /proc read; GPU is a single NVML sweep covering all pids.
+        let cpu_now: HashMap<String, Option<u64>> = candidates
+            .iter()
+            .map(|(id, pid, _, _)| (id.clone(), self.memory_sampler.sample_cpu_busy_ticks(*pid)))
+            .collect();
+        let prev_gpu_ts = self.wedge_state.lock().unwrap().gpu_last_seen_ts;
+        let (gpu_util, gpu_new_ts, gpu_usable) =
+            self.memory_sampler.sample_process_gpu_sm_util(prev_gpu_ts);
+        if gpu_present && !gpu_usable && !candidates.is_empty() {
+            tracing::debug!(
+                "Wedge detector: per-process GPU utilization unavailable this tick; \
+                 not treating idle CPU alone as wedged on this GPU node"
+            );
+        }
+
+        let ticks_per_sec = procfs::ticks_per_second();
+        let window = Duration::from_millis(self.config.wedge_detector.window_ms);
+        let now = Instant::now();
+
+        // 3. Decide per instance under the leaf lock; collect confirmed kills
+        //    along with last_activity observed this tick (for a TOCTOU recheck
+        //    that the same request still holds the slot).
+        let mut to_kill: Vec<(String, u32, Duration, Instant)> = Vec::new();
+        {
+            let mut state = self.wedge_state.lock().unwrap();
+
+            if let Some(ts) = gpu_new_ts {
+                state.gpu_last_seen_ts = Some(ts);
+            }
+            if gpu_util.values().any(|&u| u > GPU_EPS_UTIL) {
+                // A busy process surfaced: positive proof per-process GPU util
+                // works on this node, so an absent reading can mean "idle GPU".
+                state.gpu_util_trusted = true;
+            }
+            // Trust an *absent* GPU reading as "idle GPU" only when the signal
+            // has proven itself (latch) AND this tick's sweep was usable. A
+            // degraded driver (a device returning NotSupported/GpuLost) would
+            // otherwise make a CPU-idle but GPU-busy decode read as wedged.
+            let gpu_util_trusted = state.gpu_util_trusted && gpu_usable;
+
+            // Prune bookkeeping for instances no longer holding a slot.
+            let live: HashSet<&String> = candidates.iter().map(|(id, _, _, _)| id).collect();
+            state.per_instance.retain(|id, _| live.contains(id));
+
+            for (id, pid, in_flight, last_activity) in &candidates {
+                let busy_now = cpu_now.get(id).copied().flatten();
+
+                // CPU rate against the previous sample for this exact pid.
+                let cpu_busy = match (state.per_instance.get(id), busy_now) {
+                    (Some(prev), Some(busy)) if prev.pid == *pid => {
+                        let interval = now.duration_since(prev.prev_sample_at).as_secs_f64();
+                        Some(cpu_busy_cores(
+                            busy,
+                            prev.prev_busy_ticks,
+                            ticks_per_sec,
+                            interval,
+                        ))
+                    }
+                    // First observation, respawn (pid changed), or unreadable
+                    // CPU: no usable delta this tick.
+                    _ => None,
+                };
+
+                let verdict = evaluate_wedge(&WedgeInputs {
+                    in_flight: *in_flight,
+                    cpu_busy_cores: cpu_busy,
+                    // On a degraded sweep, suppress per-pid readings entirely: a
+                    // Some(low) from a working device could otherwise mask a busy
+                    // process on a device whose query failed (multi-GPU node).
+                    gpu_sm_util: if gpu_usable {
+                        gpu_util.get(pid).copied()
+                    } else {
+                        None
+                    },
+                    gpu_present,
+                    cpu_only: self.config.wedge_detector.cpu_only,
+                    gpu_util_trusted,
+                    cpu_eps_cores: CPU_EPS_CORES,
+                    gpu_eps_util: GPU_EPS_UTIL,
+                });
+
+                let st = state
+                    .per_instance
+                    .entry(id.clone())
+                    .or_insert(InstanceWedgeState {
+                        pid: *pid,
+                        prev_busy_ticks: busy_now.unwrap_or(0),
+                        prev_sample_at: now,
+                        wedged_since: None,
+                    });
+                // Reset on respawn so a recycled pid never reuses a stale delta.
+                if st.pid != *pid {
+                    st.pid = *pid;
+                    st.wedged_since = None;
+                }
+
+                match verdict {
+                    WedgeVerdict::WedgedThisTick => {
+                        let since = *st.wedged_since.get_or_insert(now);
+                        let wedged_for = now.duration_since(since);
+                        if wedged_for >= window {
+                            to_kill.push((id.clone(), *pid, wedged_for, *last_activity));
+                        }
+                    }
+                    WedgeVerdict::NotWedged => {
+                        st.wedged_since = None;
+                    }
+                }
+
+                // Advance the CPU baseline for the next tick.
+                if let Some(busy) = busy_now {
+                    st.prev_busy_ticks = busy;
+                    st.prev_sample_at = now;
+                }
+            }
+        }
+
+        // 4. Stop the confirmed-wedged instances (escalates to the write lock).
+        for (id, pid, wedged_for, sampled_last_activity) in to_kill {
+            self.kill_wedged_instance(&id, pid, wedged_for, sampled_last_activity)
+                .await;
+        }
+    }
+
+    /// Stop one wedged instance, mirroring the confirmed-victim teardown in
+    /// `check_idle_instances`: re-verify under the write lock (it may have
+    /// recovered or respawned since the sample), remove it from the map,
+    /// release its port, then stop the process and wake any queued waiters.
+    async fn kill_wedged_instance(
+        &self,
+        id: &str,
+        expected_pid: u32,
+        wedged_for: Duration,
+        sampled_last_activity: Instant,
+    ) {
+        let inst_lock = {
+            let mut instances = self.instances.write().await;
+            let Some(inst_lock) = instances.get(id).cloned() else {
+                return; // already gone
+            };
+            // Re-verify under the write lock: still the same process, still
+            // holding a slot, and the same request is still on it. `last_activity`
+            // is stamped on every new slot assignment, so if it advanced, the
+            // wedged request was released and fresh work took the instance (even
+            // if the slot count is unchanged) — its work is not described by the
+            // stale wedge verdict, so back off and let the next cycle re-confirm.
+            let (still_wedged, port) = {
+                let inst = inst_lock.read().await;
+                (
+                    inst.in_flight_requests > 0
+                        && inst.get_pid() == Some(expected_pid)
+                        && inst.last_activity == sampled_last_activity,
+                    inst.port,
+                )
+            };
+            if !still_wedged {
+                info!(
+                    instance_id = %id,
+                    "Wedged instance recovered, respawned, or took new work before kill; skipping"
+                );
+                return;
+            }
+            instances.remove(id);
+            self.release_port(port).await;
+            inst_lock
+        };
+
+        let inst = inst_lock.read().await;
+        warn!(
+            event = "instance_wedged",
+            instance_id = %id,
+            model = %inst.model_name,
+            profile = %inst.profile_id,
+            pid = expected_pid,
+            wedged_for_secs = wedged_for.as_secs(),
+            "Stopping wedged instance: held a request slot with no CPU or GPU activity"
+        );
+        self.metrics
+            .wedged_instances_killed_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.stop_and_cleanup_instance(&inst, "wedged").await;
+        drop(inst);
+        self.notify_all_queues().await;
+    }
+
     pub async fn shutdown_all_instances(&self) {
         info!("Shutting down all instances...");
         let mut instances_map = self.instances.write().await;
@@ -3801,6 +4062,7 @@ mod tests {
             logging: None,
             max_total_queue_entries: 0,
             upstream_read_timeout_ms: 600_000,
+            wedge_detector: crate::config::WedgeDetectorConfig::default(),
         }
     }
 
