@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.1] - 2026-06-20
+
+### Fixed
+
+- Local upstream body-read failures are now counted in the error metrics
+  (`proxy_errors_total` and the per-hash `errors_total`), for both the
+  non-streaming and streaming paths. Previously only `send()` failures were
+  counted on the local path: a body-read failure — a connection reset mid-body,
+  or (with `upstream_read_timeout_ms` enabled, or when the wedge-detector stops a
+  hung instance) a read-inactivity error — returned a 502 / aborted the client
+  stream without incrementing any error counter, so it was invisible to
+  `proxy_errors_total` and per-hash error metrics. The count fires exactly once
+  per failed request (guarded against per-chunk double counting on the streaming
+  path) and only on the local path; the cluster peer-forward paths already
+  account for their failures separately and are unchanged.
+
 ## [1.19.0] - 2026-06-20
 
 ### Added

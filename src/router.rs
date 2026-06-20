@@ -2,6 +2,7 @@ use crate::config::Profile;
 use crate::connection::ConnectionHandle;
 use crate::errors::AppError;
 use crate::instance::Instance;
+use crate::metrics::{HashMetrics, Metrics};
 use crate::node_state::{NodeError, NodeState};
 use axum::{
     body::Body,
@@ -1225,11 +1226,26 @@ pub async fn route_request(
                             // Transfer responsibility to cleanup_fut
                             guard.complete();
 
+                            // Count a local body-read failure (mid-stream, or a
+                            // failed non-streaming body read) like a send error;
+                            // peer paths pass None and account for it elsewhere.
+                            let error_recorder =
+                                Some((state.metrics.clone(), hash_metrics.clone()));
                             Ok(if response_streaming {
-                                build_streaming_response(resp, cleanup_fut, tokens_counter)
+                                build_streaming_response(
+                                    resp,
+                                    cleanup_fut,
+                                    tokens_counter,
+                                    error_recorder,
+                                )
                             } else {
-                                handle_non_streaming_response(resp, cleanup_fut, tokens_counter)
-                                    .await
+                                handle_non_streaming_response(
+                                    resp,
+                                    cleanup_fut,
+                                    tokens_counter,
+                                    error_recorder,
+                                )
+                                .await
                             })
                         }
                         Err(e) => {
@@ -1689,10 +1705,29 @@ pub async fn route_request(
     .await
 }
 
+/// Node-wide + per-hash error counters for the local request being served,
+/// threaded into the response paths so a body-read failure that surfaces inside
+/// the shared response builder (non-streaming) or after the handler returns
+/// (streaming) is still counted on the local path. `None` on the cluster
+/// peer-forward paths, which account for their failures separately (the
+/// peer-fallback status check and `peer_body_read_failed`).
+type BodyReadErrorRecorder = Option<(Arc<Metrics>, Arc<HashMetrics>)>;
+
+/// Count one local body-read failure: node-wide `proxy_errors_total` plus the
+/// per-hash `errors_total`, mirroring the local send()-error accounting. A
+/// `None` recorder is a no-op.
+fn record_local_body_read_error(recorder: &BodyReadErrorRecorder) {
+    if let Some((metrics, hash_metrics)) = recorder {
+        metrics.inc_errors();
+        hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 async fn handle_non_streaming_response(
     resp: reqwest::Response,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
+    error_recorder: BodyReadErrorRecorder,
 ) -> Response<Body> {
     // `AutoCleanup` guarantees `cleanup` runs exactly once — either when this
     // function returns normally, or if the enclosing task is cancelled while
@@ -1709,7 +1744,11 @@ async fn handle_non_streaming_response(
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            error!("Failed to read upstream response body: {}", e);
+            error!(
+                event = "local_body_read_failed",
+                "Failed to read upstream response body: {}", e
+            );
+            record_local_body_read_error(&error_recorder);
             return AppError::upstream_error(format!("Failed to read upstream response body: {e}"))
                 .into_response();
         }
@@ -1790,10 +1829,16 @@ fn build_streaming_response(
     resp: reqwest::Response,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
+    error_recorder: BodyReadErrorRecorder,
 ) -> Response<Body> {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let stream = CleanupStream::new(resp.bytes_stream(), cleanup, tokens_generated);
+    let stream = CleanupStream::new(
+        resp.bytes_stream(),
+        cleanup,
+        tokens_generated,
+        error_recorder,
+    );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -1811,7 +1856,9 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
 {
-    let stream = CleanupStream::new(stream, cleanup, tokens_generated);
+    // Peer (Noise) stream: peer-path failures are accounted for separately, so
+    // no local error recorder.
+    let stream = CleanupStream::new(stream, cleanup, tokens_generated, None);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -1827,9 +1874,11 @@ async fn peer_response_to_client(
     match response {
         PeerResponse::Http(resp) => {
             if stream_requested {
-                build_streaming_response(resp, cleanup, tokens_generated)
+                // Peer path: no local error recorder (failures accounted for
+                // separately via the peer-fallback status check / circuit breaker).
+                build_streaming_response(resp, cleanup, tokens_generated, None)
             } else {
-                handle_non_streaming_response(resp, cleanup, tokens_generated).await
+                handle_non_streaming_response(resp, cleanup, tokens_generated, None).await
             }
         }
         PeerResponse::Noise {
@@ -1895,13 +1944,23 @@ where
     buffer: Vec<u8>,
     token_counting_disabled: bool,
     cleanup_executed: bool,
+    /// Error counters for the local request (None on peer streams). Used to
+    /// count a mid-stream body-read failure once.
+    error_recorder: BodyReadErrorRecorder,
+    /// Guards the body-read error count to exactly one per failed stream.
+    error_recorded: bool,
 }
 
 impl<S, E> CleanupStream<S, E>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
 {
-    fn new(inner: S, cleanup: BoxFuture<'static, ()>, tokens_generated: Arc<AtomicU64>) -> Self {
+    fn new(
+        inner: S,
+        cleanup: BoxFuture<'static, ()>,
+        tokens_generated: Arc<AtomicU64>,
+        error_recorder: BodyReadErrorRecorder,
+    ) -> Self {
         Self {
             inner: Box::pin(inner),
             cleanup: Some(cleanup),
@@ -1909,6 +1968,8 @@ where
             buffer: Vec::new(),
             token_counting_disabled: false,
             cleanup_executed: false,
+            error_recorder,
+            error_recorded: false,
         }
     }
 }
@@ -2069,6 +2130,22 @@ where
                     self.cleanup_executed = true;
                 }
                 Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // A mid-stream body-read failure aborts the client stream. On
+                // the local path, count it once (like a non-streaming body-read
+                // failure or a send error); peer streams carry no recorder.
+                if !self.error_recorded {
+                    self.error_recorded = true;
+                    record_local_body_read_error(&self.error_recorder);
+                    if self.error_recorder.is_some() {
+                        error!(
+                            event = "local_stream_body_read_failed",
+                            "Local streaming body read failed"
+                        );
+                    }
+                }
+                Poll::Ready(Some(Err(e)))
             }
             other => other,
         }
@@ -2714,5 +2791,80 @@ mod tests {
             ran.load(Ordering::SeqCst),
             "cleanup should run via Drop even when the owning task is aborted"
         );
+    }
+
+    #[tokio::test]
+    async fn record_local_body_read_error_counts_node_and_hash_once() {
+        let metrics = Arc::new(Metrics::default());
+        let hm = metrics.get_hash_metrics("h").await;
+        record_local_body_read_error(&Some((metrics.clone(), hm.clone())));
+        assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
+        assert_eq!(hm.errors_total.load(Ordering::Relaxed), 1);
+        // A None recorder (peer paths) is a no-op.
+        record_local_body_read_error(&None);
+        assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
+        assert_eq!(hm.errors_total.load(Ordering::Relaxed), 1);
+    }
+
+    fn body_stream(
+        items: Vec<Result<Bytes, std::io::Error>>,
+    ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+        futures::stream::iter(items)
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_counts_local_body_read_error_once() {
+        use futures::StreamExt;
+        let metrics = Arc::new(Metrics::default());
+        let hm = metrics.get_hash_metrics("h").await;
+        let inner = body_stream(vec![
+            Ok(Bytes::from("data: {}\n")),
+            Err(std::io::Error::other("mid-stream reset")),
+        ]);
+        let mut s = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            Some((metrics.clone(), hm.clone())),
+        );
+        while s.next().await.is_some() {}
+        assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
+        assert_eq!(hm.errors_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_counts_body_read_error_at_most_once() {
+        use futures::StreamExt;
+        let metrics = Arc::new(Metrics::default());
+        let hm = metrics.get_hash_metrics("h").await;
+        // Two consecutive errors must still count exactly one (one-shot guard).
+        let inner = body_stream(vec![
+            Err(std::io::Error::other("first")),
+            Err(std::io::Error::other("second")),
+        ]);
+        let mut s = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            Some((metrics.clone(), hm.clone())),
+        );
+        while s.next().await.is_some() {}
+        assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
+        assert_eq!(hm.errors_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_does_not_count_without_recorder() {
+        use futures::StreamExt;
+        // Peer streams pass no recorder: a body error must not be counted.
+        let metrics = Arc::new(Metrics::default());
+        let inner = body_stream(vec![
+            Ok(Bytes::from("x")),
+            Err(std::io::Error::other("boom")),
+        ]);
+        let mut s =
+            CleanupStream::new(inner, Box::pin(async {}), Arc::new(AtomicU64::new(0)), None);
+        while s.next().await.is_some() {}
+        assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 0);
     }
 }
