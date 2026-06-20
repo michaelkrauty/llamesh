@@ -372,6 +372,25 @@ fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &s
     forward_headers
 }
 
+/// Build the client-facing response header map from a peer's parsed response
+/// headers. The Noise transport delivers headers as `(name, value)` pairs (one
+/// per header line), so this rebuilds a `HeaderMap` from them — using `append`
+/// so a repeated response header (e.g. multiple `Set-Cookie` lines) keeps every
+/// value. The reqwest forward path clones the upstream `HeaderMap` wholesale and
+/// so already preserves repeated values; this keeps the Noise path consistent.
+fn build_peer_response_headers(raw: &[(String, String)]) -> HeaderMap {
+    let mut response_headers = HeaderMap::new();
+    for (name, value) in raw {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            response_headers.append(name, value);
+        }
+    }
+    response_headers
+}
+
 async fn send_peer_request(
     state: &NodeState,
     request: PeerRequest<'_>,
@@ -402,15 +421,7 @@ async fn send_peer_request(
         let status = StatusCode::from_u16(response.head.status).map_err(|e| {
             AppError::internal_server_error(format!("Invalid peer response status: {e}"))
         })?;
-        let mut response_headers = HeaderMap::new();
-        for (name, value) in &response.head.headers {
-            if let (Ok(name), Ok(value)) = (
-                axum::http::HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(value),
-            ) {
-                response_headers.insert(name, value);
-            }
-        }
+        let response_headers = build_peer_response_headers(&response.head.headers);
 
         Ok(PeerResponse::Noise {
             status,
@@ -2367,6 +2378,31 @@ mod tests {
 
         // The request id is set.
         assert_eq!(forwarded.get("x-request-id").unwrap(), "req-123");
+    }
+
+    #[test]
+    fn build_peer_response_headers_preserves_repeated_set_cookie() {
+        use axum::http::header::{CONTENT_TYPE, SET_COOKIE};
+
+        // A peer's response can carry the same header more than once — most
+        // commonly several Set-Cookie lines. The Noise transport delivers these
+        // as separate (name, value) pairs; rebuilding with insert would keep
+        // only the last, append keeps them all.
+        let raw = vec![
+            ("Set-Cookie".to_string(), "a=1".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Set-Cookie".to_string(), "b=2".to_string()),
+        ];
+
+        let headers = build_peer_response_headers(&raw);
+
+        let cookies: Vec<&str> = headers
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+        assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "application/json");
     }
 
     #[test]

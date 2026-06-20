@@ -11,16 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Repeated request headers are no longer dropped when forwarding to a cluster
-  peer. `build_forward_headers` copied the incoming headers with
-  `HeaderMap::insert` while iterating, but `HeaderMap::iter` yields a separate
-  entry per value and `insert` replaces all prior values for a name, so a client
-  that sent the same header more than once (e.g. multiple `Cookie` lines, or
-  repeated `Accept-Encoding`) had every value but the last silently dropped
-  before the request reached the peer. The copy now uses `append`, which
-  preserves every value; the proxy-set `x-llama-mesh-hops` and `x-request-id`
-  headers remain single-valued and authoritative. Single-valued headers (the
-  common case, including `Authorization`) are unaffected.
+- Repeated headers are no longer dropped when relaying between clients and
+  cluster peers. Both the outgoing request headers (`build_forward_headers`) and
+  the peer's response headers (rebuilt from the Noise transport's parsed header
+  list) were copied into a fresh `HeaderMap` with `HeaderMap::insert` while
+  iterating, but `HeaderMap::iter` yields a separate entry per value and `insert`
+  replaces all prior values for a name. A request that repeated a header (e.g.
+  multiple `Cookie` lines, or repeated `Accept-Encoding`) lost every value but
+  the last on the way to the peer, and a response that repeated one (most
+  commonly several `Set-Cookie` lines) lost every value but the last on the way
+  back to the client. Both copies now use `append`, which preserves every value;
+  the proxy-set `x-llama-mesh-hops` and `x-request-id` request headers stay
+  single-valued and authoritative. The reqwest forward path already preserved
+  repeated values (it clones the upstream map), so this brings the Noise path in
+  line. Single-valued headers (the common case, including `Authorization`) are
+  unaffected.
 
 ### Fixed
 
