@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.6] - 2026-06-19
+
+### Fixed
+
+- Noise HTTP frame parsing now locates the header/body boundary on the raw
+  bytes instead of a UTF-8-lossy view. `parse_http_request` and
+  `parse_http_response_head` found the `\r\n\r\n` boundary in a
+  `String::from_utf8_lossy(data)` and then applied that offset to slice the body
+  out of the original `data`. The two offset spaces diverge if any byte before
+  the boundary is invalid UTF-8 — `from_utf8_lossy` expands each to a 3-byte
+  U+FFFD — so a non-ASCII header byte would shift the body slice and corrupt the
+  forwarded request/response body. The peers that build these frames only emit
+  ASCII headers, so this was not reachable in practice, but the parser is now
+  robust to its byte input regardless. Parsing of valid ASCII headers is
+  unchanged.
+
 ## [1.18.5] - 2026-06-19
 
 ### Documentation
