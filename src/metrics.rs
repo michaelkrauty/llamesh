@@ -291,6 +291,11 @@ pub struct MetricsSnapshot {
     pub token_counting_disabled_total: u64,
     #[serde(default)]
     pub skipped_stream_cleanups_total: u64,
+    /// Streaming responses forwarded from a cluster peer whose body aborted
+    /// mid-stream. Process-global, resets on restart; `#[serde(default)]` keeps
+    /// older snapshots loadable.
+    #[serde(default)]
+    pub peer_stream_body_aborts_total: u64,
     pub hashes: HashMap<String, HashMetricsSnapshot>,
     pub updated_at: String,
     #[serde(default)]
@@ -664,6 +669,8 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             skipped_stream_cleanups_total: crate::router::SKIPPED_STREAM_CLEANUPS
                 .load(Ordering::Relaxed),
+            peer_stream_body_aborts_total: crate::router::PEER_STREAM_BODY_ABORTS
+                .load(Ordering::Relaxed),
             hashes,
             updated_at: chrono::Utc::now().to_rfc3339(),
             is_building: build_status
@@ -899,6 +906,16 @@ pub async fn render_prometheus_with_circuit_breaker(
     out.push_str(&format!(
         "proxy_skipped_stream_cleanups_total {}\n",
         crate::router::SKIPPED_STREAM_CLEANUPS.load(Ordering::Relaxed)
+    ));
+
+    // Peer streaming responses whose forwarded body aborted mid-stream
+    out.push_str(
+        "# HELP proxy_peer_stream_body_aborts_total Forwarded peer streaming responses whose body aborted mid-stream.\n",
+    );
+    out.push_str("# TYPE proxy_peer_stream_body_aborts_total counter\n");
+    out.push_str(&format!(
+        "proxy_peer_stream_body_aborts_total {}\n",
+        crate::router::PEER_STREAM_BODY_ABORTS.load(Ordering::Relaxed)
     ));
 
     // Circuit breaker metrics (if available)

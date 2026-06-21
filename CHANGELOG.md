@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-06-21
+
+### Added
+
+- New `proxy_peer_stream_body_aborts_total` metric counting streaming responses
+  forwarded from a cluster peer whose body aborted mid-stream (a connection
+  reset, or — with `upstream_read_timeout_ms` enabled — an inactivity timeout).
+  This failure mode was previously invisible: the peer's `2xx` response head is
+  surfaced to the client and recorded as a circuit-breaker success before the
+  body streams, so a later body abort is neither a local body-read failure
+  (`proxy_errors_total`) nor a circuit-breaker signal. The counter increments
+  once per aborted forwarded stream and a `peer_stream_body_aborted` event is
+  logged. Process-global and resets on restart, like the other stream counters.
+
 ## [1.19.4] - 2026-06-21
 
 ### Documentation
