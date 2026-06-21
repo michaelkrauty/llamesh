@@ -1248,6 +1248,7 @@ pub async fn route_request(
                                     cleanup_fut,
                                     tokens_counter,
                                     error_recorder,
+                                    false,
                                 )
                             } else {
                                 handle_non_streaming_response(
@@ -1842,6 +1843,7 @@ fn build_streaming_response(
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
     error_recorder: BodyReadErrorRecorder,
+    peer_stream: bool,
 ) -> Response<Body> {
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -1850,6 +1852,7 @@ fn build_streaming_response(
         cleanup,
         tokens_generated,
         error_recorder,
+        peer_stream,
     );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -1863,14 +1866,16 @@ fn build_streaming_response_from_parts<S, E>(
     stream: S,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
+    peer_stream: bool,
 ) -> Response<Body>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
 {
-    // Peer (Noise) stream: peer-path failures are accounted for separately, so
-    // no local error recorder.
-    let stream = CleanupStream::new(stream, cleanup, tokens_generated, None);
+    // Peer (Noise) stream: no local error recorder; a mid-stream abort is
+    // counted in `PEER_STREAM_BODY_ABORTS` when `peer_stream` (a successful
+    // streamed peer response — the otherwise-invisible 2xx-body-abort case).
+    let stream = CleanupStream::new(stream, cleanup, tokens_generated, None, peer_stream);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -1886,9 +1891,14 @@ async fn peer_response_to_client(
     match response {
         PeerResponse::Http(resp) => {
             if stream_requested {
-                // Peer path: no local error recorder (failures accounted for
-                // separately via the peer-fallback status check / circuit breaker).
-                build_streaming_response(resp, cleanup, tokens_generated, None)
+                // Peer path: no local error recorder. Count a mid-stream abort in
+                // `PEER_STREAM_BODY_ABORTS` only for a *successful* (2xx) streamed
+                // response — the otherwise-invisible case. A non-2xx response is
+                // already visible via its error status (this matters on the
+                // spawn-failure fallback path, which streams whatever status the
+                // peer returned; the primary path only surfaces 2xx).
+                let peer_stream = resp.status().is_success();
+                build_streaming_response(resp, cleanup, tokens_generated, None, peer_stream)
             } else {
                 handle_non_streaming_response(resp, cleanup, tokens_generated, None).await
             }
@@ -1906,6 +1916,7 @@ async fn peer_response_to_client(
                     body,
                     cleanup,
                     tokens_generated,
+                    status.is_success(),
                 )
             } else {
                 let _cleanup_guard = AutoCleanup::new(cleanup);
@@ -1946,6 +1957,15 @@ pub static SKIPPED_STREAM_CLEANUPS: AtomicU64 = AtomicU64::new(0);
 /// Exposed via metrics endpoint.
 pub static TOKEN_COUNTING_DISABLED: AtomicU64 = AtomicU64::new(0);
 
+/// Counter for streaming responses forwarded from a cluster peer whose body
+/// aborted mid-stream (a connection reset, or — with `upstream_read_timeout_ms`
+/// enabled — an inactivity timeout). The peer's 2xx response head is surfaced to
+/// the client and recorded as a success before the body streams, so an abort
+/// after that point is otherwise invisible: it is not a local body-read failure
+/// (`proxy_errors_total`) and does not move the peer's circuit breaker. Exposed
+/// as `proxy_peer_stream_body_aborts_total`; runtime-only (resets on restart).
+pub static PEER_STREAM_BODY_ABORTS: AtomicU64 = AtomicU64::new(0);
+
 struct CleanupStream<S, E>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -1961,6 +1981,9 @@ where
     error_recorder: BodyReadErrorRecorder,
     /// Guards the body-read error count to exactly one per failed stream.
     error_recorded: bool,
+    /// True when this stream forwards a cluster peer's response body. A
+    /// mid-stream abort then increments `PEER_STREAM_BODY_ABORTS` (once).
+    peer_stream: bool,
 }
 
 impl<S, E> CleanupStream<S, E>
@@ -1972,6 +1995,7 @@ where
         cleanup: BoxFuture<'static, ()>,
         tokens_generated: Arc<AtomicU64>,
         error_recorder: BodyReadErrorRecorder,
+        peer_stream: bool,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -1982,6 +2006,7 @@ where
             cleanup_executed: false,
             error_recorder,
             error_recorded: false,
+            peer_stream,
         }
     }
 }
@@ -2144,9 +2169,11 @@ where
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
-                // A mid-stream body-read failure aborts the client stream. On
-                // the local path, count it once (like a non-streaming body-read
-                // failure or a send error); peer streams carry no recorder.
+                // A mid-stream body-read failure aborts the client stream. Count
+                // it once: on the local path via the error recorder (like a
+                // non-streaming body-read failure or a send error); on a peer
+                // forward via `PEER_STREAM_BODY_ABORTS`, since the peer's 2xx
+                // head was already surfaced/recorded as a success.
                 if !self.error_recorded {
                     self.error_recorded = true;
                     record_local_body_read_error(&self.error_recorder);
@@ -2154,6 +2181,15 @@ where
                         error!(
                             event = "local_stream_body_read_failed",
                             "Local streaming body read failed"
+                        );
+                    }
+                    if self.peer_stream {
+                        // Peer-attributed (not a node `proxy_errors_total` error);
+                        // logged at warn like the other peer-forward failures.
+                        PEER_STREAM_BODY_ABORTS.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            event = "peer_stream_body_aborted",
+                            "Forwarded peer streaming body aborted mid-stream"
                         );
                     }
                 }
@@ -2838,6 +2874,7 @@ mod tests {
             Box::pin(async {}),
             Arc::new(AtomicU64::new(0)),
             Some((metrics.clone(), hm.clone())),
+            false,
         );
         while s.next().await.is_some() {}
         assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
@@ -2859,6 +2896,7 @@ mod tests {
             Box::pin(async {}),
             Arc::new(AtomicU64::new(0)),
             Some((metrics.clone(), hm.clone())),
+            false,
         );
         while s.next().await.is_some() {}
         assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
@@ -2868,15 +2906,62 @@ mod tests {
     #[tokio::test]
     async fn cleanup_stream_does_not_count_without_recorder() {
         use futures::StreamExt;
-        // Peer streams pass no recorder: a body error must not be counted.
+        // A non-peer stream with no recorder: a body error must not be counted.
         let metrics = Arc::new(Metrics::default());
         let inner = body_stream(vec![
             Ok(Bytes::from("x")),
             Err(std::io::Error::other("boom")),
         ]);
-        let mut s =
-            CleanupStream::new(inner, Box::pin(async {}), Arc::new(AtomicU64::new(0)), None);
+        let mut s = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            false,
+        );
         while s.next().await.is_some() {}
         assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_counts_peer_body_abort_once() {
+        use futures::StreamExt;
+        // A peer stream (peer_stream = true, no local recorder) increments the
+        // peer-abort counter exactly once on a mid-stream error, and not on a
+        // clean stream.
+        let before = PEER_STREAM_BODY_ABORTS.load(Ordering::Relaxed);
+        let aborting = body_stream(vec![
+            Ok(Bytes::from("data: {}\n")),
+            Err(std::io::Error::other("peer reset")),
+            Err(std::io::Error::other("again")),
+        ]);
+        let mut s = CleanupStream::new(
+            aborting,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            true,
+        );
+        while s.next().await.is_some() {}
+        assert_eq!(
+            PEER_STREAM_BODY_ABORTS.load(Ordering::Relaxed),
+            before + 1,
+            "a peer body abort counts exactly once"
+        );
+
+        let clean = body_stream(vec![Ok(Bytes::from("a")), Ok(Bytes::from("b"))]);
+        let mut s = CleanupStream::new(
+            clean,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            true,
+        );
+        while s.next().await.is_some() {}
+        assert_eq!(
+            PEER_STREAM_BODY_ABORTS.load(Ordering::Relaxed),
+            before + 1,
+            "a clean peer stream does not count"
+        );
     }
 }
