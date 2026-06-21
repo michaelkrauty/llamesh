@@ -18,10 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then goes silent mid-response previously held its in-flight slot forever (the
   peer body read had no inactivity bound), which could hang a graceful drain
   just like the original local-stall bug. When `upstream_read_timeout_ms > 0`,
-  each Noise peer response-body chunk is now read under a per-chunk inactivity
-  timeout; a stalled peer aborts the stream and releases the slot through the
+  each Noise peer response-body frame read is now bounded by the inactivity
+  timeout (reset per frame, so a slow-but-active multi-frame chunk is not
+  aborted); a stalled peer aborts the stream and releases the slot through the
   normal cleanup path. The gossip Noise body drain is likewise bounded by the
-  existing gossip timeout. Scoped to streaming forwards: a non-streaming peer
+  existing gossip timeout, and a gossip 2xx response whose body cannot be
+  drained is now recorded as a failed exchange rather than a success. Scoped to
+  streaming forwards: a non-streaming peer
   forward buffers the body and retries on read failure, so an inactivity abort
   there would re-forward rather than release the slot; bounding that path (and
   the reqwest cluster transport) is left to a follow-up. Disabled by default

@@ -99,7 +99,7 @@ pub async fn recv_request(
     session: &mut NoiseSession,
     stream: &mut TcpStream,
 ) -> Result<NoiseRequest> {
-    let data = recv_data(session, stream).await?;
+    let data = recv_data(session, stream, None).await?;
     parse_http_request(&data)
 }
 
@@ -239,17 +239,50 @@ pub async fn recv_response_head(
     session: &mut NoiseSession,
     stream: &mut TcpStream,
 ) -> Result<NoiseResponseHead> {
-    let data = recv_data(session, stream).await?;
+    let data = recv_data(session, stream, None).await?;
     parse_http_response_head(&data)
 }
 
-/// Low-level: receive encrypted data with length prefix
-pub async fn recv_data(session: &mut NoiseSession, stream: &mut TcpStream) -> Result<Vec<u8>> {
+/// Read exactly `buf.len()` bytes, optionally bounding the wait by a per-read
+/// inactivity timeout. Applying the timeout to each frame read (rather than to
+/// a whole multi-frame message) gives true inactivity semantics: a slow but
+/// actively-progressing stream keeps resetting the bound on every frame.
+async fn read_exact_bounded(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    inactivity: Option<Duration>,
+) -> Result<()> {
+    match inactivity {
+        Some(duration) => {
+            tokio::time::timeout(duration, stream.read_exact(buf))
+                .await
+                .map_err(|_| {
+                    NoiseError::Transport(
+                        "Peer response body read timed out (no data within \
+                         upstream_read_timeout_ms)"
+                            .into(),
+                    )
+                })??;
+        }
+        None => {
+            stream.read_exact(buf).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Low-level: receive encrypted data with length prefix. `inactivity` bounds
+/// the wait for each frame read; `None` leaves the reads unbounded.
+pub async fn recv_data(
+    session: &mut NoiseSession,
+    stream: &mut TcpStream,
+    inactivity: Option<Duration>,
+) -> Result<Vec<u8>> {
     let mut result = Vec::new();
 
     loop {
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
+        read_exact_bounded(stream, &mut len_buf, inactivity).await?;
         let len = u32::from_be_bytes(len_buf) as usize;
 
         if len == 0 {
@@ -261,7 +294,7 @@ pub async fn recv_data(session: &mut NoiseSession, stream: &mut TcpStream) -> Re
         }
 
         let mut encrypted = vec![0u8; len];
-        stream.read_exact(&mut encrypted).await?;
+        read_exact_bounded(stream, &mut encrypted, inactivity).await?;
 
         let decrypted = session.decrypt(&encrypted)?;
         result.extend_from_slice(&decrypted);
@@ -416,24 +449,12 @@ impl Stream for NoiseBodyStream {
         if self.pending.is_none() {
             let mut session = self.session.take().expect("noise session missing");
             let mut stream = self.stream.take().expect("noise stream missing");
+            // `recv_data` applies `inactivity` to each frame read, so a
+            // slow-but-active peer keeps resetting the bound while one that
+            // stops sending trips it — even for a multi-frame body chunk.
             let inactivity = self.inactivity;
             self.pending = Some(Box::pin(async move {
-                // Reset the inactivity bound on every chunk: a slow-but-active
-                // peer keeps resetting it, while one that stops sending trips it.
-                let bytes = match inactivity {
-                    Some(duration) => {
-                        tokio::time::timeout(duration, recv_data(&mut session, &mut stream))
-                            .await
-                            .map_err(|_| {
-                                NoiseError::Transport(
-                                    "Peer response body read timed out (no data within \
-                                     upstream_read_timeout_ms)"
-                                        .into(),
-                                )
-                            })??
-                    }
-                    None => recv_data(&mut session, &mut stream).await?,
-                };
+                let bytes = recv_data(&mut session, &mut stream, inactivity).await?;
                 Ok((session, stream, bytes))
             }));
         }
