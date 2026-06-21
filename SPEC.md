@@ -807,7 +807,7 @@ Key `proxy_*` series exposed. Gauges reflect the current moment; most counters a
 * **Cluster health & recovery** — `proxy_circuit_breaker_state{peer}` (0=closed, 1=open, 2=half-open), `proxy_wedged_instances_killed_total` (local instances stopped by the wedged-instance watchdog).
 * **Streaming** (per-process, reset on restart) — `proxy_peer_stream_body_aborts_total` (forwarded peer streams whose body aborted mid-stream), `proxy_skipped_stream_cleanups_total` (cleanups skipped during shutdown), `proxy_token_counting_disabled_total`.
 * **Per model:profile** — the `proxy_hash_*` family (`requests_total`, `errors_total`, `tokens_generated_total`, `total_latency_ms`, latency percentiles, `peak_vram_mb`, `peak_sysmem_mb`), labeled by the profile's args hash.
-* **Build** — `proxy_build_info` / `proxy_version` (info series, value `1`).
+* **Build** — `proxy_build_info{version=...,llama_cpp_version=...}` (info series, value `1`; aggregate with `count by (version) (proxy_build_info)`).
 
 ### Cluster / Admin
 
