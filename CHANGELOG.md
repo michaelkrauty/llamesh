@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.2] - 2026-06-20
+
+### Fixed
+
+- `upstream_read_timeout_ms` now also bounds the response body of a *streaming*
+  request forwarded to a cluster peer over the Noise transport, extending the
+  in-flight-slot-leak protection it already provides for local instances
+  (addresses #138). A node that streams a forwarded request from a peer which
+  then goes silent mid-response previously held its in-flight slot forever (the
+  peer body read had no inactivity bound), which could hang a graceful drain
+  just like the original local-stall bug. When `upstream_read_timeout_ms > 0`,
+  each Noise peer response-body chunk is now read under a per-chunk inactivity
+  timeout; a stalled peer aborts the stream and releases the slot through the
+  normal cleanup path. The gossip Noise body drain is likewise bounded by the
+  existing gossip timeout. Scoped to streaming forwards: a non-streaming peer
+  forward buffers the body and retries on read failure, so an inactivity abort
+  there would re-forward rather than release the slot; bounding that path (and
+  the reqwest cluster transport) is left to a follow-up. Disabled by default
+  (`0`), so behavior is unchanged unless the timeout is enabled.
+
 ## [1.19.1] - 2026-06-20
 
 ### Fixed

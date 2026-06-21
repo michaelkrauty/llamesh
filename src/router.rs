@@ -229,7 +229,7 @@ async fn attempt_peer_forward(
         crate::circuit_breaker::DispatchDecision::Admit { probe_ticket } => probe_ticket,
         crate::circuit_breaker::DispatchDecision::Deny => return ForwardOutcome::ProbeDenied,
     };
-    let resp = match send_peer_request(state, request).await {
+    let resp = match send_peer_request(state, request, response_streaming).await {
         Ok(resp) => resp,
         Err(e) => {
             state
@@ -395,9 +395,20 @@ fn build_peer_response_headers(raw: &[(String, String)]) -> HeaderMap {
 async fn send_peer_request(
     state: &NodeState,
     request: PeerRequest<'_>,
+    streaming: bool,
 ) -> Result<PeerResponse, AppError> {
     if let Some(noise_context) = state.noise_context.as_ref() {
         let timeout = (request.timeout_ms > 0).then(|| Duration::from_millis(request.timeout_ms));
+        // Bound silence between peer response body chunks (mirrors the local
+        // upstream read timeout) so a stalled peer cannot hold this node's slot.
+        // Only for streaming responses: a non-streaming forward buffers the peer
+        // body inside `attempt_peer_forward`, where a read failure is retried
+        // (re-forwarded), so an inactivity abort there would loop rather than
+        // release the slot. A streaming response is surfaced to the client
+        // before its body is read, so an aborted body simply ends the client
+        // stream and releases the slot through the normal cleanup path.
+        let body_inactivity = (streaming && state.config.upstream_read_timeout_ms > 0)
+            .then(|| Duration::from_millis(state.config.upstream_read_timeout_ms));
         let response = crate::noise::transport::request(
             noise_context,
             crate::noise::transport::OutboundNoiseRequest {
@@ -427,7 +438,7 @@ async fn send_peer_request(
         Ok(PeerResponse::Noise {
             status,
             headers: response_headers,
-            body: Box::new(response.into_body_stream()),
+            body: Box::new(response.into_body_stream(body_inactivity)),
         })
     } else {
         let base = request.peer_address.trim_end_matches('/');
@@ -1319,6 +1330,7 @@ pub async fn route_request(
                                     body: forward_body.clone(),
                                     timeout_ms,
                                 },
+                                response_streaming,
                             )
                             .await
                             {

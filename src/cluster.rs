@@ -177,7 +177,10 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                             {
                                 Ok(resp) => {
                                     let status = resp.head.status;
-                                    let mut body = resp.into_body_stream();
+                                    // Bound the body drain by the same gossip timeout so a
+                                    // peer that stalls mid-body cannot hang the gossip loop.
+                                    let mut body =
+                                        resp.into_body_stream(Some(GOSSIP_REQUEST_TIMEOUT));
                                     while let Some(chunk) = body.next().await {
                                         if let Err(e) = chunk {
                                             debug!(

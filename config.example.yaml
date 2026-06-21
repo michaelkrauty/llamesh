@@ -70,7 +70,10 @@ model_defaults:
 # pressure from queued requests. (default: 0)
 max_total_queue_entries: 0
 
-# Inactivity (read) timeout in ms for outbound requests to a local llama-server.
+# Inactivity (read) timeout in ms for outbound requests to an upstream: every
+# request to a local llama-server, plus the response body of a streaming request
+# forwarded to a cluster peer over the Noise transport (a non-streaming peer
+# forward buffers and retries on read failure, so it is not bounded here).
 # A stalled upstream (one that stops sending mid-response) otherwise holds its
 # in-flight slot forever, which can hang a graceful drain. It is a per-chunk
 # timer (reset on every chunk), so it bounds silence between streamed tokens

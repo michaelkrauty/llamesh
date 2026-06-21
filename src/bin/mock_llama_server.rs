@@ -275,6 +275,20 @@ async fn chat_completions(
             |(step, s_id, st, m)| async move {
                 if step == 0 {
                     // First delay already happened
+                } else if step == 1 {
+                    // Test hook: `MOCK_SLOW_STREAM_MS=<n>` pauses `n` ms after the
+                    // first streamed chunk, so a forwarding node's per-chunk
+                    // inactivity bound can fire mid-stream.
+                    match std::env::var("MOCK_SLOW_STREAM_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        Some(ms) => sleep(Duration::from_millis(ms)).await,
+                        None => {
+                            let ms = rand::rng().random_range(50..200);
+                            sleep(Duration::from_millis(ms)).await;
+                        }
+                    }
                 } else {
                     let ms = rand::rng().random_range(50..200);
                     sleep(Duration::from_millis(ms)).await;

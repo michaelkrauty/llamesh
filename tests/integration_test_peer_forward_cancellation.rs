@@ -35,6 +35,10 @@ const NODE_A_BODY_ADDR: &str = "127.0.0.1:9232";
 const NODE_B_BODY_ADDR: &str = "127.0.0.1:9233";
 const NODE_A_BODY_URL: &str = "http://127.0.0.1:9232";
 const NODE_B_BODY_URL: &str = "http://127.0.0.1:9233";
+const NODE_A_INACT_ADDR: &str = "127.0.0.1:9234";
+const NODE_B_INACT_ADDR: &str = "127.0.0.1:9235";
+const NODE_A_INACT_URL: &str = "http://127.0.0.1:9234";
+const NODE_B_INACT_URL: &str = "http://127.0.0.1:9235";
 
 fn config_node(
     node_id: &str,
@@ -108,6 +112,45 @@ models:
         max_instances: 1
         llama_server_args: ""
 "#;
+
+/// Mock-server wrapper that streams the first SSE chunk promptly, then pauses
+/// `stream_delay_ms` before the rest — stalling a *streaming* response so a
+/// forwarding node's per-chunk inactivity bound can fire mid-stream.
+async fn setup_slow_stream_mock_script(root: &Path, suffix: &str, stream_delay_ms: u64) -> PathBuf {
+    let mock_script = root.join(format!("tests/mock_server_{suffix}.sh"));
+    let mock_bin = std::env::var_os("CARGO_BIN_EXE_mock_llama_server")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let debug_bin = root.join("target/debug/mock_llama_server");
+            if debug_bin.exists() {
+                debug_bin
+            } else {
+                root.join("target/release/mock_llama_server")
+            }
+        });
+    let script = format!(
+        r#"#!/bin/bash
+export MOCK_SLOW_STREAM_MS={stream_delay_ms}
+BIN="{}"
+"$BIN" "$@" &
+PID=$!
+trap "kill $PID" EXIT TERM INT
+wait $PID
+"#,
+        mock_bin.display()
+    );
+    tokio::fs::write(&mock_script, script).await.unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = tokio::fs::metadata(&mock_script)
+        .await
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o755);
+    tokio::fs::set_permissions(&mock_script, perms)
+        .await
+        .unwrap();
+    mock_script
+}
 
 /// Mock-server wrapper that sends response headers promptly, then pauses
 /// halfway through the non-streaming body.
@@ -502,6 +545,176 @@ async fn cancelled_peer_forward_during_noise_body_buffer_does_not_leak_current_r
     graceful_stop(&mut proxy_b).await;
     cleanup_procs("mock_server_peer_fwd_body_cancel.sh").await;
     cleanup_by_port_range_pattern("1313[0-9]").await;
+    let _ = tokio::fs::remove_file(mock_script).await;
+    let _ = tokio::fs::remove_file(config_a_path).await;
+    let _ = tokio::fs::remove_file(cookbook_a_path).await;
+    let _ = tokio::fs::remove_file(config_b_path).await;
+    let _ = tokio::fs::remove_file(cookbook_b_path).await;
+}
+
+/// #138: a peer that goes silent mid-stream while serving a forwarded
+/// `stream: true` request must not pin the forwarding node's in-flight slot
+/// forever. With `upstream_read_timeout_ms` set on Node B, each Noise
+/// peer-response body chunk is read under a per-chunk inactivity timeout, so a
+/// peer (Node A) that stalls partway through the streamed body is aborted and
+/// B's slot is released — without the client cancelling and well before the
+/// stall would otherwise end. Before the fix B held the slot for the full stall
+/// (here, until the mock resumed at 12s).
+#[tokio::test]
+async fn streaming_peer_forward_body_inactivity_timeout_releases_slot() {
+    cleanup_procs("mock_server_peer_fwd_body_inact.sh").await;
+    cleanup_procs("config_peer_fwd_body_inact").await;
+    cleanup_by_port_range_pattern("1314[0-9]").await;
+
+    let root = std::env::current_dir().unwrap();
+    // Node A's mock streams the first SSE chunk promptly, then stalls for 12s
+    // before the rest. B's 1500ms inactivity bound must fire in that gap, far
+    // short of the 12s stall (the long stall leaves ample margin for A's
+    // instance spawn before declaring the slot leaked).
+    let mock_script = setup_slow_stream_mock_script(&root, "peer_fwd_body_inact", 12000).await;
+
+    let config_a_path = root.join("tests/config_peer_fwd_body_inact_a.yaml");
+    common::reset_metrics_file(&root, "node-a-inact").await;
+    common::reset_metrics_file(&root, "node-b-inact").await;
+    let cookbook_a_path = root.join("tests/cookbook_peer_fwd_body_inact_a.yaml");
+    let config_b_path = root.join("tests/config_peer_fwd_body_inact_b.yaml");
+    let cookbook_b_path = root.join("tests/cookbook_peer_fwd_body_inact_b.yaml");
+
+    let proxy_bin = llamesh_binary(&root);
+
+    tokio::fs::write(
+        &config_a_path,
+        config_node(
+            "node-a-inact",
+            NODE_A_INACT_ADDR,
+            NODE_B_INACT_URL,
+            13140,
+            13144,
+            &mock_script,
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(&cookbook_a_path, COOKBOOK_A)
+        .await
+        .unwrap();
+    // Node B bounds peer-response inactivity at 1500ms (default is 0/disabled).
+    tokio::fs::write(
+        &config_b_path,
+        format!(
+            "{}\nupstream_read_timeout_ms: 1500\n",
+            config_node(
+                "node-b-inact",
+                NODE_B_INACT_ADDR,
+                NODE_A_INACT_URL,
+                13145,
+                13149,
+                &mock_script,
+            ),
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(&cookbook_b_path, COOKBOOK_B)
+        .await
+        .unwrap();
+
+    let mut proxy_a = tokio::process::Command::new(&proxy_bin)
+        .arg("--config")
+        .arg(&config_a_path)
+        .arg("--cookbook")
+        .arg(&cookbook_a_path)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to start proxy A");
+    let mut proxy_b = tokio::process::Command::new(&proxy_bin)
+        .arg("--config")
+        .arg(&config_b_path)
+        .arg("--cookbook")
+        .arg(&cookbook_b_path)
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to start proxy B");
+
+    assert!(
+        wait_for_ready(NODE_A_INACT_URL).await,
+        "node A failed to ready"
+    );
+    assert!(
+        wait_for_ready(NODE_B_INACT_URL).await,
+        "node B failed to ready"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    assert!(
+        wait_for_peer_discovery(
+            &client,
+            NODE_B_INACT_URL,
+            "node-a-inact",
+            Duration::from_secs(15)
+        )
+        .await,
+        "node B should discover node A within 15s"
+    );
+
+    // `stream: true` so B surfaces the response and streams the peer body to
+    // the client (the path the inactivity bound covers) rather than buffering.
+    let body = serde_json::json!({
+        "model": "peer-model:default",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true,
+    });
+
+    // Long client timeout (30s): the client never cancels, so only B's own
+    // inactivity bound can release the slot. B forwards to A and streams the
+    // head + first body half to the client, then A stalls 12s. B must abort the
+    // stalled body read at ~1.5s, ending the client stream, rather than holding
+    // the stream open until the mock resumes at 12s.
+    let started = std::time::Instant::now();
+    let read_result = match client
+        .post(format!("{NODE_B_INACT_URL}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+    {
+        // Reading the streamed body blocks until B aborts it (Err) or the stall
+        // ends. With the fix this errors at ~1.5s; without it, it would not
+        // resolve until the mock resumes at 12s.
+        Ok(resp) => resp.bytes().await.map(|_| ()),
+        Err(e) => Err(e),
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(9),
+        "B should abort the stalled peer stream well before the 12s stall ends; took {elapsed:?}"
+    );
+    assert!(
+        read_result.is_err(),
+        "the streamed body should be aborted by B's inactivity bound, not completed"
+    );
+
+    // The decisive check: B's slot returns to 0 well before the 12s stall would
+    // end. Without the inactivity bound B holds it until the mock resumes (~12s),
+    // so an 8s window fails on the old behavior and passes on the fix.
+    assert!(
+        wait_for_current_requests(&client, NODE_B_INACT_URL, 0, Duration::from_secs(8)).await,
+        "node B's current_requests should return to 0 within 8s via the inactivity bound; \
+         observed {}",
+        current_requests(&client, NODE_B_INACT_URL).await
+    );
+    // Node A (the serving node) has no inactivity bound configured, so it holds
+    // its own slot until its mock stall ends — that is orthogonal to this fix,
+    // which is about the *forwarding* node B not being pinned by a silent peer.
+
+    graceful_stop(&mut proxy_a).await;
+    graceful_stop(&mut proxy_b).await;
+    cleanup_procs("mock_server_peer_fwd_body_inact.sh").await;
+    cleanup_by_port_range_pattern("1314[0-9]").await;
     let _ = tokio::fs::remove_file(mock_script).await;
     let _ = tokio::fs::remove_file(config_a_path).await;
     let _ = tokio::fs::remove_file(cookbook_a_path).await;

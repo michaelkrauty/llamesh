@@ -54,6 +54,10 @@ pub struct NoiseBodyStream {
     first_body: Option<Bytes>,
     pending: Option<NoiseBodyReadFuture>,
     done: bool,
+    /// Per-chunk inactivity bound on body reads. `None` leaves reads unbounded.
+    /// When set, each `recv_data` is wrapped in this timeout (reset per chunk),
+    /// so a peer that goes silent mid-body cannot hold this node's slot forever.
+    inactivity: Option<Duration>,
 }
 
 /// Client-side response over Noise.
@@ -64,7 +68,7 @@ pub struct NoiseHttpResponse {
 }
 
 impl NoiseHttpResponse {
-    pub fn into_body_stream(self) -> NoiseBodyStream {
+    pub fn into_body_stream(self, inactivity: Option<Duration>) -> NoiseBodyStream {
         NoiseBodyStream {
             session: Some(self.session),
             stream: Some(self.stream),
@@ -75,6 +79,7 @@ impl NoiseHttpResponse {
             },
             pending: None,
             done: false,
+            inactivity,
         }
     }
 }
@@ -411,8 +416,24 @@ impl Stream for NoiseBodyStream {
         if self.pending.is_none() {
             let mut session = self.session.take().expect("noise session missing");
             let mut stream = self.stream.take().expect("noise stream missing");
+            let inactivity = self.inactivity;
             self.pending = Some(Box::pin(async move {
-                let bytes = recv_data(&mut session, &mut stream).await?;
+                // Reset the inactivity bound on every chunk: a slow-but-active
+                // peer keeps resetting it, while one that stops sending trips it.
+                let bytes = match inactivity {
+                    Some(duration) => {
+                        tokio::time::timeout(duration, recv_data(&mut session, &mut stream))
+                            .await
+                            .map_err(|_| {
+                                NoiseError::Transport(
+                                    "Peer response body read timed out (no data within \
+                                     upstream_read_timeout_ms)"
+                                        .into(),
+                                )
+                            })??
+                    }
+                    None => recv_data(&mut session, &mut stream).await?,
+                };
                 Ok((session, stream, bytes))
             }));
         }
