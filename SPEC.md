@@ -799,6 +799,16 @@ For full semantics (including drain/shutdown behavior), see **Health, Readiness,
 * `GET /metrics` -> Prometheus-style metrics (canonical source for real-time scraping).
 * `GET /metrics/json` -> JSON-encoded metrics for ad-hoc inspection or tooling.
 
+Key `proxy_*` series exposed. Gauges reflect the current moment; most counters are cumulative and persist across restarts via the metrics snapshot — the exception is the per-process stream counters in the **Streaming** group, which reset on restart.
+
+* **Request handling** — `proxy_requests_total` (requests received), `proxy_errors_total` (request errors), `proxy_current_requests` (in flight now).
+* **Queueing** — `proxy_queue_length` (waiting now), `proxy_queue_drops_total{reason}` (`full` / `timeout` / `global_limit`), `proxy_queue_wait_total_ms` and `proxy_queue_wait_count` (cumulative wait time and count), `proxy_queue_pending_tokens`.
+* **Node resources** — `proxy_node_active_instances`; `proxy_node_effective_vram_mb` / `proxy_node_max_vram_mb` (VRAM used for admission vs the configured guardrail) and the `_sysmem_` equivalents; `proxy_node_llamesh_vram_mb`, `proxy_node_external_vram_mb`, `proxy_node_device_vram_used_mb`, `proxy_node_device_vram_total_mb`; `proxy_node_gpu_telemetry_available` (1/0).
+* **Cluster health & recovery** — `proxy_circuit_breaker_state{peer}` (0=closed, 1=open, 2=half-open), `proxy_wedged_instances_killed_total` (local instances stopped by the wedged-instance watchdog).
+* **Streaming** (per-process, reset on restart) — `proxy_peer_stream_body_aborts_total` (forwarded peer streams whose body aborted mid-stream), `proxy_skipped_stream_cleanups_total` (cleanups skipped during shutdown), `proxy_token_counting_disabled_total`.
+* **Per model:profile** — the `proxy_hash_*` family (`requests_total`, `errors_total`, `tokens_generated_total`, `total_latency_ms`, latency percentiles, `peak_vram_mb`, `peak_sysmem_mb`), labeled by the profile's args hash.
+* **Build** — `proxy_build_info{version=...,llama_cpp_version=...}` (info series, value `1`; aggregate with `count by (version) (proxy_build_info)`).
+
 ### Cluster / Admin
 
 * `GET /cluster/nodes` -> current view of nodes and their capacities.
