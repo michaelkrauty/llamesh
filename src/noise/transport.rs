@@ -243,30 +243,39 @@ pub async fn recv_response_head(
     parse_http_response_head(&data)
 }
 
-/// Read exactly `buf.len()` bytes, optionally bounding the wait by a per-read
-/// inactivity timeout. Applying the timeout to each frame read (rather than to
-/// a whole multi-frame message) gives true inactivity semantics: a slow but
-/// actively-progressing stream keeps resetting the bound on every frame.
+/// Fill `buf` completely, optionally bounding the wait by an inactivity
+/// timeout. The timeout is applied to each individual read and reset on every
+/// successful read, so it bounds *silence* on the connection (true read-
+/// inactivity semantics): a stream that keeps delivering bytes — even slowly,
+/// and even within one large frame — never trips it, while one that goes quiet
+/// for `duration` does. `None` leaves the read unbounded.
 async fn read_exact_bounded(
     stream: &mut TcpStream,
     buf: &mut [u8],
     inactivity: Option<Duration>,
 ) -> Result<()> {
-    match inactivity {
-        Some(duration) => {
-            tokio::time::timeout(duration, stream.read_exact(buf))
-                .await
-                .map_err(|_| {
-                    NoiseError::Transport(
-                        "Peer response body read timed out (no data within \
-                         upstream_read_timeout_ms)"
-                            .into(),
-                    )
-                })??;
+    let Some(duration) = inactivity else {
+        stream.read_exact(buf).await?;
+        return Ok(());
+    };
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = tokio::time::timeout(duration, stream.read(&mut buf[filled..]))
+            .await
+            .map_err(|_| {
+                NoiseError::Transport(
+                    "Peer response body read timed out (no data within \
+                     upstream_read_timeout_ms)"
+                        .into(),
+                )
+            })??;
+        if n == 0 {
+            // Peer closed the connection before the frame was complete.
+            return Err(NoiseError::Transport(
+                "Peer closed connection mid-frame".into(),
+            ));
         }
-        None => {
-            stream.read_exact(buf).await?;
-        }
+        filled += n;
     }
     Ok(())
 }
