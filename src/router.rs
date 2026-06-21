@@ -15,7 +15,7 @@ use axum::{
 use bytes::Bytes;
 use futures::{future::BoxFuture, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::{
     collections::HashSet,
@@ -897,6 +897,7 @@ pub async fn route_request(
                             response_streaming,
                             cleanup_fut,
                             tokens_counter,
+                            Some((state.circuit_breaker.clone(), peer.node_id.clone())),
                         )
                         .await);
                     }
@@ -1248,6 +1249,7 @@ pub async fn route_request(
                                     cleanup_fut,
                                     tokens_counter,
                                     error_recorder,
+                                    None,
                                 )
                             } else {
                                 handle_non_streaming_response(
@@ -1377,6 +1379,7 @@ pub async fn route_request(
                                         response_streaming,
                                         cleanup_fut,
                                         tokens_counter,
+                                        Some((state.circuit_breaker.clone(), peer.node_id.clone())),
                                     )
                                     .await;
 
@@ -1538,6 +1541,7 @@ pub async fn route_request(
                             response_streaming,
                             cleanup_fut,
                             tokens_counter,
+                            Some((state.circuit_breaker.clone(), current_node.node_id.clone())),
                         )
                         .await);
                     }
@@ -1725,6 +1729,33 @@ pub async fn route_request(
 /// peer-fallback status check and `peer_body_read_failed`).
 type BodyReadErrorRecorder = Option<(Arc<Metrics>, Arc<HashMetrics>)>;
 
+/// For a streaming peer forward: the circuit breaker and the peer id to record a
+/// failure against if the peer's response body aborts mid-stream. `None` on the
+/// local path and non-streaming forwards.
+type PeerStreamFailureRecorder = Option<(Arc<crate::circuit_breaker::CircuitBreaker>, String)>;
+
+/// Set the shared `body_errored` flag (if present) so a streaming peer's
+/// cleanup can record a circuit-breaker failure for an aborted body. Idempotent.
+fn flag_peer_stream_body_error(flag: &Option<Arc<AtomicBool>>) {
+    if let Some(flag) = flag {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Record a (non-probe) circuit-breaker failure for `peer_id` when a streaming
+/// peer forward's body aborted mid-stream. A non-probe failure counts toward the
+/// failure threshold (backing off a chronically-failing peer) but never reopens
+/// a peer that is recovering in half-open state.
+async fn back_off_peer_on_body_error(
+    circuit_breaker: &crate::circuit_breaker::CircuitBreaker,
+    peer_id: &str,
+    body_errored: &AtomicBool,
+) {
+    if body_errored.load(Ordering::Relaxed) {
+        circuit_breaker.record_failure(peer_id, false).await;
+    }
+}
+
 /// Count one local body-read failure: node-wide `proxy_errors_total` plus the
 /// per-hash `errors_total`, mirroring the local send()-error accounting. A
 /// `None` recorder is a no-op.
@@ -1842,6 +1873,7 @@ fn build_streaming_response(
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
     error_recorder: BodyReadErrorRecorder,
+    body_errored: Option<Arc<AtomicBool>>,
 ) -> Response<Body> {
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -1850,6 +1882,7 @@ fn build_streaming_response(
         cleanup,
         tokens_generated,
         error_recorder,
+        body_errored,
     );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
@@ -1863,14 +1896,15 @@ fn build_streaming_response_from_parts<S, E>(
     stream: S,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
+    body_errored: Option<Arc<AtomicBool>>,
 ) -> Response<Body>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
 {
-    // Peer (Noise) stream: peer-path failures are accounted for separately, so
-    // no local error recorder.
-    let stream = CleanupStream::new(stream, cleanup, tokens_generated, None);
+    // Peer (Noise) stream: local error metrics are accounted for separately, so
+    // no local error recorder; `body_errored` lets the cleanup back off the peer.
+    let stream = CleanupStream::new(stream, cleanup, tokens_generated, None, body_errored);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -1882,13 +1916,32 @@ async fn peer_response_to_client(
     stream_requested: bool,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
+    peer_failure_recorder: PeerStreamFailureRecorder,
 ) -> Response<Body> {
+    // For a streaming peer forward, a body abort after a 2xx head is a peer
+    // failure that should back the peer off, but it surfaces only later inside
+    // the streamed body — after the head was already recorded as a success. Use
+    // a shared flag the stream sets on error and the cleanup reads, recording a
+    // (non-probe) circuit-breaker failure so a chronically-stalling peer is
+    // deprioritised. Only wired up for streaming forwards: a non-streaming
+    // forward buffers the body and a read error is surfaced directly instead.
+    let body_errored = stream_requested.then(|| Arc::new(AtomicBool::new(false)));
+    let cleanup: BoxFuture<'static, ()> = match (&body_errored, peer_failure_recorder) {
+        (Some(flag), Some((circuit_breaker, peer_id))) => {
+            let flag = flag.clone();
+            Box::pin(async move {
+                cleanup.await;
+                back_off_peer_on_body_error(&circuit_breaker, &peer_id, &flag).await;
+            })
+        }
+        _ => cleanup,
+    };
     match response {
         PeerResponse::Http(resp) => {
             if stream_requested {
-                // Peer path: no local error recorder (failures accounted for
-                // separately via the peer-fallback status check / circuit breaker).
-                build_streaming_response(resp, cleanup, tokens_generated, None)
+                // Peer path: no local error recorder (local metrics are accounted
+                // for separately); `body_errored` drives peer back-off instead.
+                build_streaming_response(resp, cleanup, tokens_generated, None, body_errored)
             } else {
                 handle_non_streaming_response(resp, cleanup, tokens_generated, None).await
             }
@@ -1906,6 +1959,7 @@ async fn peer_response_to_client(
                     body,
                     cleanup,
                     tokens_generated,
+                    body_errored,
                 )
             } else {
                 let _cleanup_guard = AutoCleanup::new(cleanup);
@@ -1961,6 +2015,10 @@ where
     error_recorder: BodyReadErrorRecorder,
     /// Guards the body-read error count to exactly one per failed stream.
     error_recorded: bool,
+    /// Shared flag set on a mid-stream body error so a streaming peer forward's
+    /// cleanup can record a circuit-breaker failure for the peer. `None` when
+    /// there is nothing to signal (local streams, non-peer).
+    body_errored: Option<Arc<AtomicBool>>,
 }
 
 impl<S, E> CleanupStream<S, E>
@@ -1972,6 +2030,7 @@ where
         cleanup: BoxFuture<'static, ()>,
         tokens_generated: Arc<AtomicU64>,
         error_recorder: BodyReadErrorRecorder,
+        body_errored: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             inner: Box::pin(inner),
@@ -1982,6 +2041,7 @@ where
             cleanup_executed: false,
             error_recorder,
             error_recorded: false,
+            body_errored,
         }
     }
 }
@@ -2156,6 +2216,9 @@ where
                             "Local streaming body read failed"
                         );
                     }
+                    // For a streaming peer forward, signal the cleanup to back
+                    // off this peer (the body aborted after a 2xx head).
+                    flag_peer_stream_body_error(&self.body_errored);
                 }
                 Poll::Ready(Some(Err(e)))
             }
@@ -2838,6 +2901,7 @@ mod tests {
             Box::pin(async {}),
             Arc::new(AtomicU64::new(0)),
             Some((metrics.clone(), hm.clone())),
+            None,
         );
         while s.next().await.is_some() {}
         assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
@@ -2859,6 +2923,7 @@ mod tests {
             Box::pin(async {}),
             Arc::new(AtomicU64::new(0)),
             Some((metrics.clone(), hm.clone())),
+            None,
         );
         while s.next().await.is_some() {}
         assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 1);
@@ -2874,9 +2939,77 @@ mod tests {
             Ok(Bytes::from("x")),
             Err(std::io::Error::other("boom")),
         ]);
-        let mut s =
-            CleanupStream::new(inner, Box::pin(async {}), Arc::new(AtomicU64::new(0)), None);
+        let mut s = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            None,
+        );
         while s.next().await.is_some() {}
         assert_eq!(metrics.errors_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_sets_body_errored_flag_on_mid_stream_error() {
+        use futures::StreamExt;
+        // A streaming peer forward passes this flag; a mid-stream body error
+        // must set it so the cleanup records a peer circuit-breaker failure.
+        let flag = Arc::new(AtomicBool::new(false));
+        let inner = body_stream(vec![
+            Ok(Bytes::from("data: {}\n")),
+            Err(std::io::Error::other("peer reset")),
+        ]);
+        let mut s = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Some(flag.clone()),
+        );
+        while s.next().await.is_some() {}
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a mid-stream body error must set body_errored"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_leaves_body_errored_clear_on_clean_eof() {
+        use futures::StreamExt;
+        // A stream that completes without error must not flag a peer failure.
+        let flag = Arc::new(AtomicBool::new(false));
+        let inner = body_stream(vec![Ok(Bytes::from("a")), Ok(Bytes::from("b"))]);
+        let mut s = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            Some(flag.clone()),
+        );
+        while s.next().await.is_some() {}
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a clean EOF must not set body_errored"
+        );
+    }
+
+    #[tokio::test]
+    async fn back_off_peer_records_failure_only_when_body_errored() {
+        use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        });
+        // No body error: nothing recorded, circuit stays closed.
+        back_off_peer_on_body_error(&cb, "peer-x", &AtomicBool::new(false)).await;
+        assert_eq!(cb.get_state("peer-x").await, CircuitState::Closed);
+        // Body errored: each call records a non-probe failure; the circuit opens
+        // once the threshold is reached, backing the stalling peer off.
+        let errored = AtomicBool::new(true);
+        back_off_peer_on_body_error(&cb, "peer-x", &errored).await;
+        assert_eq!(cb.get_state("peer-x").await, CircuitState::Closed);
+        back_off_peer_on_body_error(&cb, "peer-x", &errored).await;
+        assert_eq!(cb.get_state("peer-x").await, CircuitState::Open);
     }
 }

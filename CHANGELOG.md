@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.4] - 2026-06-21
+
+### Fixed
+
+- A streaming request forwarded to a cluster peer is surfaced to the client as
+  soon as the peer's `2xx` response head arrives, and that head is recorded as a
+  circuit-breaker success. If the peer's body then aborted mid-stream, the
+  failure was delivered later by the body stream and was not fed back into the
+  peer's circuit-breaker accounting, so a peer that repeatedly sent headers and
+  then stalled or reset kept being selected instead of being backed off
+  (#147). The streamed peer body now records a non-probe circuit-breaker failure
+  for the peer when it aborts. A non-probe failure counts toward the failure
+  threshold (so a chronically-failing peer opens its circuit and is
+  deprioritised) but never reopens a peer that is already recovering in
+  half-open state. Only a genuine mid-stream body error triggers it — a clean
+  end or a downstream client disconnect does not — and it is scoped to streaming
+  forwards (a non-streaming forward surfaces a body-read error directly).
+
 ## [1.19.3] - 2026-06-21
 
 ### Changed
