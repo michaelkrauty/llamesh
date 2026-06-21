@@ -95,14 +95,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    type BoxedRetryFuture = std::pin::Pin<Box<dyn Future<Output = anyhow::Result<usize>> + Send>>;
+
     /// Returns an op closure that fails `failures` times, then succeeds,
     /// along with the attempt counter it increments.
-    fn flaky_op(
-        failures: usize,
-    ) -> (
-        impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<usize>> + Send>>,
-        Arc<AtomicUsize>,
-    ) {
+    fn flaky_op(failures: usize) -> (impl FnMut() -> BoxedRetryFuture, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_in_op = calls.clone();
         let op = move || {
@@ -114,7 +111,7 @@ mod tests {
                 } else {
                     Ok(n)
                 }
-            }) as std::pin::Pin<Box<dyn Future<Output = anyhow::Result<usize>> + Send>>
+            }) as BoxedRetryFuture
         };
         (op, calls)
     }

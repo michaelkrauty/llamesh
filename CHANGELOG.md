@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.3] - 2026-06-21
+
+### Changed
+
+- Cleared the remaining `cargo clippy --all-targets` warnings so the full-target
+  lint is a clean gate (previously only `--bin llamesh` was clean): a test
+  helper's complex boxed-future return type is now a named type alias, and the
+  non-empty `SCHEDULED_UPDATE_RETRY_DELAYS` invariant is enforced by a
+  compile-time assertion next to the constant (stronger than the former runtime
+  test, which clippy flagged as an always-true `const` check). No runtime
+  behavior change.
+
 ## [1.19.2] - 2026-06-20
 
 ### Fixed

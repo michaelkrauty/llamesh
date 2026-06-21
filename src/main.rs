@@ -52,6 +52,11 @@ const SCHEDULED_UPDATE_RETRY_DELAYS: &[Duration] = &[
     Duration::from_secs(300),
 ];
 
+// An empty schedule would silently make a single `git fetch` blip skip a whole
+// `auto_update_interval_seconds` (commonly a day) and log it at ERROR as a build
+// failure. Enforce a non-empty schedule at compile time.
+const _: () = assert!(!SCHEDULED_UPDATE_RETRY_DELAYS.is_empty());
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -526,14 +531,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    // A scheduled-update cycle must retry transient failures. An empty delay
-    // schedule would silently make a single `git fetch` blip skip a whole
-    // auto_update_interval_seconds (commonly a day) and log it at ERROR as a
-    // build failure — the regression this schedule guards against.
-    #[test]
-    fn scheduled_update_retry_delays_allow_retries() {
-        assert!(!SCHEDULED_UPDATE_RETRY_DELAYS.is_empty());
-    }
+    // The non-empty-schedule invariant this test used to assert at runtime is
+    // now enforced at compile time next to `SCHEDULED_UPDATE_RETRY_DELAYS`.
 
     // A transient failure recovers within the scheduled retry budget without
     // reaching the exhausted (ERROR-logged) outcome — the behavior this
