@@ -1276,6 +1276,13 @@ cluster:
     open_duration_max_ms: 60000
 ```
 
+**Behavior:**
+
+* The circuit is **per peer**, keyed by the peer's node id. Both request forwarding *and* gossip to that peer feed the same circuit, so a peer that stays reachable for gossip is continually observed as healthy.
+* In the **closed** state each failure increments a counter and the circuit opens once the counter reaches `failure_threshold`; **any success resets that counter to zero**. Failures therefore have to reach the threshold without an intervening success — which is why the breaker primarily catches a peer that is failing outright (forwarding *and* gossip failing together) rather than one that stays reachable but returns the occasional bad response.
+* An **open** circuit blocks dispatches to the peer for an exponential backoff (`open_duration_base_ms`, doubling on each consecutive open, capped at `open_duration_max_ms`), then admits a single **half-open** recovery probe. `success_threshold` consecutive probe successes close the circuit; a probe failure reopens it with the next backoff step. On an otherwise idle cluster the periodic gossip exchange can serve as that recovery probe.
+* Recovery transitions are driven only by *probe* results: a slow failure from a request dispatched before the circuit opened does not re-block a peer that is already recovering.
+
 **Tuning tips:**
 
 * Lower `failure_threshold` for faster failure detection (trades off more false positives).

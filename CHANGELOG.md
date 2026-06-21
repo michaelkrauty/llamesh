@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.4] - 2026-06-21
+
+### Documentation
+
+- Documented the circuit breaker's runtime behavior in `SPEC.md` (only its
+  configuration was described before): the per-peer circuit is keyed by the peer
+  node id and shared by both request forwarding and gossip; any success in the
+  closed state resets the failure counter to zero, so the breaker primarily
+  catches a peer failing outright rather than one that stays reachable but
+  returns occasional bad responses; and recovery is a single half-open probe
+  with exponential backoff, driven only by probe results. No code change.
+
 ## [1.19.3] - 2026-06-21
 
 ### Changed
