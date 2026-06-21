@@ -52,12 +52,16 @@ pub struct NodeConfig {
     /// 0 = no global limit (only per-model limits apply).
     #[serde(default = "default_max_total_queue_entries")]
     pub max_total_queue_entries: usize,
-    /// Inactivity (read) timeout in milliseconds for outbound requests to a
-    /// local `llama-server` instance. A stalled upstream (one that accepted the
-    /// request then stops sending, e.g. a hung instance at 0% CPU) otherwise
-    /// holds its in-flight slot forever, which can hang a graceful drain. reqwest
-    /// resets this on every received chunk, so for a streaming response it bounds
-    /// silence between tokens without affecting an actively-streaming generation.
+    /// Inactivity (read) timeout in milliseconds for outbound requests to an
+    /// upstream. Covers every request to a local `llama-server` instance, plus
+    /// the response body of a *streaming* request forwarded to a cluster peer
+    /// over the Noise transport (a non-streaming peer forward buffers and
+    /// retries on read failure, so it is not bounded here). A stalled upstream
+    /// (one that accepted the request then stops sending, e.g. a hung instance
+    /// at 0% CPU or a frozen peer) otherwise holds its in-flight slot forever,
+    /// which can hang a graceful drain. The timer is reset on every received
+    /// chunk, so for a streaming response it bounds silence between tokens
+    /// without affecting an actively-streaming generation.
     /// Disabled by default (`0`): the timer also covers the wait for the first
     /// body bytes — and for `stream: false` the body arrives only when generation
     /// finishes — so any non-zero value shorter than a request's full generation

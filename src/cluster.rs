@@ -177,17 +177,25 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                             {
                                 Ok(resp) => {
                                     let status = resp.head.status;
-                                    let mut body = resp.into_body_stream();
+                                    // Bound the body drain by the same gossip timeout so a
+                                    // peer that stalls mid-body cannot hang the gossip loop.
+                                    let mut body =
+                                        resp.into_body_stream(Some(GOSSIP_REQUEST_TIMEOUT));
+                                    let mut drained = true;
                                     while let Some(chunk) = body.next().await {
                                         if let Err(e) = chunk {
                                             debug!(
                                                 "Failed to drain Noise gossip response from {}: {}",
                                                 peer_url, e
                                             );
+                                            drained = false;
                                             break;
                                         }
                                     }
-                                    if (200..300).contains(&status) {
+                                    // A 2xx head whose body could not be drained (e.g. the peer
+                                    // stalled and tripped the read timeout) is a failed exchange,
+                                    // not a healthy one — record it as such instead of success.
+                                    if (200..300).contains(&status) && drained {
                                         if circuit_breaker
                                             .record_success(&cb_key, gossip_probe_ticket)
                                             .await
@@ -199,8 +207,8 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                             .record_failure(&cb_key, gossip_probe_ticket)
                                             .await;
                                         debug!(
-                                            "Failed to gossip to {} over Noise: HTTP {}",
-                                            peer_url, status
+                                            "Failed to gossip to {} over Noise: HTTP {} (body drained: {})",
+                                            peer_url, status, drained
                                         );
                                     }
                                 }
