@@ -1866,14 +1866,16 @@ fn build_streaming_response_from_parts<S, E>(
     stream: S,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
+    peer_stream: bool,
 ) -> Response<Body>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
 {
-    // Peer (Noise) stream: no local error recorder, but a mid-stream abort is
-    // counted in `PEER_STREAM_BODY_ABORTS` (peer_stream = true).
-    let stream = CleanupStream::new(stream, cleanup, tokens_generated, None, true);
+    // Peer (Noise) stream: no local error recorder; a mid-stream abort is
+    // counted in `PEER_STREAM_BODY_ABORTS` when `peer_stream` (a successful
+    // streamed peer response — the otherwise-invisible 2xx-body-abort case).
+    let stream = CleanupStream::new(stream, cleanup, tokens_generated, None, peer_stream);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -1889,9 +1891,14 @@ async fn peer_response_to_client(
     match response {
         PeerResponse::Http(resp) => {
             if stream_requested {
-                // Peer path: no local error recorder, but a mid-stream abort is
-                // counted in `PEER_STREAM_BODY_ABORTS` (peer_stream = true).
-                build_streaming_response(resp, cleanup, tokens_generated, None, true)
+                // Peer path: no local error recorder. Count a mid-stream abort in
+                // `PEER_STREAM_BODY_ABORTS` only for a *successful* (2xx) streamed
+                // response — the otherwise-invisible case. A non-2xx response is
+                // already visible via its error status (this matters on the
+                // spawn-failure fallback path, which streams whatever status the
+                // peer returned; the primary path only surfaces 2xx).
+                let peer_stream = resp.status().is_success();
+                build_streaming_response(resp, cleanup, tokens_generated, None, peer_stream)
             } else {
                 handle_non_streaming_response(resp, cleanup, tokens_generated, None).await
             }
@@ -1909,6 +1916,7 @@ async fn peer_response_to_client(
                     body,
                     cleanup,
                     tokens_generated,
+                    status.is_success(),
                 )
             } else {
                 let _cleanup_guard = AutoCleanup::new(cleanup);
