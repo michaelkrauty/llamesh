@@ -2176,8 +2176,10 @@ where
                         );
                     }
                     if self.peer_stream {
+                        // Peer-attributed (not a node `proxy_errors_total` error);
+                        // logged at warn like the other peer-forward failures.
                         PEER_STREAM_BODY_ABORTS.fetch_add(1, Ordering::Relaxed);
-                        error!(
+                        warn!(
                             event = "peer_stream_body_aborted",
                             "Forwarded peer streaming body aborted mid-stream"
                         );
