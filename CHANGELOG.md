@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.1] - 2026-06-21
+
+### Documentation
+
+- Added a metrics reference to `SPEC.md`: the `### Metrics` section previously
+  named only the `/metrics` and `/metrics/json` endpoints without listing what
+  they expose. It now groups the key `proxy_*` series (request handling,
+  queueing, node resources, cluster health/recovery, streaming, per-model:profile
+  `proxy_hash_*`, and build info) with one-line descriptions, so operators do not
+  have to read the source to know what is scraped. No code change.
+
 ## [1.20.0] - 2026-06-21
 
 ### Added
