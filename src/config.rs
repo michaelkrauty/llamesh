@@ -295,6 +295,24 @@ impl NodeConfig {
                     ));
                 }
             }
+
+            // Validate the peer version-mismatch policy. The gossip handler in
+            // `cluster.rs` matches exactly "reject_any" and "reject_major" and
+            // treats every other string as the permissive default (accept all
+            // peers), so a typo like "reject-major" or "strict" silently disables
+            // the rejection an operator intended during a rolling upgrade. The
+            // field has a default ("warn"), so only a non-default typo trips this.
+            if !matches!(
+                self.cluster.version_mismatch_action.as_str(),
+                "warn" | "reject_major" | "reject_any"
+            ) {
+                return Err(anyhow::anyhow!(
+                    "cluster.version_mismatch_action '{}' is invalid; expected one of: \
+                     warn, reject_major, reject_any. An unknown value silently degrades to \
+                     'warn' (accept all peers).",
+                    self.cluster.version_mismatch_action
+                ));
+            }
         }
 
         // Validate the local instance cap. `max_instances_per_node` caps how many
@@ -375,6 +393,32 @@ impl NodeConfig {
             // A sample interval larger than the window is allowed: it does not
             // make confirmation impossible, it only raises detection latency
             // (the sustained-wedge check still accumulates across samples).
+        }
+
+        // Validate API key auth, but only when enabled. `check_api_key_auth`
+        // rejects a request unless its key matches one of `allowed_keys`, so an
+        // enabled auth block with an empty `allowed_keys` rejects *every* request
+        // as Unauthorized — the proxy comes up healthy but serves nothing, with
+        // no signal beyond 401s (easy to hit when the keys live in a secrets file
+        // that was not merged). An empty `required_header` likewise leaves clients
+        // no header to send the key in. Both deserialize cleanly, so catch them
+        // at startup. Skipped when auth is absent or disabled.
+        if let Some(auth) = &self.auth {
+            if auth.enabled {
+                if auth.allowed_keys.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "auth.enabled is true but auth.allowed_keys is empty; every request \
+                         would be rejected as Unauthorized. Add at least one key, or set \
+                         auth.enabled: false."
+                    ));
+                }
+                if auth.required_header.trim().is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "auth.enabled is true but auth.required_header is empty; set the header \
+                         name clients send the API key in (e.g. \"x-api-key\")."
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -741,8 +785,31 @@ impl Cookbook {
         // Only enabled pairs are indexed, so only those can actually collide.
         let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for model in &self.models {
+            // A ':' in a model or profile name collides with the reserved
+            // `model:profile` request separator. The index key is built as
+            // `model:profile` and resolution splits on the first ':', so an
+            // embedded colon makes the entry permanently unaddressable (a silent
+            // 404 at request time with no startup signal). Reject it here.
+            if model.name.contains(':') {
+                return Err(anyhow::anyhow!(
+                    "Model name '{}' contains ':', which is reserved as the model:profile \
+                     request separator; an embedded colon makes the model unaddressable \
+                     (resolution splits on the first ':'). Remove the colon from the name.",
+                    model.name
+                ));
+            }
             for profile in &model.profiles {
                 profile.validate(&model.name)?;
+
+                if profile.id.contains(':') {
+                    return Err(anyhow::anyhow!(
+                        "Profile id '{}' (model '{}') contains ':', which is reserved as the \
+                         model:profile request separator; an embedded colon makes the profile \
+                         unaddressable. Remove the colon from the id.",
+                        profile.id,
+                        model.name
+                    ));
+                }
 
                 if model.enabled && profile.enabled {
                     let key = format!(
@@ -1473,6 +1540,122 @@ mod tests {
         let mut config = config_with_cluster(false, 5, 16);
         config.max_instances_per_node = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_enabled_auth_with_empty_allowed_keys() {
+        // Enabled auth with no keys rejects every request as Unauthorized, so the
+        // proxy comes up healthy but serves nothing. Catch it at startup.
+        let mut config = config_with_ports(None);
+        config.auth = Some(AuthConfig {
+            enabled: true,
+            required_header: "x-api-key".into(),
+            allowed_keys: vec![],
+        });
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_enabled_auth_with_empty_required_header() {
+        let mut config = config_with_ports(None);
+        config.auth = Some(AuthConfig {
+            enabled: true,
+            required_header: "   ".into(),
+            allowed_keys: vec!["k".into()],
+        });
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_enabled_auth_with_keys() {
+        let mut config = config_with_ports(None);
+        config.auth = Some(AuthConfig {
+            enabled: true,
+            required_header: "x-api-key".into(),
+            allowed_keys: vec!["k".into()],
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_ignores_empty_auth_keys_when_disabled() {
+        // A disabled auth block never gates requests, so stray empties are fine.
+        let mut config = config_with_ports(None);
+        config.auth = Some(AuthConfig {
+            enabled: false,
+            required_header: String::new(),
+            allowed_keys: vec![],
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_version_mismatch_action_when_cluster_enabled() {
+        let mut config = config_with_cluster(true, 5, 16);
+        config.cluster.version_mismatch_action = "reject-major".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_known_version_mismatch_actions() {
+        for action in ["warn", "reject_major", "reject_any"] {
+            let mut config = config_with_cluster(true, 5, 16);
+            config.cluster.version_mismatch_action = action.into();
+            assert!(config.validate().is_ok(), "{action} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_ignores_version_mismatch_action_when_cluster_disabled() {
+        // The gossip handler never runs in standalone mode, so the field is moot.
+        let mut config = config_with_cluster(false, 5, 16);
+        config.cluster.version_mismatch_action = "bogus".into();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cookbook_validate_rejects_colon_in_model_name() {
+        let yaml = r#"
+models:
+  - name: "gpt:oss"
+    profiles:
+      - id: default
+        model_path: /tmp/m.gguf
+        idle_timeout_seconds: 10
+        llama_server_args: ""
+"#;
+        let cookbook: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cookbook.validate().is_err());
+    }
+
+    #[test]
+    fn cookbook_validate_rejects_colon_in_profile_id() {
+        let yaml = r#"
+models:
+  - name: gptoss
+    profiles:
+      - id: "fast:v2"
+        model_path: /tmp/m.gguf
+        idle_timeout_seconds: 10
+        llama_server_args: ""
+"#;
+        let cookbook: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cookbook.validate().is_err());
+    }
+
+    #[test]
+    fn cookbook_validate_accepts_colon_free_names() {
+        let yaml = r#"
+models:
+  - name: gpt-oss
+    profiles:
+      - id: default
+        model_path: /tmp/m.gguf
+        idle_timeout_seconds: 10
+        llama_server_args: ""
+"#;
+        let cookbook: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cookbook.validate().is_ok());
     }
 
     #[test]

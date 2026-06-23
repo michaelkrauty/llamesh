@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.2] - 2026-06-23
+
+### Fixed
+
+- Startup config validation now rejects three more classes of configuration that
+  loaded cleanly but were silently broken at runtime (continuing the fail-fast
+  pattern already applied to ports, gossip, the circuit breaker, and the instance
+  cap):
+  - `auth.enabled: true` with an empty `allowed_keys` (or an empty
+    `required_header`) — every request would be rejected as `Unauthorized`, so the
+    proxy came up healthy but served nothing with no signal beyond 401s (easy to
+    hit when the keys live in a secrets file that was not merged). Validation is
+    skipped when auth is absent or disabled.
+  - A `:` in a cookbook model name or profile id — `:` is the reserved
+    `model:profile` request separator, so an embedded colon made the entry
+    permanently unaddressable (a silent 404 at request time).
+  - An unknown `cluster.version_mismatch_action` — only `warn`, `reject_major`,
+    and `reject_any` are honored; any other value silently degraded to accepting
+    all peers, inverting the operator's intended rejection policy during a rolling
+    upgrade. Checked only in cluster mode.
+
 ## [1.20.1] - 2026-06-21
 
 ### Documentation
