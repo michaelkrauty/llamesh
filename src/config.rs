@@ -785,33 +785,36 @@ impl Cookbook {
         // Only enabled pairs are indexed, so only those can actually collide.
         let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for model in &self.models {
-            // A ':' in a model or profile name collides with the reserved
-            // `model:profile` request separator. The index key is built as
-            // `model:profile` and resolution splits on the first ':', so an
-            // embedded colon makes the entry permanently unaddressable (a silent
-            // 404 at request time with no startup signal). Reject it here.
-            if model.name.contains(':') {
-                return Err(anyhow::anyhow!(
-                    "Model name '{}' contains ':', which is reserved as the model:profile \
-                     request separator; an embedded colon makes the model unaddressable \
-                     (resolution splits on the first ':'). Remove the colon from the name.",
-                    model.name
-                ));
-            }
             for profile in &model.profiles {
                 profile.validate(&model.name)?;
 
-                if profile.id.contains(':') {
-                    return Err(anyhow::anyhow!(
-                        "Profile id '{}' (model '{}') contains ':', which is reserved as the \
-                         model:profile request separator; an embedded colon makes the profile \
-                         unaddressable. Remove the colon from the id.",
-                        profile.id,
-                        model.name
-                    ));
-                }
-
                 if model.enabled && profile.enabled {
+                    // A ':' in a model or profile name collides with the reserved
+                    // `model:profile` request separator: the index key is built as
+                    // `model:profile` and resolution splits on the first ':', so an
+                    // embedded colon makes the pair permanently unaddressable (a
+                    // silent 404). Only enabled pairs are indexed (`build_model_index`
+                    // skips disabled ones), so — like the duplicate-key check below
+                    // — gate this on enabled so a disabled, inert colon-named entry
+                    // does not turn a working cookbook into a startup/reload error.
+                    if model.name.contains(':') {
+                        return Err(anyhow::anyhow!(
+                            "Model name '{}' contains ':', which is reserved as the model:profile \
+                             request separator; an embedded colon makes the model unaddressable \
+                             (resolution splits on the first ':'). Remove the colon from the name.",
+                            model.name
+                        ));
+                    }
+                    if profile.id.contains(':') {
+                        return Err(anyhow::anyhow!(
+                            "Profile id '{}' (model '{}') contains ':', which is reserved as the \
+                             model:profile request separator; an embedded colon makes the profile \
+                             unaddressable. Remove the colon from the id.",
+                            profile.id,
+                            model.name
+                        ));
+                    }
+
                     let key = format!(
                         "{}:{}",
                         model.name.to_lowercase(),
@@ -1650,6 +1653,25 @@ models:
   - name: gpt-oss
     profiles:
       - id: default
+        model_path: /tmp/m.gguf
+        idle_timeout_seconds: 10
+        llama_server_args: ""
+"#;
+        let cookbook: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        assert!(cookbook.validate().is_ok());
+    }
+
+    #[test]
+    fn cookbook_validate_ignores_colon_in_disabled_entry() {
+        // A disabled model/profile is skipped by build_model_index and never
+        // indexed, so a colon in its (inert) name must not turn a working
+        // cookbook into a startup/reload error — mirrors the duplicate-key gate.
+        let yaml = r#"
+models:
+  - name: "retired:model"
+    enabled: false
+    profiles:
+      - id: "old:profile"
         model_path: /tmp/m.gguf
         idle_timeout_seconds: 10
         llama_server_args: ""
