@@ -20,7 +20,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 /// observer: `is_alive` sets the child handle to `None` on the first poll that
 /// sees an exit, so each crash is counted exactly once, and the proxy's own
 /// `stop()` takes the handle first so its intentional teardown never reaches the
-/// counting arm. Two further exits are deliberately not counted: a plain
+/// counting arm. Deliberately not counted: a clean exit (status 0, e.g. a
+/// server that handles a shutdown signal and exits on its own), a plain
 /// `SIGTERM` (how systemd's whole-control-group `systemctl restart` and
 /// operators ask a process to stop — an expected shutdown, not a crash), and a
 /// `try_wait` poll failure (which means "status unknown", not "exited"). Fault
@@ -604,17 +605,18 @@ impl Instance {
         match &mut *guard {
             Some(child) => match child.try_wait() {
                 Ok(Some(status)) => {
-                    // A plain SIGTERM is how systemd (whole control-group on a
-                    // `systemctl restart`) and operators ask a process to stop,
-                    // so an instance that exits on SIGTERM was terminated on
-                    // purpose, not crashed — do not count it. Genuine crashes
-                    // surface as a fault signal (SIGSEGV/SIGABRT/SIGKILL/…) or a
-                    // non-zero exit code, both still counted. The proxy's own
-                    // stop() takes the child handle first, so its intentional
-                    // teardown never reaches this arm; this guard covers the
-                    // out-of-band case where the child is signalled directly
-                    // (e.g. systemd during a graceful node shutdown).
-                    if status.signal() != Some(libc::SIGTERM) {
+                    // Count only abnormal exits. A clean exit (status 0) is not a
+                    // crash — llama-server may handle a shutdown signal and exit
+                    // 0 on its own before stop() takes the handle. A plain
+                    // SIGTERM is likewise a deliberate stop, not a crash: it is
+                    // how systemd (whole control-group on a `systemctl restart`)
+                    // and operators ask a process to terminate, and it reaches
+                    // this arm out-of-band during a graceful node shutdown while
+                    // the proxy's own stop() (which takes the handle first) has
+                    // not run yet. Genuine crashes — a fault signal
+                    // (SIGSEGV/SIGABRT/SIGKILL/…) or a non-zero exit code — are
+                    // counted.
+                    if !status.success() && status.signal() != Some(libc::SIGTERM) {
                         INSTANCES_CRASHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
                     warn!(
@@ -1134,6 +1136,28 @@ mod tests {
             INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed),
             before_term,
             "a SIGTERM (deliberate stop) must not count as a crash"
+        );
+
+        // 3. A clean exit (status 0) — e.g. a llama-server that handles a
+        //    shutdown signal and exits on its own before stop() takes the handle
+        //    — is not a crash: observed but not counted.
+        let before_clean = INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed);
+        let clean = make_instance("clean-exit-test");
+        *clean.child.lock() = Some(
+            Command::new("sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .expect("spawn clean-exit child"),
+        );
+        assert!(
+            observe_dead(&clean).await,
+            "is_alive should observe the clean exit"
+        );
+        assert_eq!(
+            INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed),
+            before_clean,
+            "a clean exit (status 0) must not count as a crash"
         );
     }
 }
