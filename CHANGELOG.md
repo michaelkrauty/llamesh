@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-07-04
+
+### Added
+
+- New `proxy_instances_crashed_total` metric counting local `llama-server`
+  instances that exited abnormally. Instance crashes were previously visible
+  only as an `Instance exited unexpectedly` log line, so their rate could not be
+  scraped or alerted on; in practice they arrive in intermittent bursts (a bad
+  model/profile dying repeatedly), which is exactly the pattern a counter
+  surfaces better than logs. The counter increments in the liveness check
+  (`Instance::is_alive`), the single authoritative crash observer: it nulls the
+  child handle on the first poll that sees an exit, so each crash is counted
+  exactly once. Deliberate stops are excluded — the proxy's own `stop()` takes
+  the handle first, and an exit on a plain `SIGTERM` (how systemd's
+  whole-control-group `systemctl restart` and operators ask a process to stop)
+  is treated as a graceful shutdown rather than a crash, so a routine restart
+  does not inflate the counter even while a background sweep observes the exit.
+  Fault signals (SIGSEGV/SIGABRT/SIGKILL/…) and non-zero exit codes are counted.
+  Exposed on both `/metrics` and `/metrics/json`; process-global and resets on
+  restart, like the other static-sourced counters.
+
 ## [1.20.2] - 2026-06-23
 
 ### Fixed

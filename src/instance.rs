@@ -3,8 +3,9 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -13,6 +14,20 @@ use tokio::sync::Notify;
 use tracing::{info, warn};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+/// Counter for local `llama-server` instances that exited abnormally, observed
+/// by the liveness check (`Instance::is_alive`). This is the sole runtime crash
+/// observer: `is_alive` sets the child handle to `None` on the first poll that
+/// sees an exit, so each crash is counted exactly once, and the proxy's own
+/// `stop()` takes the handle first so its intentional teardown never reaches the
+/// counting arm. Deliberately not counted: a clean exit (status 0, e.g. a
+/// server that handles a shutdown signal and exits on its own), a plain
+/// `SIGTERM` (how systemd's whole-control-group `systemctl restart` and
+/// operators ask a process to stop — an expected shutdown, not a crash), and a
+/// `try_wait` poll failure (which means "status unknown", not "exited"). Fault
+/// signals (SIGSEGV/SIGABRT/SIGKILL/…) and non-zero exit codes are counted.
+/// Exposed as `proxy_instances_crashed_total`; runtime-only (resets on restart).
+pub static INSTANCES_CRASHED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Model parameters parsed from llama-server startup log.
 /// This is the ground truth for model capabilities.
@@ -590,6 +605,20 @@ impl Instance {
         match &mut *guard {
             Some(child) => match child.try_wait() {
                 Ok(Some(status)) => {
+                    // Count only abnormal exits. A clean exit (status 0) is not a
+                    // crash — llama-server may handle a shutdown signal and exit
+                    // 0 on its own before stop() takes the handle. A plain
+                    // SIGTERM is likewise a deliberate stop, not a crash: it is
+                    // how systemd (whole control-group on a `systemctl restart`)
+                    // and operators ask a process to terminate, and it reaches
+                    // this arm out-of-band during a graceful node shutdown while
+                    // the proxy's own stop() (which takes the handle first) has
+                    // not run yet. Genuine crashes — a fault signal
+                    // (SIGSEGV/SIGABRT/SIGKILL/…) or a non-zero exit code — are
+                    // counted.
+                    if !status.success() && status.signal() != Some(libc::SIGTERM) {
+                        INSTANCES_CRASHED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
                     warn!(
                         instance_id = %self.id,
                         model = %self.model_name,
@@ -1025,6 +1054,110 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "probe must time out promptly rather than hang, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_counter_classifies_exits() {
+        // The liveness check is the single authoritative crash observer. This is
+        // the only test that touches the process-global INSTANCES_CRASHED_TOTAL,
+        // and both cases run sequentially here, so its exact deltas stay
+        // deterministic under the parallel test harness.
+        fn make_instance(id: &str) -> Instance {
+            Instance::new(
+                id.to_string(),
+                "test-model".to_string(),
+                "default".to_string(),
+                "127.0.0.1".to_string(),
+                8080,
+                "hash123".to_string(),
+                false,
+            )
+        }
+        async fn observe_dead(instance: &Instance) -> bool {
+            for _ in 0..200 {
+                if !instance.is_alive() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            false
+        }
+
+        // 1. A non-zero exit stands in for a real crash: counted exactly once,
+        //    and a later liveness check on the already-observed exit (handle now
+        //    `None`) must not re-count.
+        let before = INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed);
+        let crashed = make_instance("crash-test");
+        *crashed.child.lock() = Some(
+            Command::new("sh")
+                .arg("-c")
+                .arg("exit 1")
+                .spawn()
+                .expect("spawn crashing child"),
+        );
+        assert!(
+            observe_dead(&crashed).await,
+            "is_alive should observe the exit"
+        );
+        assert_eq!(
+            INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed),
+            before + 1,
+            "a non-zero exit must be counted exactly once"
+        );
+        assert!(!crashed.is_alive());
+        assert_eq!(
+            INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed),
+            before + 1,
+            "an already-observed crash must not be re-counted"
+        );
+
+        // 2. A deliberate SIGTERM (systemd's whole-cgroup `systemctl restart`, an
+        //    operator stop) is an expected shutdown, not a crash: the liveness
+        //    check still observes the exit but must not count it.
+        let before_term = INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed);
+        let terminated = make_instance("sigterm-test");
+        let sleeper = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleeping child");
+        let pid = sleeper.id().expect("child pid") as i32;
+        *terminated.child.lock() = Some(sleeper);
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .expect("send SIGTERM to child");
+        assert!(
+            observe_dead(&terminated).await,
+            "is_alive should observe the SIGTERM exit"
+        );
+        assert_eq!(
+            INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed),
+            before_term,
+            "a SIGTERM (deliberate stop) must not count as a crash"
+        );
+
+        // 3. A clean exit (status 0) — e.g. a llama-server that handles a
+        //    shutdown signal and exits on its own before stop() takes the handle
+        //    — is not a crash: observed but not counted.
+        let before_clean = INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed);
+        let clean = make_instance("clean-exit-test");
+        *clean.child.lock() = Some(
+            Command::new("sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .expect("spawn clean-exit child"),
+        );
+        assert!(
+            observe_dead(&clean).await,
+            "is_alive should observe the clean exit"
+        );
+        assert_eq!(
+            INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed),
+            before_clean,
+            "a clean exit (status 0) must not count as a crash"
         );
     }
 }
