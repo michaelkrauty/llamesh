@@ -296,6 +296,12 @@ pub struct MetricsSnapshot {
     /// older snapshots loadable.
     #[serde(default)]
     pub peer_stream_body_aborts_total: u64,
+    /// Local `llama-server` instances observed to have exited abnormally by the
+    /// liveness check (a fault signal or non-zero exit; a graceful `SIGTERM` is
+    /// not counted). Process-global, resets on restart; `#[serde(default)]` keeps
+    /// older snapshots loadable.
+    #[serde(default)]
+    pub instances_crashed_total: u64,
     pub hashes: HashMap<String, HashMetricsSnapshot>,
     pub updated_at: String,
     #[serde(default)]
@@ -671,6 +677,8 @@ impl Metrics {
                 .load(Ordering::Relaxed),
             peer_stream_body_aborts_total: crate::router::PEER_STREAM_BODY_ABORTS
                 .load(Ordering::Relaxed),
+            instances_crashed_total: crate::instance::INSTANCES_CRASHED_TOTAL
+                .load(Ordering::Relaxed),
             hashes,
             updated_at: chrono::Utc::now().to_rfc3339(),
             is_building: build_status
@@ -916,6 +924,16 @@ pub async fn render_prometheus_with_circuit_breaker(
     out.push_str(&format!(
         "proxy_peer_stream_body_aborts_total {}\n",
         crate::router::PEER_STREAM_BODY_ABORTS.load(Ordering::Relaxed)
+    ));
+
+    // Local instances observed to have exited abnormally by the liveness check
+    out.push_str(
+        "# HELP proxy_instances_crashed_total Local llama-server instances that exited abnormally (fault signal or non-zero exit; excludes graceful SIGTERM).\n",
+    );
+    out.push_str("# TYPE proxy_instances_crashed_total counter\n");
+    out.push_str(&format!(
+        "proxy_instances_crashed_total {}\n",
+        crate::instance::INSTANCES_CRASHED_TOTAL.load(Ordering::Relaxed)
     ));
 
     // Circuit breaker metrics (if available)
