@@ -52,6 +52,49 @@ async fn wait_for_capacity_or_disconnect(
     }
 }
 
+/// Await an upstream network operation, aborting early if the client's
+/// connection closes first.
+///
+/// Wraps a peer forward or a local generation so an abandoned request stops
+/// consuming cluster resources — a queued instance slot, a peer connection, an
+/// in-flight generation — instead of running to completion for a client that
+/// has already gone away. Returns the operation's output, or
+/// `AppError::client_disconnected()` if the client disconnects first. With no
+/// connection handle (`None`) the future is awaited without disconnect
+/// detection (e.g. an internally-originated request that has no client socket).
+///
+/// Dropping `fut` on disconnect is intentional: it cancels the wrapped
+/// operation, closing the per-request peer/backend connection so the abort
+/// propagates one hop downstream (a forwarding node closing its connection lets
+/// the serving node observe the disconnect in turn). The caller's
+/// `RequestGuard`/`PeerForwardGuard` release the request's in-flight and metric
+/// accounting on the early return exactly as they do on any other error path,
+/// and a circuit-breaker probe left unrecorded is benign (at worst the peer's
+/// next recovery probe waits one interval).
+async fn await_unless_client_gone<F, T>(
+    conn: &Option<ConnectionHandle>,
+    poll_interval: Duration,
+    stage: &'static str,
+    fut: F,
+) -> Result<T, AppError>
+where
+    F: std::future::Future<Output = T>,
+{
+    match conn {
+        Some(handle) => {
+            tokio::select! {
+                biased;
+                res = fut => Ok(res),
+                _ = crate::connection::poll_client_disconnect(handle, poll_interval) => {
+                    info!(event = "client_disconnected", stage = stage, "Client disconnected during upstream wait");
+                    Err(AppError::client_disconnected())
+                }
+            }
+        }
+        None => Ok(fut.await),
+    }
+}
+
 struct RequestGuard {
     state: Arc<NodeState>,
     // For local instances
@@ -865,20 +908,25 @@ pub async fn route_request(
                 // cleanup_fut on the attempt that commits.
                 let peer_forward_guard = state.track_peer_forward(&peer.node_id).await;
 
-                let outcome = attempt_peer_forward(
-                    &state,
-                    PeerRequest {
-                        peer_id: &peer.node_id,
-                        peer_address: &peer.address,
-                        method: parts.method.clone(),
-                        path_and_query: &path_and_query,
-                        headers: forward_headers.clone(),
-                        body: forward_body.clone(),
-                        timeout_ms,
-                    },
-                    response_streaming,
+                let outcome = await_unless_client_gone(
+                    &conn_handle,
+                    DISCONNECT_POLL_INTERVAL,
+                    "peer_forward",
+                    attempt_peer_forward(
+                        &state,
+                        PeerRequest {
+                            peer_id: &peer.node_id,
+                            peer_address: &peer.address,
+                            method: parts.method.clone(),
+                            path_and_query: &path_and_query,
+                            headers: forward_headers.clone(),
+                            body: forward_body.clone(),
+                            timeout_ms,
+                        },
+                        response_streaming,
+                    ),
                 )
-                .await;
+                .await?;
 
                 match outcome {
                     ForwardOutcome::StreamingSurface(resp) => {
@@ -1133,7 +1181,14 @@ pub async fn route_request(
                         client_req = client_req.timeout(Duration::from_millis(timeout_ms));
                     }
 
-                    match client_req.send().await {
+                    match await_unless_client_gone(
+                        &conn_handle,
+                        DISCONNECT_POLL_INTERVAL,
+                        "local_generation",
+                        client_req.send(),
+                    )
+                    .await?
+                    {
                         Ok(resp) => {
                             let tokens_counter = Arc::new(AtomicU64::new(0));
                             let tokens_for_cleanup = tokens_counter.clone();
@@ -1320,20 +1375,25 @@ pub async fn route_request(
                             let forward_headers =
                                 build_forward_headers(&parts.headers, current_hops, &request_id);
 
-                            match send_peer_request(
-                                &state,
-                                PeerRequest {
-                                    peer_id: &peer.node_id,
-                                    peer_address: &peer.address,
-                                    method: parts.method.clone(),
-                                    path_and_query: &path_and_query,
-                                    headers: forward_headers,
-                                    body: forward_body.clone(),
-                                    timeout_ms,
-                                },
-                                response_streaming,
+                            match await_unless_client_gone(
+                                &conn_handle,
+                                DISCONNECT_POLL_INTERVAL,
+                                "peer_forward",
+                                send_peer_request(
+                                    &state,
+                                    PeerRequest {
+                                        peer_id: &peer.node_id,
+                                        peer_address: &peer.address,
+                                        method: parts.method.clone(),
+                                        path_and_query: &path_and_query,
+                                        headers: forward_headers,
+                                        body: forward_body.clone(),
+                                        timeout_ms,
+                                    },
+                                    response_streaming,
+                                ),
                             )
-                            .await
+                            .await?
                             {
                                 Ok(resp) => {
                                     let status = match &resp {
@@ -1497,20 +1557,25 @@ pub async fn route_request(
                 let peer_forward_guard =
                     state.track_peer_forward(&current_node.node_id).await;
 
-                let outcome = attempt_peer_forward(
-                    &state,
-                    PeerRequest {
-                        peer_id: &current_node.node_id,
-                        peer_address: &current_node.address,
-                        method: parts.method.clone(),
-                        path_and_query: &path_and_query,
-                        headers: forward_headers.clone(),
-                        body: forward_body.clone(),
-                        timeout_ms,
-                    },
-                    response_streaming,
+                let outcome = await_unless_client_gone(
+                    &conn_handle,
+                    DISCONNECT_POLL_INTERVAL,
+                    "peer_forward",
+                    attempt_peer_forward(
+                        &state,
+                        PeerRequest {
+                            peer_id: &current_node.node_id,
+                            peer_address: &current_node.address,
+                            method: parts.method.clone(),
+                            path_and_query: &path_and_query,
+                            headers: forward_headers.clone(),
+                            body: forward_body.clone(),
+                            timeout_ms,
+                        },
+                        response_streaming,
+                    ),
                 )
-                .await;
+                .await?;
 
                 let mut probe_wait_deadline: Option<Duration> = None;
                 let mut skip_wait = false;
@@ -2338,6 +2403,56 @@ fn ensure_profile_supports_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::AsRawFd;
+
+    // A live, connected server-side socket whose peer is still attached.
+    async fn connected_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn await_unless_client_gone_without_handle_just_awaits() {
+        // No connection handle (e.g. an internally-originated request): the
+        // future is awaited with no disconnect detection.
+        let out: Result<u32, AppError> =
+            await_unless_client_gone(&None, Duration::from_millis(10), "test", async { 42 }).await;
+        assert_eq!(out.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn await_unless_client_gone_returns_output_when_still_connected() {
+        // Client still attached: a completing future returns its value and is
+        // never spuriously aborted as a disconnect.
+        let (client, server) = connected_pair().await;
+        let handle = Some(ConnectionHandle::new(server.as_raw_fd()));
+        let out: Result<u32, AppError> =
+            await_unless_client_gone(&handle, Duration::from_millis(20), "test", async { 7 }).await;
+        assert_eq!(out.unwrap(), 7);
+        drop(client);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn await_unless_client_gone_aborts_when_client_disconnects() {
+        // Client goes away while the operation is still pending: the wrapped
+        // future is dropped and a 499 client_disconnected error is returned
+        // instead of the request running to completion.
+        let (client, server) = connected_pair().await;
+        let handle = Some(ConnectionHandle::new(server.as_raw_fd()));
+        drop(client); // client closes the connection
+        tokio::time::sleep(Duration::from_millis(50)).await; // let the kernel process the FIN
+        let never = std::future::pending::<u32>();
+        let out: Result<u32, AppError> =
+            await_unless_client_gone(&handle, Duration::from_millis(20), "test", never).await;
+        let err = out.expect_err("should abort on client disconnect");
+        assert_eq!(err.status.as_u16(), 499);
+        assert_eq!(err.error.type_, "client_disconnected");
+        drop(server);
+    }
 
     #[test]
     fn resolve_requested_model_absent_uses_default() {

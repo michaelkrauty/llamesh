@@ -944,7 +944,17 @@ async fn handle_noise_connection(
             ("POST", "/cluster/gossip") => {
                 handle_noise_gossip(&state, request.body.as_ref(), &peer_node_id, remote_addr).await
             }
-            _ => handle_noise_http_request(state.clone(), request).await,
+            _ => {
+                // Give the forwarded request a handle to this per-request Noise
+                // TCP connection. The Noise transport opens one connection per
+                // request, so its liveness tracks the forwarding peer: when the
+                // peer closes it (because the original client disconnected and
+                // the peer aborted its forward), the router detects the close
+                // and abandons the request instead of queueing/generating for a
+                // client that is already gone.
+                let conn_handle = ConnectionHandle::new(tcp_stream.as_raw_fd());
+                handle_noise_http_request(state.clone(), conn_handle, request).await
+            }
         };
 
         if let Err(e) = send_noise_response(&mut session, &mut tcp_stream, response).await {
@@ -1008,6 +1018,7 @@ fn build_noise_request_headers(raw: &[(String, String)]) -> HeaderMap {
 
 async fn handle_noise_http_request(
     state: Arc<NodeState>,
+    conn_handle: ConnectionHandle,
     request: crate::noise::transport::NoiseRequest,
 ) -> axum::response::Response {
     let mut builder = Request::builder()
@@ -1029,7 +1040,7 @@ async fn handle_noise_http_request(
         }
     };
 
-    match router::route_request(State(state), None, req).await {
+    match router::route_request(State(state), Some(Extension(conn_handle)), req).await {
         Ok(resp) => resp.into_response(),
         Err(err) => err.into_response(),
     }
