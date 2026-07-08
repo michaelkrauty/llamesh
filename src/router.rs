@@ -1297,23 +1297,35 @@ pub async fn route_request(
                             // peer paths pass None and account for it elsewhere.
                             let error_recorder =
                                 Some((state.metrics.clone(), hash_metrics.clone()));
-                            Ok(if response_streaming {
-                                build_streaming_response(
+                            if response_streaming {
+                                Ok(build_streaming_response(
                                     resp,
                                     cleanup_fut,
                                     tokens_counter,
                                     error_recorder,
                                     false,
-                                )
+                                ))
                             } else {
-                                handle_non_streaming_response(
-                                    resp,
-                                    cleanup_fut,
-                                    tokens_counter,
-                                    error_recorder,
+                                // `send()` resolves at the response headers, so a
+                                // slow non-streaming body would otherwise be read
+                                // to completion for an already-gone client. Keep
+                                // watching for disconnect across the body drain
+                                // too; the `AutoCleanup` inside
+                                // `handle_non_streaming_response` runs the cleanup
+                                // if we bail mid-read.
+                                await_unless_client_gone(
+                                    &conn_handle,
+                                    DISCONNECT_POLL_INTERVAL,
+                                    "local_generation",
+                                    handle_non_streaming_response(
+                                        resp,
+                                        cleanup_fut,
+                                        tokens_counter,
+                                        error_recorder,
+                                    ),
                                 )
                                 .await
-                            })
+                            }
                         }
                         Err(e) => {
                             error!("Upstream error: {}", e);
