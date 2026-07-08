@@ -1445,13 +1445,27 @@ pub async fn route_request(
 
                                     guard.complete();
 
-                                    let client_response = peer_response_to_client(
-                                        resp,
-                                        response_streaming,
-                                        cleanup_fut,
-                                        tokens_counter,
+                                    // Watch for client disconnect across the peer
+                                    // body drain too. For a non-streaming response
+                                    // peer_response_to_client buffers the body, so
+                                    // without this an abandoned request would read
+                                    // the full peer generation; its AutoCleanup
+                                    // runs the cleanup if we bail mid-read. (A
+                                    // streaming response returns here at the
+                                    // headers and is torn down by its own
+                                    // write-failure path.)
+                                    let client_response = await_unless_client_gone(
+                                        &conn_handle,
+                                        DISCONNECT_POLL_INTERVAL,
+                                        "peer_forward",
+                                        peer_response_to_client(
+                                            resp,
+                                            response_streaming,
+                                            cleanup_fut,
+                                            tokens_counter,
+                                        ),
                                     )
-                                    .await;
+                                    .await?;
 
                                     // Count an error iff the client ultimately
                                     // receives an error response. `client_status` is
