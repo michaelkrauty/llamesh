@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.1] - 2026-07-08
+
+### Fixed
+
+- Client disconnects now propagate across the cluster, so an abandoned request
+  stops consuming resources instead of running to completion. A request
+  forwarded to a peer over the encrypted cluster (Noise) transport previously
+  reached the router without a connection handle, which left the existing
+  client-disconnect detection inert for all cross-node traffic: when the
+  originating client went away, the serving node kept the request queued while
+  waiting for capacity and then generated a full upstream response that no one
+  would read — for however long the request would otherwise take (many minutes
+  of queue wait under memory contention). Peer-forwarded requests now carry a
+  handle to their per-request transport connection, and the router's upstream
+  waits — acquiring a local instance (including time spent queued for capacity),
+  forwarding to a peer, and the local generation request — are abandoned with
+  `499 Client Closed Request` when that connection closes, which in turn closes
+  the next hop's connection so the cancellation propagates down the chain.
+  Direct (non-forwarded) API requests were already covered by the HTTP server
+  cancelling the handler on disconnect; this brings cross-node forwarding to
+  parity.
+
 ## [1.21.0] - 2026-07-04
 
 ### Added
