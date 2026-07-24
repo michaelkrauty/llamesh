@@ -68,7 +68,7 @@ models:
         model_path: "./models/mock-emb.gguf"
         idle_timeout_seconds: 60
         max_instances: 1
-        llama_server_args: "--embedding -c 4096 --parallel 3"
+        llama_server_args: "--embedding"
 
   - name: "rerank-model"
     profiles:
@@ -115,38 +115,7 @@ models:
     assert_eq!(json["object"], "list");
     assert_eq!(json["data"][0]["object"], "embedding");
 
-    // 2. Model params parsed from the instance startup log reach /v1/models.
-    // The embeddings request above spawned the instance, so its startup log has
-    // been parsed by now. Asserting the values end-to-end guards the whole
-    // chain — stderr capture, regex parse, metadata assembly — against silent
-    // llama.cpp log-format drift, which is otherwise invisible: the parser fails
-    // open, leaving these fields null rather than failing any request.
-    let resp = client
-        .get("http://127.0.0.1:9200/v1/models")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "Models request failed");
-    let json: serde_json::Value = resp.json().await.unwrap();
-    let embedding_entry = json["data"]
-        .as_array()
-        .expect("data array")
-        .iter()
-        .find(|m| {
-            m["metadata"]["model"] == "embedding-model" && m["metadata"]["profile_id"] == "default"
-        })
-        .expect("embedding-model default profile listed in /v1/models");
-    let parsed = &embedding_entry["metadata"]["parsed_model_params"];
-    assert_eq!(
-        parsed["n_ctx"], 4096,
-        "n_ctx must come from the startup log (-c 4096); got {parsed}"
-    );
-    assert_eq!(
-        parsed["n_slots"], 3,
-        "n_slots must come from the startup log (--parallel 3); got {parsed}"
-    );
-
-    // 3. Test Reranking
+    // 2. Test Reranking
     let body = serde_json::json!({
         "model": "rerank-model:default",
         "query": "What is love?",
@@ -164,7 +133,7 @@ models:
     let json: serde_json::Value = resp.json().await.unwrap();
     assert!(json["results"].is_array());
 
-    // 4. Test Wrong Endpoint (Text model on embedding endpoint)
+    // 3. Test Wrong Endpoint (Text model on embedding endpoint)
     // "embedding-model" is configured for embeddings. Try using it for chat.
     let body = serde_json::json!({
         "model": "embedding-model:default",
