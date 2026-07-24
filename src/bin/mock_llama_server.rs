@@ -133,14 +133,14 @@ async fn main() {
 
     // Mimic the llama-server startup lines (at default verbosity) that the
     // proxy parses for model parameters, so integration tests exercise the
-    // real startup-log parsing path.
-    println!("srv    load_model: initializing slots, n_slots = {num_slots}");
-    for slot_id in 0..num_slots {
-        println!(
-            "slot   load_model: id  {slot_id} | task -1 | new slot, n_ctx = {}",
-            args.ctx_size
-        );
-    }
+    // real startup-log parsing path. This must track what current llama.cpp
+    // actually emits: it consolidated the slot count and context window onto a
+    // single info-level line and demoted the older per-slot `new slot, n_ctx`
+    // line to trace level, which is invisible at default verbosity.
+    println!(
+        "0.05.107.617 I srv    load_model: initializing, n_slots = {num_slots}, n_ctx_slot = {}, kv_unified = 'true'",
+        args.ctx_size
+    );
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
