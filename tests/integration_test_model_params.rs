@@ -96,7 +96,7 @@ models:
         model_path: "./models/mock.gguf"
         idle_timeout_seconds: 1
         max_instances: 1
-        llama_server_args: "-c 4096"
+        llama_server_args: "-c 4096 --parallel 3"
 "#;
 
 /// Parsed model params must remain available from /v1/models after the
@@ -170,7 +170,13 @@ async fn test_parsed_params_survive_instance_eviction() {
         sleep(Duration::from_millis(250)).await;
     }
     let params = params.expect("parsed params should appear after instance startup");
+    // Both values come from the instance's slot-init line, and both are pinned
+    // to distinct launch args so a match cannot be coincidence. Asserting them
+    // here is what catches llama.cpp startup-log format drift: the parser fails
+    // open, so a format change nulls these fields silently instead of failing
+    // any request.
     assert_eq!(params["n_ctx"], 4096, "unexpected params: {params}");
+    assert_eq!(params["n_slots"], 3, "unexpected params: {params}");
 
     // Wait for the idle instance (1s timeout) to be evicted.
     let mut evicted = false;
@@ -189,6 +195,10 @@ async fn test_parsed_params_survive_instance_eviction() {
         .expect("parsed params should survive instance eviction");
     assert_eq!(
         params["n_ctx"], 4096,
+        "persisted params drifted after eviction: {params}"
+    );
+    assert_eq!(
+        params["n_slots"], 3,
         "persisted params drifted after eviction: {params}"
     );
 

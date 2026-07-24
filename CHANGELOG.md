@@ -19,10 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pattern matched any longer, so every instance startup logged `Failed to parse
   model params from startup log` and `/v1/models` reported
   `parsed_model_params: null` for every profile. The parser now reads both
-  values from the consolidated line, and also accepts the trained context length
-  from the capping warning that replaced the older `n_ctx_seq (<x>) <
-  n_ctx_train (<N>)` one. The previous spellings are still accepted, so a pinned
-  older `llama.cpp` keeps parsing.
+  values from the consolidated line, and additionally accepts the trained
+  context length from the server's own capping warning (`the slot context (<x>)
+  exceeds the training context of the model (<N>)`), which is emitted as a
+  warning and so is visible at default verbosity. The previous spellings are
+  still accepted, so a pinned older `llama.cpp` keeps parsing.
+- `n_ctx_train` remains `null` at default verbosity unless the requested context
+  exceeds the trained one. `llama.cpp` still emits its `n_ctx_seq (<x>) <
+  n_ctx_train (<N>)` message in the opposite case, but at library INFO level,
+  behind the same verbosity gate that hides the `print_info:` block. This is
+  documented rather than worked around: raising verbosity still populates it,
+  along with the rest of the model-metadata block.
 - The mock `llama-server` used by the integration tests emitted the superseded
   startup-log format, which is why the drift above went unnoticed: the suite
   kept passing against a format production no longer produced. It now emits what

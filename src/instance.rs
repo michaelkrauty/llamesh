@@ -113,20 +113,24 @@ static N_CTX_SLOT_REGEX: LazyLock<Regex> =
 static N_SLOTS_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"initializing(?: slots)?, n_slots = (\d+)").unwrap());
 
-/// Trained context length, taken from the capacity warning llama.cpp prints at
-/// default verbosity when the running context is *smaller* than the trained one:
-/// `n_ctx_seq (<x>) < n_ctx_train (<N>)`. Current builds dropped this warning in
-/// favour of the opposite-direction one matched by [`N_CTX_TRAIN_CAP_REGEX`].
+/// Trained context length from llama.cpp's core context-capacity messages,
+/// `n_ctx_seq (<x>) < n_ctx_train (<N>)` and its `>` counterpart. Both are still
+/// emitted, but at different levels: the `<` form is library-level INFO, which
+/// is gated behind the same verbosity threshold as the `print_info:` block and
+/// so is absent from a default-verbosity log, while the `>` form is a warning
+/// and survives. Keep this pattern — it is the only one that matches either
+/// message, and [`N_CTX_TRAIN_CAP_REGEX`] does not supersede it.
 static N_CTX_TRAIN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"n_ctx_train \((\d+)\)").unwrap());
 
-/// Trained context length from current llama.cpp's capping warning, printed at
-/// default verbosity when the requested slot context *exceeds* what the model
-/// was trained on: `the slot context (<x>) exceeds the training context of the
-/// model (<N>) - capping`. Neither this warning nor the one above is printed
-/// when requested and trained context match, so `n_ctx_train` legitimately stays
-/// `None` for a default-verbosity startup that asked for exactly the trained
-/// context.
+/// Trained context length from the server's own capping warning, emitted when
+/// the requested slot context exceeds what the model was trained on: `the slot
+/// context (<x>) exceeds the training context of the model (<N>) - capping`.
+/// This is a warning, so unlike the `<` message above it is visible at default
+/// verbosity. Net effect: at default verbosity `n_ctx_train` is observable only
+/// when the requested context *exceeds* the trained one; a startup that asked
+/// for the same or a smaller context leaves it `None`, which is expected rather
+/// than a parse failure.
 static N_CTX_TRAIN_CAP_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"exceeds the training context of the model \((\d+)\)").unwrap());
 
