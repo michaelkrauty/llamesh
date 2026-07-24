@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.2] - 2026-07-24
+
+### Fixed
+
+- Model parameters are parsed from `llama-server` startup logs again. Recent
+  `llama.cpp` consolidated slot initialisation onto a single log line —
+  `initializing, n_slots = <N>, n_ctx_slot = <M>, ...` — renaming the line the
+  slot count was read from and demoting the per-slot `new slot, n_ctx = <N>`
+  line to trace level, where it is invisible at default verbosity. Neither
+  pattern matched any longer, so every instance startup logged `Failed to parse
+  model params from startup log` and `/v1/models` reported
+  `parsed_model_params: null` for every profile. The parser now reads both
+  values from the consolidated line, and additionally accepts the trained
+  context length from the server's own capping warning (`the slot context (<x>)
+  exceeds the training context of the model (<N>)`), which is emitted as a
+  warning and so is visible at default verbosity. The previous spellings are
+  still accepted, so a pinned older `llama.cpp` keeps parsing.
+- `n_ctx_train` remains `null` at default verbosity unless the requested context
+  exceeds the trained one. `llama.cpp` still emits its `n_ctx_seq (<x>) <
+  n_ctx_train (<N>)` message in the opposite case, but at library INFO level,
+  behind the same verbosity gate that hides the `print_info:` block. This is
+  documented rather than worked around: raising verbosity still populates it,
+  along with the rest of the model-metadata block.
+- The mock `llama-server` used by the integration tests emitted the superseded
+  startup-log format, which is why the drift above went unnoticed: the suite
+  kept passing against a format production no longer produced. It now emits what
+  current `llama.cpp` emits, and an integration test asserts the parsed values
+  reach `/v1/models`, so a future format change fails the suite instead of
+  silently nulling the field.
+
 ## [1.21.1] - 2026-07-08
 
 ### Fixed

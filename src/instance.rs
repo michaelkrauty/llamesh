@@ -40,17 +40,17 @@ pub struct ParsedModelParams {
     // Core context/batch
     pub n_ctx_train: Option<u64>,
     /// Effective per-request context window the instance is serving, parsed from
-    /// `new slot, n_ctx = <N>`. May be smaller than `n_ctx_train` when the
-    /// instance is launched with a reduced context. Unlike the other fields here
-    /// (which come from the model-metadata block), this line is present in every
-    /// healthy startup log regardless of llama.cpp log verbosity.
+    /// the slot-init line (`n_ctx_slot`, or `new slot, n_ctx` on older builds).
+    /// May be smaller than `n_ctx_train` when the instance is launched with a
+    /// reduced context. Unlike the model-metadata fields below, the slot-init
+    /// line is present in every healthy startup log regardless of llama.cpp log
+    /// verbosity.
     pub n_ctx: Option<u64>,
-    /// Number of parallel decode slots the instance initialized, parsed from
-    /// `initializing slots, n_slots = <N>`. This is the number of requests the
-    /// instance can serve concurrently. When a profile does not pin
+    /// Number of parallel decode slots the instance initialized, parsed from the
+    /// same slot-init line as `n_ctx` (`n_slots`). This is the number of requests
+    /// the instance can serve concurrently. When a profile does not pin
     /// `--parallel`/`-np`, llama-server derives this automatically, so it may
     /// differ from the proxy's configured `max_concurrent_requests_per_instance`.
-    /// Like `n_ctx`, this line is present at default llama.cpp log verbosity.
     pub n_slots: Option<u64>,
     pub n_batch: Option<u64>,
     pub n_ubatch: Option<u64>,
@@ -87,23 +87,52 @@ pub struct ParsedModelParams {
 static LOG_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"print_info:\s+(\S+)\s+=\s+(.+)").unwrap());
 
-/// Effective per-slot context window, logged at default verbosity as
-/// `slot load_model: ... new slot, n_ctx = <N>`.
+/// Effective per-slot context window in the spelling older builds emit at
+/// default verbosity: `slot load_model: ... new slot, n_ctx = <N>`. Current
+/// llama.cpp logs this line at trace level, so it is absent unless verbosity is
+/// raised; [`N_CTX_SLOT_REGEX`] covers those builds.
 static SLOT_N_CTX_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"new slot, n_ctx = (\d+)").unwrap());
 
-/// Number of parallel decode slots the instance initialized, logged at default
-/// verbosity as `srv load_model: initializing slots, n_slots = <N>`. This is the
-/// instance's real concurrency capacity, present whether `--parallel`/`-np` was
-/// set explicitly or left for llama-server to resolve automatically.
-static N_SLOTS_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"initializing slots, n_slots = (\d+)").unwrap());
+/// Effective per-slot context window as current llama.cpp reports it, on the
+/// consolidated slot-init line `srv load_model: initializing, n_slots = <N>,
+/// n_ctx_slot = <M>, kv_unified = '<bool>'`. That line is info level, so unlike
+/// `new slot, n_ctx` it survives at default verbosity. Every slot's `n_ctx` is
+/// initialized from `n_ctx_slot` and never reassigned, so the two agree; that
+/// also makes matching the key unanchored safe, even though llama.cpp repeats it
+/// on a trace-level `new prompt, n_ctx_slot = <M>` line during serving.
+static N_CTX_SLOT_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"n_ctx_slot = (\d+)").unwrap());
 
-/// Trained context length, logged at default verbosity only inside the capacity
-/// warning `n_ctx_seq (<x>) < n_ctx_train (<N>)` (printed when an instance is
-/// launched with a context smaller than the model was trained on).
+/// Number of parallel decode slots the instance initialized, logged at info
+/// level on the slot-init line. Current llama.cpp spells it `initializing,
+/// n_slots = <N>, ...`; older builds spelled it `initializing slots, n_slots =
+/// <N>`. This is the instance's real concurrency capacity, present whether
+/// `--parallel`/`-np` was set explicitly or left for llama-server to resolve
+/// automatically.
+static N_SLOTS_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"initializing(?: slots)?, n_slots = (\d+)").unwrap());
+
+/// Trained context length from llama.cpp's core context-capacity messages,
+/// `n_ctx_seq (<x>) < n_ctx_train (<N>)` and its `>` counterpart. Both are still
+/// emitted, but at different levels: the `<` form is library-level INFO, which
+/// is gated behind the same verbosity threshold as the `print_info:` block and
+/// so is absent from a default-verbosity log, while the `>` form is a warning
+/// and survives. Keep this pattern — it is the only one that matches either
+/// message, and [`N_CTX_TRAIN_CAP_REGEX`] does not supersede it.
 static N_CTX_TRAIN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"n_ctx_train \((\d+)\)").unwrap());
+
+/// Trained context length from the server's own capping warning, emitted when
+/// the requested slot context exceeds what the model was trained on: `the slot
+/// context (<x>) exceeds the training context of the model (<N>) - capping`.
+/// This is a warning, so unlike the `<` message above it is visible at default
+/// verbosity. Net effect: at default verbosity `n_ctx_train` is observable only
+/// when the requested context *exceeds* the trained one; a startup that asked
+/// for the same or a smaller context leaves it `None`, which is expected rather
+/// than a parse failure.
+static N_CTX_TRAIN_CAP_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"exceeds the training context of the model \((\d+)\)").unwrap());
 
 /// Maximum number of startup log lines to buffer per instance.
 /// Prevents unbounded memory growth if an instance floods stdout before becoming ready.
@@ -161,20 +190,28 @@ pub fn parse_llama_server_log(lines: &[String]) -> ParsedModelParams {
             }
         }
 
-        // New default-verbosity format (llama.cpp build ~9425+): the verbose
-        // `print_info:` block above is suppressed, but the effective context
-        // window is always logged per slot, and the trained context length is
-        // logged (when the running context is reduced) in a capacity warning.
-        // Parsing these keeps model params observable without raising verbosity.
-        // `print_info:` values, when present, are parsed first and take
-        // precedence, hence the `is_none` guards.
+        // Default-verbosity format (llama.cpp build ~9425+): the verbose
+        // `print_info:` block above is suppressed, but the slot-init line still
+        // reports the effective context window and slot count, and a capacity
+        // warning reports the trained context length whenever it differs from
+        // the requested one. Parsing these keeps model params observable without
+        // raising verbosity. `print_info:` values, when present, are parsed first
+        // and take precedence, hence the `is_none` guards. Each field accepts
+        // both the current and the older spelling, so instances launched against
+        // a pinned older llama.cpp keep parsing.
         if params.n_ctx.is_none() {
-            if let Some(caps) = SLOT_N_CTX_REGEX.captures(line) {
+            if let Some(caps) = SLOT_N_CTX_REGEX
+                .captures(line)
+                .or_else(|| N_CTX_SLOT_REGEX.captures(line))
+            {
                 params.n_ctx = caps.get(1).and_then(|m| m.as_str().parse().ok());
             }
         }
         if params.n_ctx_train.is_none() {
-            if let Some(caps) = N_CTX_TRAIN_REGEX.captures(line) {
+            if let Some(caps) = N_CTX_TRAIN_REGEX
+                .captures(line)
+                .or_else(|| N_CTX_TRAIN_CAP_REGEX.captures(line))
+            {
                 params.n_ctx_train = caps.get(1).and_then(|m| m.as_str().parse().ok());
             }
         }
@@ -903,11 +940,58 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_llama_server_log_new_default_verbosity_format() {
-        // Real default-verbosity startup output from llama.cpp build 9425: the
-        // verbose `print_info:` block is suppressed, but the effective context
-        // window (per slot) and the trained context length (capacity warning)
-        // are still present. Both lines carry the new timestamp/severity prefix.
+    fn test_parse_llama_server_log_consolidated_slot_init_line() {
+        // Verbatim default-verbosity startup output from a current llama.cpp
+        // build. The `print_info:` block is suppressed, the per-slot `new slot,
+        // n_ctx` line is now trace level (so absent entirely), and both the slot
+        // count and the effective context window come from one consolidated
+        // info-level line. Parsing must not regress when upstream reshapes this.
+        let lines = vec![
+            "0.00.364.805 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)".to_string(),
+            "0.00.508.091 I srv    load_model: loading model 'Qwen/Qwen3-Embedding-8B-GGUF'".to_string(),
+            "0.05.107.617 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 40960, kv_unified = 'true'".to_string(),
+            "0.05.111.957 I srv  llama_server: model loaded".to_string(),
+        ];
+        let params = parse_llama_server_log(&lines);
+        assert_eq!(params.n_ctx, Some(40960));
+        assert_eq!(params.n_slots, Some(4));
+        // No capacity warning is printed when requested == trained context.
+        assert_eq!(params.n_ctx_train, None);
+    }
+
+    #[test]
+    fn test_parse_llama_server_log_n_ctx_train_from_capping_warning() {
+        // Current llama.cpp reports the trained context in the opposite-direction
+        // warning: it caps a slot context that exceeds what the model was trained
+        // on, rather than warning that the running context is smaller.
+        let lines = vec![
+            "0.04.688.112 W srv    load_model: the slot context (262144) exceeds the training context of the model (131072) - capping".to_string(),
+            "0.05.107.617 I srv    load_model: initializing, n_slots = 2, n_ctx_slot = 131072, kv_unified = 'false'".to_string(),
+        ];
+        let params = parse_llama_server_log(&lines);
+        assert_eq!(params.n_ctx_train, Some(131072));
+        // The slot context reported after capping is the trained maximum.
+        assert_eq!(params.n_ctx, Some(131072));
+        assert_eq!(params.n_slots, Some(2));
+    }
+
+    #[test]
+    fn test_parse_llama_server_log_print_info_n_ctx_train_beats_capping_warning() {
+        // When the metadata block is available it remains authoritative for
+        // `n_ctx_train`, ahead of either capacity warning.
+        let lines = vec![
+            "0.00.670.006 I print_info: n_ctx_train           = 262144".to_string(),
+            "0.04.688.112 W srv    load_model: the slot context (262144) exceeds the training context of the model (131072) - capping".to_string(),
+        ];
+        let params = parse_llama_server_log(&lines);
+        assert_eq!(params.n_ctx_train, Some(262144));
+    }
+
+    #[test]
+    fn test_parse_llama_server_log_legacy_default_verbosity_format() {
+        // Older llama.cpp (build ~9425) spelled the slot-init line differently
+        // and logged the per-slot context window at default verbosity. Instances
+        // launched against a pinned older build must keep parsing.
         let lines = vec![
             "0.04.710.907 W llama_context: n_ctx_seq (4096) < n_ctx_train (131072) -- the full capacity of the model will not be utilized".to_string(),
             "0.04.730.906 I srv    load_model: initializing slots, n_slots = 4".to_string(),
