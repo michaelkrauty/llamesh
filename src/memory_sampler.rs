@@ -8,6 +8,9 @@ use tracing::{debug, warn};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
+#[cfg(test)]
+type ProcessMemorySample = (Option<u64>, Option<u64>);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuDeviceMemory {
     pub index: u32,
@@ -28,7 +31,9 @@ pub struct GpuMemorySnapshot {
 pub struct MemorySampler {
     nvml: Option<Nvml>,
     #[cfg(test)]
-    device_vram_override: std::sync::Mutex<Option<GpuMemorySnapshot>>,
+    device_vram_override: std::sync::Mutex<std::collections::VecDeque<GpuMemorySnapshot>>,
+    #[cfg(test)]
+    process_memory_overrides: std::sync::Mutex<HashMap<u32, ProcessMemorySample>>,
 }
 
 fn bytes_to_mib_floor(bytes: u64) -> u64 {
@@ -67,17 +72,36 @@ impl MemorySampler {
         Self {
             nvml,
             #[cfg(test)]
-            device_vram_override: std::sync::Mutex::new(None),
+            device_vram_override: std::sync::Mutex::new(Default::default()),
+            #[cfg(test)]
+            process_memory_overrides: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     #[cfg(test)]
     pub fn set_device_vram_override(&self, snapshot: Option<GpuMemorySnapshot>) {
-        *self.device_vram_override.lock().unwrap() = snapshot;
+        *self.device_vram_override.lock().unwrap() = snapshot.into_iter().collect();
+    }
+
+    #[cfg(test)]
+    pub fn set_device_vram_sequence(&self, snapshots: Vec<GpuMemorySnapshot>) {
+        *self.device_vram_override.lock().unwrap() = snapshots.into();
+    }
+
+    #[cfg(test)]
+    pub fn set_process_memory_override(&self, pid: u32, vram: Option<u64>, sysmem: Option<u64>) {
+        self.process_memory_overrides
+            .lock()
+            .unwrap()
+            .insert(pid, (vram, sysmem));
     }
 
     /// Sample system memory (RSS) for a process in MiB.
     pub fn sample_sysmem(&self, pid: u32) -> Option<u64> {
+        #[cfg(test)]
+        if let Some((_, sysmem)) = self.process_memory_overrides.lock().unwrap().get(&pid) {
+            return *sysmem;
+        }
         let proc = Process::new(pid as i32).ok()?;
         let status = proc.status().ok()?;
         // VmRSS is in KiB, convert to MiB
@@ -87,6 +111,10 @@ impl MemorySampler {
     /// Sample VRAM usage for a process in MiB.
     /// Sums across all GPUs where the process appears.
     pub fn sample_vram(&self, pid: u32) -> Option<u64> {
+        #[cfg(test)]
+        if let Some((vram, _)) = self.process_memory_overrides.lock().unwrap().get(&pid) {
+            return *vram;
+        }
         let nvml = self.nvml.as_ref()?;
         let device_count = nvml.device_count().ok()?;
 
@@ -121,8 +149,14 @@ impl MemorySampler {
     /// is unavailable or no device memory can be sampled.
     pub fn sample_device_vram(&self) -> Option<GpuMemorySnapshot> {
         #[cfg(test)]
-        if let Some(snapshot) = self.device_vram_override.lock().unwrap().clone() {
-            return Some(snapshot);
+        {
+            let mut snapshots = self.device_vram_override.lock().unwrap();
+            if snapshots.len() > 1 {
+                return snapshots.pop_front();
+            }
+            if let Some(snapshot) = snapshots.front() {
+                return Some(snapshot.clone());
+            }
         }
 
         let nvml = self.nvml.as_ref()?;

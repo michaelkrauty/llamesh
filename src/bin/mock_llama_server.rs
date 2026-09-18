@@ -49,6 +49,12 @@ struct Args {
     kv_unified: bool,
     #[arg(long)]
     api_key: Option<String>,
+    /// Keep /health unready until this file exists, without delaying bind.
+    #[arg(long)]
+    startup_ready_file: Option<std::path::PathBuf>,
+    /// Hold chat responses until this file exists, while health stays ready.
+    #[arg(long)]
+    response_ready_file: Option<std::path::PathBuf>,
     // llama-server args we ignore but need to accept
     #[arg(long)]
     fit: Option<String>,
@@ -152,8 +158,19 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"status": "ok"}))
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if state
+        .args
+        .startup_ready_file
+        .as_ref()
+        .is_some_and(|path| !path.exists())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "loading"})),
+        );
+    }
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
 async fn models(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -227,6 +244,14 @@ async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
+    while state
+        .args
+        .response_ready_file
+        .as_ref()
+        .is_some_and(|path| !path.exists())
+    {
+        sleep(Duration::from_millis(20)).await;
+    }
     {
         let mut n = state.total_requests.lock().unwrap();
         *n += 1;
