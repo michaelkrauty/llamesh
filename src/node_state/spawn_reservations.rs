@@ -136,6 +136,7 @@ impl SpawnReservations {
                 reservations: self.clone(),
                 id,
                 finished: AtomicBool::new(false),
+                released: tokio::sync::watch::channel(false).0,
                 on_abandon: Mutex::new(on_abandon),
             }),
             handed_off: false,
@@ -193,6 +194,7 @@ pub struct MemoryReservation {
     reservations: Arc<SpawnReservations>,
     id: String,
     finished: AtomicBool,
+    released: tokio::sync::watch::Sender<bool>,
     // Cleared at map handoff. Before handoff the registry does not own this
     // token, so a callback retaining node state cannot form an ownership cycle.
     on_abandon: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -231,6 +233,7 @@ impl MemoryReservation {
     pub fn finish(&self) {
         if !self.finished.swap(true, Ordering::AcqRel) {
             self.reservations.release_memory(&self.id);
+            self.released.send_replace(true);
             // A cancelled spawn may still have a child being reaped. Wake its
             // competitors only once the retained commitment is actually gone.
             let callback = self.on_abandon.lock().take();
@@ -238,6 +241,15 @@ impl MemoryReservation {
                 callback();
             }
         }
+    }
+
+    /// Wait for confirmed release, including when another caller owns the reaper.
+    pub async fn wait_released(&self) {
+        self.released
+            .subscribe()
+            .wait_for(|released| *released)
+            .await
+            .expect("reservation owns the release sender");
     }
 }
 

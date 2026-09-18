@@ -17,6 +17,9 @@ use tokio::time::{timeout, Duration};
 pub(super) struct TestHooks {
     pub(super) after_reserve: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) before_enqueue: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    pub(super) before_retire: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    pub(super) after_capacity_retire: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    pub(super) after_retirement_send: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 pub(super) async fn pause_at(hook: &Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>) {
@@ -452,6 +455,293 @@ async fn retirement_keeps_unmapped_process_memory_until_confirmed_reaping() {
         .await
         .expect("confirmed reaping frees the reservation");
     assert!(plan.victims.is_empty());
+}
+
+async fn retirement_state() -> Arc<NodeState> {
+    test_state_with_cookbook(
+        test_config(),
+        Cookbook {
+            models: vec![Model {
+                name: "waiting".into(),
+                description: None,
+                enabled: true,
+                profiles: vec![profile("default", 1_000, 0)],
+            }],
+        },
+    )
+    .await
+}
+
+async fn mapped_victim(
+    state: &NodeState,
+    name: &str,
+    vram: u64,
+    trap_term: bool,
+) -> (Arc<RwLock<Instance>>, tokio::process::ChildStdout, u32) {
+    use tokio::io::AsyncReadExt;
+    let mut guard = state
+        .spawn_reservations
+        .reserve(format!("{name}:default"), (vram, 0), None);
+    let mut inst = Instance::new(
+        guard.memory().id().into(),
+        name.into(),
+        "default".into(),
+        "127.0.0.1".into(),
+        0,
+        name.into(),
+        false,
+    );
+    inst.memory_reservation = Some(guard.memory());
+    let mut child = tokio::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            if trap_term {
+                "trap 'printf term' TERM; printf ready; while :; do read -r line; done"
+            } else {
+                "printf ready; exec sleep 60"
+            },
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut ready = [0; 5];
+    timeout(Duration::from_secs(1), stdout.read_exact(&mut ready))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+    guard.memory().set_pid(pid);
+    *inst.child.lock() = Some(child);
+    let inst = Arc::new(RwLock::new(inst));
+    state
+        .instances
+        .write()
+        .await
+        .insert(guard.memory().id().into(), inst.clone());
+    guard.handoff();
+    (inst, stdout, pid)
+}
+
+async fn retirement_waiter(state: &NodeState) -> oneshot::Receiver<PendingQueuePermit> {
+    let (tx, rx) = oneshot::channel();
+    state.queues.write().await.insert(
+        "waiting:default".into(),
+        VecDeque::from([QueueEntry { token: 17, tx }]),
+    );
+    rx
+}
+
+#[tokio::test]
+async fn cancelled_capacity_stop_wakes_only_after_all_mapped_victims_release() {
+    use tokio::io::AsyncReadExt;
+    let state = retirement_state().await;
+    let (first, mut stdout, pid) = mapped_victim(&state, "first", 500, true).await;
+    first.write().await.last_activity = Instant::now() - Duration::from_secs(1);
+    let (second, _, _) = mapped_victim(&state, "second", 500, false).await;
+    let caller_state = state.clone();
+    let caller = tokio::spawn(async move {
+        caller_state
+            .try_get_or_spawn(
+                "contender",
+                &profile("default", 1_000, 0),
+                true,
+                "test",
+                false,
+            )
+            .await
+    });
+    let mut term = [0; 4];
+    timeout(Duration::from_secs(1), stdout.read_exact(&mut term))
+        .await
+        .expect("first victim must reach graceful stop")
+        .unwrap();
+    assert_eq!(&term, b"term");
+    assert!(state.instances.read().await.is_empty());
+    let mut waiter = retirement_waiter(&state).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(state.spawn_reservations.snapshot().entries.len(), 2);
+    assert!(matches!(
+        waiter.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+
+    // Keep stale Instance Arcs alive: a dropped caller must still stop later
+    // victims, and finish must release memory without waiting for those Arcs.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let result = timeout(Duration::from_secs(1), &mut waiter).await;
+    // Also clean up the negative-control run, where the second victim is stranded.
+    first.read().await.stop().await.unwrap();
+    second.read().await.stop().await.unwrap();
+    let mut permit = result
+        .expect("mapped retirement must wake without a maintenance tick")
+        .unwrap();
+    assert!(state.spawn_reservations.snapshot().entries.is_empty());
+    permit.release().await;
+}
+
+#[tokio::test]
+async fn capacity_retirement_cancellation_boundaries_preserve_wakeup() {
+    for before_cleanup in [true, false] {
+        let state = retirement_state().await;
+        let (stale, _, _) = mapped_victim(&state, "old", 1_000, false).await;
+        let hook = if before_cleanup {
+            &state.test_hooks.before_retire
+        } else {
+            &state.test_hooks.after_capacity_retire
+        };
+        let (entered, release) = install_pause(hook);
+        let caller_state = state.clone();
+        let caller = tokio::spawn(async move {
+            caller_state
+                .try_get_or_spawn(
+                    "contender",
+                    &profile("default", 1_000, 0),
+                    true,
+                    "test",
+                    false,
+                )
+                .await
+        });
+        wait_for_hook(entered, "retirement boundary").await;
+        let mut waiter = retirement_waiter(&state).await;
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let _ = release.send(());
+        let mut permit = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellation at either boundary must wake the queue")
+            .unwrap();
+        assert!(state.spawn_reservations.snapshot().entries.is_empty());
+        assert!(stale.read().await.child.lock().is_none());
+        permit.release().await;
+    }
+}
+
+#[tokio::test]
+async fn successful_capacity_retirement_defers_wake_until_contender_admission() {
+    let state = retirement_state().await;
+    let (_stale, _, _) = mapped_victim(&state, "old", 1_000, false).await;
+    let mut waiter = retirement_waiter(&state).await;
+    let (entered, release) = install_pause(&state.test_hooks.after_capacity_retire);
+    let (reserved, resume) = install_pause(&state.test_hooks.after_reserve);
+    let caller_state = state.clone();
+    let caller = tokio::spawn(async move {
+        caller_state
+            .try_get_or_spawn(
+                "contender",
+                &profile("default", 1_000, 0),
+                true,
+                "test",
+                false,
+            )
+            .await
+    });
+    wait_for_hook(entered, "retired capacity before re-admission").await;
+    assert!(state.spawn_reservations.snapshot().entries.is_empty());
+    assert!(matches!(
+        waiter.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    release.send(()).unwrap();
+    wait_for_hook(reserved, "contender reservation").await;
+    assert_eq!(
+        state.spawn_reservations.profile_count("contender:default"),
+        1
+    );
+    assert!(matches!(
+        waiter.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    resume.send(()).unwrap();
+    assert!(caller.await.unwrap().is_err()); // Deliberately nonexistent executable.
+    let mut permit = timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    permit.release().await;
+}
+
+#[tokio::test]
+async fn buffered_retirement_completion_notifies_when_receiver_is_cancelled() {
+    let state = retirement_state().await;
+    let (stale, _, _) = mapped_victim(&state, "old", 1_000, false).await;
+    let mut waiter = retirement_waiter(&state).await;
+    let (sent, release) = install_pause(&state.test_hooks.after_retirement_send);
+    let mut instances = state.instances.clone().write_owned().await;
+    let victims = instances
+        .drain()
+        .map(|(_, inst)| (inst, "capacity"))
+        .collect();
+    let completion = state.retire_instances(instances, victims, true);
+    wait_for_hook(sent, "completion buffered before caller receives it").await;
+    assert!(state.spawn_reservations.snapshot().entries.is_empty());
+    assert!(matches!(
+        waiter.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    drop(completion);
+    release.send(()).unwrap();
+    let mut permit = timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stale.read().await.child.lock().is_none());
+    permit.release().await;
+}
+
+#[tokio::test]
+async fn cancelled_crash_prune_waits_for_an_existing_reaper_before_waking() {
+    let state = retirement_state().await;
+    let (stale, _stdout, pid) = mapped_victim(&state, "old", 1_000, true).await;
+    {
+        let inst = stale.read().await;
+        let mut stop = Box::pin(inst.stop());
+        assert!(futures::poll!(stop.as_mut()).is_pending());
+        // A different caller has detached the reaper. The mapped instance now
+        // looks dead, but its retained memory still blocks queue admission.
+    }
+    let (entered, release) = install_pause(&state.test_hooks.before_retire);
+    let caller_state = state.clone();
+    let caller = tokio::spawn(async move {
+        caller_state
+            .try_get_or_spawn(
+                "contender",
+                &profile("default", 1_000, 0),
+                true,
+                "test",
+                false,
+            )
+            .await
+    });
+    wait_for_hook(entered, "crash-prune removal").await;
+    let waiter = retirement_waiter(&state).await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let mut permit = timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("stop with no child must still wait for the existing reaper's release")
+        .unwrap();
+    assert!(state.spawn_reservations.snapshot().entries.is_empty());
+    permit.release().await;
 }
 
 #[tokio::test]

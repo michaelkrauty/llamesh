@@ -64,6 +64,23 @@ pub enum NodeError {
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// Transferred from a detached retirement task to its caller. Keeping this in
+/// the completion channel also covers cancellation just after a successful send.
+/// Capacity evictions retain it until the contender has claimed its reservation.
+struct RetirementWake {
+    state: NodeState,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for RetirementWake {
+    fn drop(&mut self) {
+        let state = self.state.clone();
+        self.runtime.spawn(async move {
+            state.notify_retired_capacity().await;
+        });
+    }
+}
+
 /// Per-instance bookkeeping for the wedged-instance watchdog, keyed by
 /// instance id. Holds the previous CPU sample (to derive a rate) and how long
 /// the instance has continuously looked wedged.
@@ -1126,6 +1143,58 @@ impl NodeState {
         self.gossip_trigger.notify_one();
     }
 
+    /// Transfer every removed victim before the first await after map removal.
+    /// Cleanup survives caller cancellation, including port release and victims
+    /// whose child has already been transferred to another reaper.
+    fn retire_instances(
+        &self,
+        instances: tokio::sync::OwnedRwLockWriteGuard<HashMap<String, Arc<RwLock<Instance>>>>,
+        victims: Vec<(Arc<RwLock<Instance>>, &'static str)>,
+        defer_wake: bool,
+    ) -> oneshot::Receiver<Option<RetirementWake>> {
+        let state = self.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            #[cfg(test)]
+            guardrail_tests::pause_at(&state.test_hooks.before_retire).await;
+            // Preserve port-release ordering: no admission can race removal.
+            for (inst_lock, _) in &victims {
+                state.release_port(inst_lock.read().await.port).await;
+            }
+            drop(instances);
+            for (inst_lock, reason) in victims {
+                let inst = inst_lock.read().await;
+                state.stop_and_cleanup_instance(&inst, reason).await;
+                if let Some(memory) = &inst.memory_reservation {
+                    memory.wait_released().await;
+                }
+            }
+            // On cancellation the failed send drops the wake here, after actual
+            // release. Otherwise the caller decides when freed capacity is public.
+            #[cfg(test)]
+            let test_hooks = state.test_hooks.clone();
+            let wake = if defer_wake {
+                Some(RetirementWake {
+                    state,
+                    runtime: tokio::runtime::Handle::current(),
+                })
+            } else {
+                state.notify_retired_capacity().await;
+                None
+            };
+            let _ = tx.send(wake);
+            #[cfg(test)]
+            guardrail_tests::pause_at(&test_hooks.after_retirement_send).await;
+        });
+        rx
+    }
+
+    async fn notify_retired_capacity(&self) {
+        self.maybe_cancel_drains().await;
+        self.notify_all_queues().await;
+        self.gossip_trigger.notify_one();
+    }
+
     /// Side-effect-free admission plan shared by spawning and queue rechecks.
     async fn plan_spawn(
         &self,
@@ -1291,38 +1360,23 @@ impl NodeState {
             "Evicting all idle instances for cold-start OOM recovery"
         );
 
-        // Second pass: remove under write lock, re-verify idleness to close TOCTOU gap
-        let removed: Vec<(u16, Arc<RwLock<Instance>>)>;
-        {
-            let mut instances = self.instances.write().await;
-            let mut verified_removals = Vec::new();
-            for (id, port) in to_remove {
-                if let Some(inst_lock) = instances.get(&id) {
-                    let inst = inst_lock.read().await;
-                    // Re-verify: instance may have become active between read and write lock
-                    if inst.in_flight_requests == 0 {
-                        drop(inst);
-                        if let Some(removed_inst) = instances.remove(&id) {
-                            verified_removals.push((port, removed_inst));
-                        }
-                    }
+        // Verify the whole batch before removing anything: cancellation at an
+        // instance-lock await must not strand an already-removed victim.
+        let mut instances = self.instances.clone().write_owned().await;
+        let mut verified = Vec::new();
+        for (id, _) in to_remove {
+            if let Some(inst_lock) = instances.get(&id) {
+                if inst_lock.read().await.in_flight_requests == 0 {
+                    verified.push(id);
                 }
             }
-            removed = verified_removals;
         }
-        // Write lock released here
-
+        let removed: Vec<_> = verified
+            .into_iter()
+            .filter_map(|id| instances.remove(&id).map(|inst| (inst, "cold_oom_stage1")))
+            .collect();
         let evicted_count = removed.len();
-
-        // Now do cleanup without holding any instance map lock
-        for (port, inst_lock) in &removed {
-            self.release_port(*port).await;
-            let inst = inst_lock.read().await;
-            self.stop_and_cleanup_instance(&inst, "cold_oom_stage1")
-                .await;
-        }
-
-        self.notify_all_queues().await;
+        let _ = self.retire_instances(instances, removed, false).await;
         evicted_count
     }
 
@@ -1413,26 +1467,12 @@ impl NodeState {
             "All instances drained, proceeding with eviction"
         );
 
-        // Now evict all instances - collect under lock, cleanup after releasing
-        let removed: Vec<(u16, Arc<RwLock<Instance>>)>;
-        {
-            let mut instances = self.instances.write().await;
-            removed = instances_to_drain
-                .iter()
-                .filter_map(|(id, port)| instances.remove(id).map(|inst_lock| (*port, inst_lock)))
-                .collect();
-        }
-        // Write lock released
-
-        // Cleanup without holding the lock
-        for (port, inst_lock) in &removed {
-            self.release_port(*port).await;
-            let inst = inst_lock.read().await;
-            self.stop_and_cleanup_instance(&inst, "cold_oom_stage2")
-                .await;
-        }
-
-        self.notify_all_queues().await;
+        let mut instances = self.instances.clone().write_owned().await;
+        let removed = instances_to_drain
+            .iter()
+            .filter_map(|(id, _)| instances.remove(id).map(|inst| (inst, "cold_oom_stage2")))
+            .collect();
+        let _ = self.retire_instances(instances, removed, false).await;
     }
 
     /// Mark all running instances as draining after a binary swap.
@@ -2019,10 +2059,14 @@ impl NodeState {
         reason: &str,
         has_priority_token: bool,
     ) -> Result<Arc<RwLock<Instance>>, NodeError> {
+        // Defer retirement wakes across all retries until admission or failure.
+        // Dropping the future at any await releases already-completed wakes;
+        // in-progress retirements retain theirs until all victims are reaped.
+        let mut retirement_wakes = Vec::new();
         // Loop for lock-free eviction retry logic
         loop {
             // 1. Acquire Write Lock
-            let mut instances_map = self.instances.write().await;
+            let mut instances_map = self.instances.clone().write_owned().await;
 
             // FAIRNESS: Re-check pending waiters under lock to close TOCTOU gap.
             // Fresh requests (no priority token) must yield if notified waiters exist.
@@ -2054,26 +2098,16 @@ impl NodeState {
             }
 
             if !crashed_instances.is_empty() {
-                // Remove instances and collect ports for release
-                let ports_to_release: Vec<_> = crashed_instances
+                let removed = crashed_instances
                     .iter()
-                    .map(|(_, _, _, port)| *port)
+                    .filter_map(|(id, _, _, _)| {
+                        instances_map.remove(id).map(|inst| (inst, "error"))
+                    })
                     .collect();
-                for (id, _, _, _) in &crashed_instances {
-                    instances_map.remove(id);
+                let _ = self.retire_instances(instances_map, removed, false).await;
+                for (_, model, profile, _) in crashed_instances {
+                    self.update_peak_memory(&model, &profile).await;
                 }
-
-                // Release ports BEFORE dropping instances lock to prevent race
-                for port in &ports_to_release {
-                    self.release_port(*port).await;
-                }
-                drop(instances_map);
-
-                for (_, m, p, _) in crashed_instances {
-                    self.update_peak_memory(&m, &p).await;
-                }
-                self.notify_all_queues().await;
-
                 continue;
             }
 
@@ -2157,16 +2191,14 @@ impl NodeState {
                     continue;
                 };
 
-                // Collect ports and release them BEFORE dropping instances lock
-                let mut ports_to_release: Vec<u16> = Vec::new();
-                for inst_lock in &removed_instances {
-                    let inst = inst_lock.read().await;
-                    ports_to_release.push(inst.port);
-                }
-                for port in &ports_to_release {
-                    self.release_port(*port).await;
-                }
-                drop(instances_map);
+                let retirement = self.retire_instances(
+                    instances_map,
+                    removed_instances
+                        .into_iter()
+                        .map(|inst| (inst, "capacity"))
+                        .collect(),
+                    true,
+                );
 
                 // Stop instances (they're already removed from map)
                 // Note: We do NOT call notify_queue here. The current request triggered
@@ -2174,10 +2206,10 @@ impl NodeState {
                 // Notifying here would wake waiters for the EVICTED instance's profile,
                 // causing a race where they spawn the wrong profile and get immediately
                 // evicted again (profile thrashing bug).
-                for inst_lock in removed_instances {
-                    let inst = inst_lock.read().await;
-                    self.stop_and_cleanup_instance(&inst, "capacity").await;
-                }
+                retirement_wakes.push(retirement.await.map_err(anyhow::Error::from)?);
+
+                #[cfg(test)]
+                guardrail_tests::pause_at(&self.test_hooks.after_capacity_retire).await;
 
                 // Restart loop to grab the space we just freed
                 continue;
@@ -3457,7 +3489,7 @@ impl NodeState {
         }
 
         // 2. Remove and Stop (Write Lock + Non-blocking Stop)
-        let mut instances_map = self.instances.write().await;
+        let mut instances_map = self.instances.clone().write_owned().await;
         let mut confirmed_victims = Vec::new();
 
         for (id, inst_lock, reason) in to_evict {
@@ -3486,37 +3518,19 @@ impl NodeState {
             }
         }
 
-        // Collect ports BEFORE dropping the instances lock to prevent race
-        let mut ports_to_release: Vec<u16> = Vec::new();
-        for (_, inst_lock, _) in &confirmed_victims {
-            let inst = inst_lock.read().await;
-            ports_to_release.push(inst.port);
-        }
-
-        for (id, _, _) in &confirmed_victims {
-            instances_map.remove(id);
-        }
-
-        // Release ports while still holding instances lock
-        for port in &ports_to_release {
-            self.release_port(*port).await;
-        }
-        drop(instances_map);
-
-        let any_evicted = !confirmed_victims.is_empty();
-
-        for (_, inst_lock, reason) in confirmed_victims {
-            let inst = inst_lock.read().await;
-            let reason_str = match reason {
-                EvictionReason::Idle => "idle",
-                EvictionReason::Crashed => "error",
-                EvictionReason::Drained => "drained",
-            };
-            self.stop_and_cleanup_instance(&inst, reason_str).await;
-        }
-
-        if any_evicted {
-            self.notify_all_queues().await;
+        if !confirmed_victims.is_empty() {
+            let removed = confirmed_victims
+                .into_iter()
+                .filter_map(|(id, _, reason)| {
+                    let reason = match reason {
+                        EvictionReason::Idle => "idle",
+                        EvictionReason::Crashed => "error",
+                        EvictionReason::Drained => "drained",
+                    };
+                    instances_map.remove(&id).map(|inst| (inst, reason))
+                })
+                .collect();
+            let _ = self.retire_instances(instances_map, removed, false).await;
         }
 
         Ok(())
@@ -3692,8 +3706,8 @@ impl NodeState {
         wedged_for: Duration,
         sampled_last_activity: Instant,
     ) {
-        let inst_lock = {
-            let mut instances = self.instances.write().await;
+        let retirement = {
+            let mut instances = self.instances.clone().write_owned().await;
             let Some(inst_lock) = instances.get(id).cloned() else {
                 return; // already gone
             };
@@ -3703,15 +3717,10 @@ impl NodeState {
             // wedged request was released and fresh work took the instance (even
             // if the slot count is unchanged) — its work is not described by the
             // stale wedge verdict, so back off and let the next cycle re-confirm.
-            let (still_wedged, port) = {
-                let inst = inst_lock.read().await;
-                (
-                    inst.in_flight_requests > 0
-                        && inst.get_pid() == Some(expected_pid)
-                        && inst.last_activity == sampled_last_activity,
-                    inst.port,
-                )
-            };
+            let inst = inst_lock.read().await;
+            let still_wedged = inst.in_flight_requests > 0
+                && inst.get_pid() == Some(expected_pid)
+                && inst.last_activity == sampled_last_activity;
             if !still_wedged {
                 info!(
                     instance_id = %id,
@@ -3719,27 +3728,23 @@ impl NodeState {
                 );
                 return;
             }
+            warn!(
+                event = "instance_wedged",
+                instance_id = %id,
+                model = %inst.model_name,
+                profile = %inst.profile_id,
+                pid = expected_pid,
+                wedged_for_secs = wedged_for.as_secs(),
+                "Stopping wedged instance: held a request slot with no CPU or GPU activity"
+            );
+            drop(inst);
+            self.metrics
+                .wedged_instances_killed_total
+                .fetch_add(1, Ordering::Relaxed);
             instances.remove(id);
-            self.release_port(port).await;
-            inst_lock
+            self.retire_instances(instances, vec![(inst_lock, "wedged")], false)
         };
-
-        let inst = inst_lock.read().await;
-        warn!(
-            event = "instance_wedged",
-            instance_id = %id,
-            model = %inst.model_name,
-            profile = %inst.profile_id,
-            pid = expected_pid,
-            wedged_for_secs = wedged_for.as_secs(),
-            "Stopping wedged instance: held a request slot with no CPU or GPU activity"
-        );
-        self.metrics
-            .wedged_instances_killed_total
-            .fetch_add(1, Ordering::Relaxed);
-        self.stop_and_cleanup_instance(&inst, "wedged").await;
-        drop(inst);
-        self.notify_all_queues().await;
+        let _ = retirement.await;
     }
 
     pub async fn shutdown_all_instances(&self) {

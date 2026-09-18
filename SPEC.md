@@ -934,6 +934,7 @@ On chosen node (or standalone):
 * A `max_wait_in_queue_ms` of 0 means infinite wait (no timeout).
 * After enqueueing, recheck admission, including capacity obtainable by evicting idle instances, to close notification races. Periodic maintenance also rechecks queued profiles against current memory usage so an external GPU consumer freeing memory can unblock them without an instance lifecycle event.
 * An abandoned spawn wakes queues after its retained memory commitment is released, including when child reaping outlives the cancelled request.
+* Removed instances are cleaned up independently of the requesting future. Cancellation cannot strand later victims in an eviction batch or suppress the wake after memory is released. Capacity-driven eviction defers that wake until the contender finishes admission or abandons it, preserving its opportunity to claim the freed capacity.
 * If the request stays in queue longer than that (and the timeout is non-zero):
 
   * Remove it from the queue and return 503 `queue_timeout`.
