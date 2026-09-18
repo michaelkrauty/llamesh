@@ -32,6 +32,8 @@ cargo test           # all tests pass
 Any new warning or formatting diff is attributable to the change that
 introduced it.
 
+For changes to the log-query scripts, also run `python3 tests/log_tools_test.py` (requires Bash and `jq`; SSH is mocked).
+
 ## Pull Requests
 
 - **Open a tracking issue first** describing the problem or proposal, and
