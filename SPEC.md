@@ -1389,6 +1389,12 @@ Examples of log events:
   * `event="queue_dequeue"`, `token_id`.
   * `event="queue_drop"`, `reason="full"` or `"timeout"`.
 
+### Querying Error Logs
+
+`scripts/log-tools/errors.sh [local|remote|both] [YYYY-MM-DD] [limit]` prints recent `WARN` and `ERROR` entries from daily log files (defaults: both nodes, today, 50 entries per node). It requires Bash and `jq`, plus SSH for remote queries. Set `LLAMESH_LOCAL_LOG_DIR` to override the repository's `logs` directory. Remote queries require `LLAMESH_REMOTE_HOST`; set `LLAMESH_REMOTE_LOG_DIR` to the remote log directory (default: `./logs`, relative to the SSH login directory).
+
+A successful query with no matching entries exits zero. Fetch or JSON parsing failures produce stderr diagnostics and a nonzero exit status. In `both` mode, both nodes are queried even if the first fails; failure on either node makes the overall command fail. Output may be partial when a query fails.
+
 ---
 
 ## Security Model

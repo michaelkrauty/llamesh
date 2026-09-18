@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.3] - 2026-09-18
+
+### Fixed
+
+- The `errors.sh` log helper now preserves fetch and JSON parsing diagnostics and exits nonzero when a log query fails. In `both` mode it still queries both nodes, but no longer reports missing or unreadable logs as `(no errors)` with a successful exit status.
+
 ## [1.21.2] - 2026-07-24
 
 ### Fixed
