@@ -1251,6 +1251,7 @@ pub async fn route_request(
                                                     && !inst.draining.load(Ordering::Relaxed)
                                                 {
                                                     inst.draining.store(true, Ordering::Relaxed);
+                                                    inst.draining_for_competitor.store(true, Ordering::Relaxed);
                                                     info!(
                                                         event = "drain_triggered",
                                                         model = %model_name,

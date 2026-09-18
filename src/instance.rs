@@ -322,6 +322,10 @@ pub struct Instance {
     pub is_cold_start: bool,
     /// Whether this instance is draining (no new requests should be assigned).
     pub draining: AtomicBool,
+    /// Only scheduler drains may be cancelled when competing demand disappears.
+    /// Forced drains clear this under a read lock (readiness may hold one).
+    /// Scheduling and cancellation require the instance write lock.
+    pub draining_for_competitor: AtomicBool,
     /// Earliest time this instance can be drained for a competing model.
     /// Set to `now() + tenure` when instance reaches Ready.
     pub evictable_after: Mutex<Option<Instant>>,
@@ -432,6 +436,7 @@ impl Instance {
             parsed_params: Mutex::new(None),
             is_cold_start,
             draining: AtomicBool::new(false),
+            draining_for_competitor: AtomicBool::new(false),
             evictable_after: Mutex::new(None),
             llama_cpp_version: None,
             memory_reservation: None,

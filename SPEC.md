@@ -933,6 +933,7 @@ On chosen node (or standalone):
 * Each request has a `max_wait_in_queue_ms` configured globally or per model.
 * A `max_wait_in_queue_ms` of 0 means infinite wait (no timeout).
 * After enqueueing, recheck admission, including capacity obtainable by evicting idle instances, to close notification races. Periodic maintenance also rechecks queued profiles against current memory usage so an external GPU consumer freeing memory can unblock them without an instance lifecycle event.
+* An abandoned spawn wakes queues after its retained memory commitment is released, including when child reaping outlives the cancelled request.
 * If the request stays in queue longer than that (and the timeout is non-zero):
 
   * Remove it from the queue and return 503 `queue_timeout`.
@@ -1001,6 +1002,7 @@ Each instance is a `llama-server` process spawned by the proxy:
 * Draining:
 
   * Instances have a `draining` flag. Draining instances do not receive new requests but continue serving in-flight requests until completion.
+  * Drains scheduled for competing demand can be cancelled when that demand disappears. Cookbook, binary-update, and recovery drains remain mandatory.
   * Used during binary swap (see Build Manager) and graceful shutdown.
 
 ### 6. Streaming & Backpressure

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Reserve estimated VRAM and system memory for concurrent model loads, retaining commitments through startup and process teardown. Admission and peer headroom now include pending loads and external GPU usage, with fresh telemetry checked on every spawn attempt and retry.
 - Recheck queued requests after capacity changes and during periodic maintenance, including requests that can proceed after idle eviction. Partial startup samples and unavailable telemetry no longer erase startup estimates for later spawns.
+- Wake queued requests after abandoned processes actually release their memory, and cancel unnecessary competitor drains without cancelling mandatory lifecycle drains.
 
 ## [1.21.3] - 2026-09-18
 

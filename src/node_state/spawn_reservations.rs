@@ -132,13 +132,13 @@ impl SpawnReservations {
         }
 
         SpawnReservation {
-            memory: Some(Arc::new(MemoryReservation {
+            memory: Arc::new(MemoryReservation {
                 reservations: self.clone(),
                 id,
                 finished: AtomicBool::new(false),
-            })),
+                on_abandon: Mutex::new(on_abandon),
+            }),
             handed_off: false,
-            on_abandon,
         }
     }
 
@@ -189,11 +189,22 @@ impl SpawnReservations {
 ///
 /// The last owner removes the registry entry, or any owner can call
 /// [`finish`](Self::finish) after confirmed process reaping.
-#[derive(Debug)]
 pub struct MemoryReservation {
     reservations: Arc<SpawnReservations>,
     id: String,
     finished: AtomicBool,
+    // Cleared at map handoff. Before handoff the registry does not own this
+    // token, so a callback retaining node state cannot form an ownership cycle.
+    on_abandon: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for MemoryReservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryReservation")
+            .field("id", &self.id)
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryReservation {
@@ -220,6 +231,12 @@ impl MemoryReservation {
     pub fn finish(&self) {
         if !self.finished.swap(true, Ordering::AcqRel) {
             self.reservations.release_memory(&self.id);
+            // A cancelled spawn may still have a child being reaped. Wake its
+            // competitors only once the retained commitment is actually gone.
+            let callback = self.on_abandon.lock().take();
+            if let Some(callback) = callback {
+                callback();
+            }
         }
     }
 }
@@ -234,20 +251,17 @@ impl Drop for MemoryReservation {
 ///
 /// On [`handoff`](Self::handoff), pending admission becomes a process-memory
 /// commitment owned by the caller through [`memory`](Self::memory). Otherwise
-/// dropping the guard drops its memory owner before notifying waiters.
+/// dropping the guard leaves the abandonment notification with the memory
+/// owner, so a child reaper can release capacity before waking waiters.
 pub struct SpawnReservation {
-    memory: Option<Arc<MemoryReservation>>,
+    memory: Arc<MemoryReservation>,
     handed_off: bool,
-    on_abandon: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl SpawnReservation {
     /// Returns a cloneable process-memory commitment for the spawned instance.
     pub fn memory(&self) -> Arc<MemoryReservation> {
-        self.memory
-            .as_ref()
-            .expect("spawn reservation memory already released")
-            .clone()
+        self.memory.clone()
     }
 
     /// Transfers admission accounting to the associated process commitment.
@@ -258,22 +272,8 @@ impl SpawnReservation {
             return;
         }
         self.handed_off = true;
-        if let Some(memory) = self.memory.as_ref() {
-            memory.reservations.mark_handed_off(memory.id());
-        }
-        self.on_abandon = None;
-    }
-}
-
-impl Drop for SpawnReservation {
-    fn drop(&mut self) {
-        let memory = self.memory.take();
-        drop(memory);
-        if !self.handed_off {
-            if let Some(callback) = self.on_abandon.take() {
-                callback();
-            }
-        }
+        self.memory.on_abandon.lock().take();
+        self.memory.reservations.mark_handed_off(self.memory.id());
     }
 }
 
@@ -399,9 +399,51 @@ mod tests {
             })),
         );
 
+        let memory = guard.memory();
         guard.handoff();
         drop(guard);
+        memory.finish();
+        drop(memory);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn abandoned_child_notifies_only_after_retained_memory_is_released() {
+        for explicit_finish in [false, true] {
+            let reservations = Arc::new(SpawnReservations::default());
+            let callback_reservations = reservations.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let guard = reservations.reserve(
+                "loading:default".into(),
+                (600, 400),
+                Some(Box::new(move || {
+                    tx.send(callback_reservations.snapshot().entries.is_empty())
+                        .unwrap();
+                })),
+            );
+            // A cancelled pre-map spawn transfers this owner to its child reaper.
+            let reaper_memory = guard.memory();
+            drop(guard);
+            assert!(
+                matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+                "an early wake would requeue while the child still consumes capacity"
+            );
+            assert_eq!(reservations.snapshot().entries.len(), 1);
+
+            if explicit_finish {
+                reaper_memory.finish();
+                reaper_memory.finish();
+            }
+            drop(reaper_memory);
+            assert!(
+                rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+                "wake must follow actual capacity release"
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)
+            ));
+        }
     }
 
     #[test]

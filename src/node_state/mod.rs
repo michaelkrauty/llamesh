@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod drain_tests;
+#[cfg(test)]
 mod guardrail_tests;
 mod model_index;
 mod peer_state;
@@ -631,18 +633,19 @@ impl NodeState {
 
         for inst_lock in instances.values() {
             // Snapshot the instance's identity while holding only the inner read lock.
-            let (model_name, profile_id, inst_args_hash, inst_id, already_draining) = {
+            let (model_name, profile_id, inst_args_hash, inst_id, already_forced) = {
                 let inst = inst_lock.read().await;
                 (
                     inst.model_name.clone(),
                     inst.profile_id.clone(),
                     inst.args_hash.clone(),
                     inst.id.clone(),
-                    inst.draining.load(Ordering::Relaxed),
+                    inst.draining.load(Ordering::Relaxed)
+                        && !inst.draining_for_competitor.load(Ordering::Relaxed),
                 )
             };
 
-            if already_draining {
+            if already_forced {
                 continue;
             }
 
@@ -667,6 +670,7 @@ impl NodeState {
             if let Some(reason) = reason {
                 let inst = inst_lock.read().await;
                 inst.draining.store(true, Ordering::Relaxed);
+                inst.draining_for_competitor.store(false, Ordering::Relaxed);
                 drop(inst);
                 info!(
                     event = "instance_orphaned_by_reload",
@@ -1333,6 +1337,7 @@ impl NodeState {
                 let inst = inst_lock.read().await;
                 inst.draining
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                inst.draining_for_competitor.store(false, Ordering::Relaxed);
                 instances_to_drain.push((id.clone(), inst.port));
             }
         }
@@ -1441,6 +1446,8 @@ impl NodeState {
         let mut drained_count = 0usize;
         for (id, inst_lock) in instances.iter() {
             let inst = inst_lock.read().await;
+            // A mandatory update must also promote an existing scheduler drain.
+            inst.draining_for_competitor.store(false, Ordering::Relaxed);
             // Only drain instances that aren't already draining
             if !inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
                 inst.draining
@@ -2217,11 +2224,13 @@ impl NodeState {
             // wakes waiters if abandoned; any spawned child retains its memory
             // lease until exit. Count hands off to the map at insertion.
             let abandon_state = self.clone();
+            let abandon_runtime = tokio::runtime::Handle::current();
             let mut spawn_reservation = self.spawn_reservations.reserve(
                 profile_key,
                 (required_vram, required_sysmem),
                 Some(Box::new(move || {
-                    tokio::spawn(async move {
+                    abandon_runtime.spawn(async move {
+                        abandon_state.maybe_cancel_drains().await;
                         abandon_state.notify_all_queues().await;
                         abandon_state.gossip_trigger.notify_one();
                     });
@@ -3261,7 +3270,7 @@ impl NodeState {
         pending.get(&key).map(|s| !s.is_empty()).unwrap_or(false)
     }
 
-    /// Cancel drains that are no longer needed (competitors were handled by
+    /// Cancel scheduler drains that are no longer needed (competitors were handled by
     /// peers or timed out). Notifies the drained model's queue so its
     /// pending requests can resume being dispatched.
     pub async fn maybe_cancel_drains(&self) {
@@ -3270,7 +3279,7 @@ impl NodeState {
             let mut candidates = Vec::new();
             for inst_lock in instances.values() {
                 let inst = inst_lock.read().await;
-                if inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                if inst.draining_for_competitor.load(Ordering::Relaxed) {
                     candidates.push((
                         inst_lock.clone(),
                         inst.model_name.clone(),
@@ -3294,12 +3303,13 @@ impl NodeState {
             if inst.id != instance_id
                 || inst.model_name != model_name
                 || inst.profile_id != profile_id
-                || !inst.draining.load(std::sync::atomic::Ordering::Relaxed)
+                || !inst.draining_for_competitor.load(Ordering::Relaxed)
             {
                 continue;
             }
             inst.draining
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            inst.draining_for_competitor.store(false, Ordering::Relaxed);
             info!(
                 event = "drain_cancelled",
                 model = %model_name,
@@ -3309,7 +3319,6 @@ impl NodeState {
             );
             drop(inst);
             self.notify_queue(&model_name, &profile_id).await;
-            return;
         }
     }
 
