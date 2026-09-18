@@ -83,25 +83,13 @@ class ErrorsScriptTest(unittest.TestCase):
         )
 
     def test_empty_and_info_only_logs_succeed(self):
-        for node, local_text, remote_text in (
-            ("local", "", None),
-            ("remote", None, ""),
-            ("both", "", ""),
-            ("local", '{"level":"INFO","fields":{"message":"quiet"}}\n', None),
-            ("remote", None, '{"level":"INFO","fields":{"message":"quiet"}}\n'),
-            (
-                "both",
-                '{"level":"INFO","fields":{"message":"quiet"}}\n',
-                '{"level":"INFO","fields":{"message":"quiet"}}\n',
-            ),
-        ):
-            with self.subTest(node=node, empty=not local_text and not remote_text):
-                completed = self.invoke(
-                    node, local_text=local_text, remote_text=remote_text
-                )
-                self.assertEqual(completed.returncode, 0, completed.stderr)
-                self.assertNotIn("[ERROR]", completed.stdout)
-                self.assertNotIn("[WARN]", completed.stdout)
+        for node in ("local", "remote", "both"):
+            for text in ("", '{"level":"INFO","fields":{"message":"quiet"}}\n'):
+                with self.subTest(node=node, empty=not text):
+                    completed = self.invoke(node, local_text=text, remote_text=text)
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    self.assertNotIn("[ERROR]", completed.stdout)
+                    self.assertNotIn("[WARN]", completed.stdout)
 
     def test_failures_are_visible_and_not_reported_as_empty(self):
         cases = (
