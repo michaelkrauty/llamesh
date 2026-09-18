@@ -331,34 +331,76 @@ pub struct Instance {
     /// still loading; parsed params must be attributed to the binary that
     /// actually produced them. `None` when no version was recorded.
     pub llama_cpp_version: Option<String>,
+    /// Accounting ownership follows the child through asynchronous teardown.
+    pub memory_reservation: Option<Arc<crate::node_state::MemoryReservation>>,
+}
+
+/// Transfer process ownership before returning: dropping a caller's wait must
+/// not drop the child or its memory accounting before the process exits.
+fn reap_child(
+    mut child: Child,
+    reservation: Option<Arc<crate::node_state::MemoryReservation>>,
+    graceful: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if graceful {
+        if let Some(pid) = child.id() {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    } else {
+        let _ = child.start_kill();
+    }
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        Some(handle.spawn(async move {
+            let exited = graceful
+                && matches!(
+                    tokio::time::timeout(Duration::from_secs(10), child.wait()).await,
+                    Ok(Ok(_))
+                );
+            if !exited {
+                loop {
+                    let _ = child.start_kill();
+                    match child.wait().await {
+                        Ok(_) => break,
+                        Err(error) => {
+                            warn!(%error, "Failed to reap child; retaining memory accounting");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            }
+            if let Some(reservation) = reservation {
+                reservation.finish();
+            }
+        }))
+    } else {
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if !graceful || Instant::now() >= deadline {
+                    let _ = child.start_kill();
+                }
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    if let Some(reservation) = reservation {
+                        reservation.finish();
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        None
+    }
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
         let mut guard = self.child.lock();
-        if let Some(mut child) = guard.take() {
-            // First try synchronous kill (non-blocking signal)
-            let _ = child.start_kill();
-            // Then spawn async wait if runtime available, to reap the zombie
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    // Wait for process to exit after kill signal, with timeout
-                    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-                });
-            } else {
-                // Fallback: spawn blocking thread to reap process when no runtime
-                std::thread::spawn(move || {
-                    for _ in 0..50 {
-                        // 5 seconds total (50 * 100ms)
-                        if let Ok(Some(_)) = child.try_wait() {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    // Force kill if still running after timeout
-                    let _ = child.start_kill();
-                });
-            }
+        if let Some(child) = guard.take() {
+            reap_child(child, self.memory_reservation.clone(), false);
         }
     }
 }
@@ -392,6 +434,7 @@ impl Instance {
             draining: AtomicBool::new(false),
             evictable_after: Mutex::new(None),
             llama_cpp_version: None,
+            memory_reservation: None,
         }
     }
 
@@ -410,6 +453,7 @@ impl Instance {
 
         let mut cmd = Command::new(binary_path);
         cmd.args(args);
+        cmd.kill_on_drop(true);
 
         // Set LD_LIBRARY_PATH to the directory containing the resolved binary so
         // shared libraries (libllama.so, libggml.so, libmtmd.so, etc.) that live
@@ -468,6 +512,9 @@ impl Instance {
 
         {
             let mut guard = self.child.lock();
+            if let (Some(reservation), Some(pid)) = (&self.memory_reservation, child.id()) {
+                reservation.set_pid(pid);
+            }
             *guard = Some(child);
         }
 
@@ -589,6 +636,9 @@ impl Instance {
     }
 
     fn mark_ready(&self) {
+        if let Some(reservation) = &self.memory_reservation {
+            reservation.mark_ready();
+        }
         let mut status = self.status.lock();
         *status = InstanceStatus::Ready;
         self.ready_signal.notify_waiters();
@@ -600,33 +650,16 @@ impl Instance {
             guard.take()
         };
 
-        if let Some(mut child) = child_opt {
+        if let Some(child) = child_opt {
             info!(
                 "Stopping instance {} (up for {:?})",
                 self.id,
                 self.start_time.elapsed()
             );
 
-            #[cfg(unix)]
-            {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-
-                if let Some(pid) = child.id() {
-                    let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-                }
-
-                // Wait for graceful exit
-                match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-                    Ok(_) => return Ok(()),
-                    Err(_) => {
-                        warn!("Instance {} did not stop gracefully; forcing kill", self.id);
-                    }
-                }
+            if let Some(cleanup) = reap_child(child, self.memory_reservation.clone(), true) {
+                cleanup.await.context("Child cleanup task failed")?;
             }
-
-            child.kill().await?;
-            child.wait().await?;
         }
         Ok(())
     }
@@ -664,6 +697,9 @@ impl Instance {
                         "Instance exited unexpectedly"
                     );
                     *guard = None;
+                    if let Some(reservation) = &self.memory_reservation {
+                        reservation.finish();
+                    }
                     false
                 }
                 Ok(None) => true,
@@ -673,9 +709,11 @@ impl Instance {
                         model = %self.model_name,
                         profile = %self.profile_id,
                         error = %err,
-                        "Failed to poll child status; assuming instance is dead"
+                        "Failed to poll child status; terminating instance"
                     );
-                    *guard = None;
+                    if let Some(child) = guard.take() {
+                        reap_child(child, self.memory_reservation.clone(), false);
+                    }
                     false
                 }
             },
@@ -688,6 +726,108 @@ impl Instance {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    async fn accounted_child(
+        ignore_term: bool,
+    ) -> (
+        Arc<crate::node_state::SpawnReservations>,
+        Arc<Instance>,
+        u32,
+    ) {
+        use tokio::io::AsyncReadExt;
+
+        let reservations = Arc::new(crate::node_state::SpawnReservations::default());
+        let mut guard = reservations.reserve("test:default".into(), (4096, 8192), None);
+        let mut instance = Instance::new(
+            "child-test".into(),
+            "test".into(),
+            "default".into(),
+            "127.0.0.1".into(),
+            0,
+            "test-hash".into(),
+            true,
+        );
+        instance.memory_reservation = Some(guard.memory());
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                if ignore_term {
+                    "trap '' TERM; printf ready; exec sleep 60"
+                } else {
+                    "printf ready; exec sleep 60"
+                },
+            ])
+            .stdout(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut ready = [0; 5];
+        tokio::time::timeout(Duration::from_secs(5), stdout.read_exact(&mut ready))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        let pid = child.id().unwrap();
+        instance.memory_reservation.as_ref().unwrap().set_pid(pid);
+        *instance.child.lock() = Some(child);
+        guard.handoff();
+        (reservations, Arc::new(instance), pid)
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_retains_accounting_until_child_exit() {
+        let (reservations, instance, pid) = accounted_child(true).await;
+        let id = instance.memory_reservation.as_ref().unwrap().id();
+        let mut stop = Box::pin(instance.stop());
+        assert!(futures::poll!(stop.as_mut()).is_pending());
+        drop(stop);
+        assert!(instance.child.lock().is_none());
+        assert!(reservations.snapshot().entries.contains_key(id));
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reservations.snapshot().entries.contains_key(id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached cleanup must finish accounting despite a surviving Instance");
+    }
+
+    #[tokio::test]
+    async fn stopped_child_finishes_accounting_with_stale_instance_references() {
+        let (reservations, instance, _) = accounted_child(false).await;
+        let stale = instance.clone();
+        instance.stop().await.unwrap();
+        assert!(reservations.snapshot().entries.is_empty());
+        assert!(stale.memory_reservation.is_some());
+        stale.stop().await.unwrap();
+        assert!(reservations.snapshot().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn observed_child_exit_finishes_accounting_with_stale_instance_references() {
+        let (reservations, instance, pid) = accounted_child(false).await;
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while instance.is_alive() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reservations.snapshot().entries.is_empty());
+        assert!(instance.memory_reservation.is_some());
+    }
 
     // Compile-time validation of timeout constant bounds
     const _: () = {

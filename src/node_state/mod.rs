@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod guardrail_tests;
 mod model_index;
 mod peer_state;
 mod port_pool;
@@ -6,7 +8,8 @@ mod spawn_reservations;
 pub use model_index::{args_hash_for_profile, build_pre_args, get_args_hash_for_key, ModelIndex};
 pub use peer_state::{PeerModelStats, PeerState};
 pub use port_pool::PortPool;
-pub use spawn_reservations::SpawnReservations;
+use spawn_reservations::ReservationSnapshot;
+pub use spawn_reservations::{MemoryReservation, SpawnReservations};
 
 use crate::build_manager::BuildManager;
 use crate::config::{Cookbook, ModelDefaults, NodeConfig, Profile};
@@ -24,7 +27,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Notify, RwLock};
 use tracing::{error, info, warn};
-use ulid::Ulid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -171,11 +173,8 @@ pub struct NodeState {
     /// Notified when cluster capacity changes (instance idle, terminated, peer update).
     /// Used by route_or_wait() to efficiently wait for capacity.
     pub capacity_notify: Arc<Notify>,
-    /// In-flight spawn reservations: spawns that passed capacity checks but
-    /// whose instances are not yet in `instances`. Reserved while holding the
-    /// `instances` write lock (check-and-reserve is atomic); released via
-    /// RAII from any context. Interior mutex is a synchronous leaf lock,
-    /// never held across `await`.
+    /// Pending spawn counts and process-lifetime memory commitments. Additions
+    /// require `instances.write()`; the synchronous registry lock is a leaf.
     pub spawn_reservations: Arc<SpawnReservations>,
     /// Model:profile keys that failed to spawn due to InsufficientResources
     /// and need eviction of existing instances to proceed. Used by the drain
@@ -202,6 +201,8 @@ pub struct NodeState {
     /// Synchronous leaf mutex, only touched by the single detector task and
     /// never held across an `.await`, so it is outside the async lock ordering.
     wedge_state: Arc<std::sync::Mutex<WedgeDetectorState>>,
+    #[cfg(test)]
+    test_hooks: Arc<guardrail_tests::TestHooks>,
 }
 
 use crate::security;
@@ -318,6 +319,21 @@ pub struct ResourceSnapshot {
     pub gpu_telemetry_available: bool,
     /// Number of llama-server instances managed on this node at snapshot time.
     pub active_instances: u64,
+}
+
+/// One observation supplies both the admission baseline and eviction credits.
+/// Unmapped processes (including ones still stopping) consume memory but cannot
+/// be selected as victims.
+struct ResourceAccounting {
+    resources: ResourceSnapshot,
+    reservations: ReservationSnapshot,
+    instance_memory: HashMap<String, (u64, u64)>,
+}
+
+#[derive(Debug)]
+struct SpawnPlan {
+    victims: Vec<String>,
+    revision: u64,
 }
 
 impl ResourceSnapshot {
@@ -541,6 +557,8 @@ impl NodeState {
             circuit_breaker,
             capacity_notify: Arc::new(Notify::new()),
             spawn_reservations: Arc::new(SpawnReservations::default()),
+            #[cfg(test)]
+            test_hooks: Arc::new(guardrail_tests::TestHooks::default()),
             needs_eviction: Arc::new(RwLock::new(HashSet::new())),
             gossip_trigger: Arc::new(Notify::new()),
             peer_pending_forwards: Arc::new(RwLock::new(HashMap::new())),
@@ -859,8 +877,9 @@ impl NodeState {
     pub async fn calculate_resource_snapshot(&self) -> ResourceSnapshot {
         let instances = self.instances.read().await;
         let snapshot = self
-            .calculate_resource_snapshot_for_instances(&instances)
-            .await;
+            .resource_accounting_for_instances(&instances)
+            .await
+            .resources;
         drop(instances);
         self.observe_resource_snapshot(&snapshot);
         snapshot
@@ -879,25 +898,78 @@ impl NodeState {
         queues.values().map(|q| q.len() as u64).sum()
     }
 
-    async fn calculate_resource_snapshot_for_instances(
+    async fn resource_accounting_for_instances(
         &self,
         instances: &HashMap<String, Arc<RwLock<Instance>>>,
-    ) -> ResourceSnapshot {
-        let mut vram = 0;
-        let mut sysmem = 0;
+    ) -> ResourceAccounting {
+        // Read readiness before sampling: a concurrent Ready transition must
+        // not turn an earlier partial load sample into the final allocation.
+        let reservations = self.spawn_reservations.snapshot();
+        let mut vram = 0u64;
+        let mut sysmem = 0u64;
+        let mut promised_vram = 0u64;
+        let mut promised_sysmem = 0u64;
+        let mut instance_memory = HashMap::new();
 
-        for inst_lock in instances.values() {
-            let inst = inst_lock.read().await;
-            let (v, s) = self.get_memory_for_instance(&inst).await;
-            vram += v;
-            sysmem += s;
+        for (id, record) in &reservations.entries {
+            let (live_vram, live_sysmem) = record.pid.map_or((None, None), |pid| {
+                (
+                    self.memory_sampler.sample_vram(pid),
+                    self.memory_sampler.sample_sysmem(pid),
+                )
+            });
+            let observed_vram = live_vram.unwrap_or(0);
+            let observed_sysmem = live_sysmem.unwrap_or(0);
+            let committed_vram = if !record.ready || live_vram.is_none() {
+                record.estimate.0.saturating_sub(observed_vram)
+            } else {
+                0
+            };
+            let committed_sysmem = if !record.ready || live_sysmem.is_none() {
+                record.estimate.1.saturating_sub(observed_sysmem)
+            } else {
+                0
+            };
+            vram = vram.saturating_add(observed_vram);
+            sysmem = sysmem.saturating_add(observed_sysmem);
+            promised_vram = promised_vram.saturating_add(committed_vram);
+            promised_sysmem = promised_sysmem.saturating_add(committed_sysmem);
+            instance_memory.insert(
+                id.clone(),
+                (
+                    observed_vram.saturating_add(committed_vram),
+                    observed_sysmem.saturating_add(committed_sysmem),
+                ),
+            );
         }
-        ResourceSnapshot::from_samples(
+
+        // Instances constructed outside the scheduler have no registry lease.
+        for (id, inst_lock) in instances {
+            let inst = inst_lock.read().await;
+            if inst.memory_reservation.is_none() {
+                let (v, s) = self.get_memory_for_instance(&inst).await;
+                vram = vram.saturating_add(v);
+                sysmem = sysmem.saturating_add(s);
+                instance_memory.insert(id.clone(), (v, s));
+            }
+        }
+        let mut resources = ResourceSnapshot::from_samples(
             vram,
             sysmem,
             self.memory_sampler.sample_device_vram(),
-            instances.len() as u64,
-        )
+            (instances.len() + reservations.node_total()) as u64,
+        );
+        // External usage must be derived from observed allocations, never
+        // estimates: max(observed + promised, device) loses external memory.
+        resources.effective_vram_mb = resources.effective_vram_mb.saturating_add(promised_vram);
+        resources.effective_sysmem_mb = resources
+            .effective_sysmem_mb
+            .saturating_add(promised_sysmem);
+        ResourceAccounting {
+            resources,
+            reservations,
+            instance_memory,
+        }
     }
 
     fn observe_resource_snapshot(&self, snapshot: &ResourceSnapshot) {
@@ -938,14 +1010,26 @@ impl NodeState {
 
     /// Get memory estimate for spawning a new instance with given args_hash.
     async fn get_memory_estimate(&self, args_hash: &str, profile: &Profile) -> (u64, u64) {
-        if let Some((vram, sysmem)) = self.metrics.get_learned_memory(args_hash).await {
-            (vram, sysmem)
-        } else {
-            (
-                profile.estimated_vram_mb.unwrap_or(0),
-                profile.estimated_sysmem_mb.unwrap_or(0),
-            )
-        }
+        let (vram, sysmem) = self
+            .metrics
+            .get_learned_memory(args_hash)
+            .await
+            .unwrap_or_default();
+        // A positive RSS observation does not establish GPU telemetry. Zero
+        // learned values may mean unavailable sampling, so retain the cookbook
+        // fallback independently for each dimension.
+        (
+            if vram > 0 {
+                vram
+            } else {
+                profile.estimated_vram_mb.unwrap_or(0)
+            },
+            if sysmem > 0 {
+                sysmem
+            } else {
+                profile.estimated_sysmem_mb.unwrap_or(0)
+            },
+        )
     }
 
     /// Get memory estimate for a model:profile key (for routing decisions).
@@ -967,7 +1051,7 @@ impl NodeState {
 
         for inst_lock in instances.values() {
             let inst = inst_lock.read().await;
-            if inst.model_name == model_name && inst.profile_id == profile_id {
+            if inst.model_name == model_name && inst.profile_id == profile_id && inst.is_ready() {
                 let (v, s) = self.get_memory_for_instance(&inst).await;
                 if v > 0 || s > 0 {
                     let hash_metrics = self.metrics.get_hash_metrics(&inst.args_hash).await;
@@ -1022,25 +1106,70 @@ impl NodeState {
             }
         }
 
+        // Record this completed load before stopping it, without reacquiring
+        // the instances map while the caller holds an instance read guard.
+        if inst.is_ready() && (vram > 0 || sysmem > 0) {
+            self.metrics
+                .get_hash_metrics(&inst.args_hash)
+                .await
+                .observe_memory(vram, sysmem);
+        }
         if let Err(e) = inst.stop().await {
             error!("Failed to stop instance {}: {}", inst.id, e);
         }
-
-        self.update_peak_memory(&inst.model_name, &inst.profile_id)
-            .await;
 
         // Trigger instant gossip so peers learn about freed capacity immediately
         self.gossip_trigger.notify_one();
     }
 
-    // Helper to identify victims for eviction. Needs to be called under lock if we want to be sure.
-    // But since we want to release lock to stop instances, we return victims.
-    // This method does NOT remove them from the map or stop them.
+    /// Side-effect-free admission plan shared by spawning and queue rechecks.
+    async fn plan_spawn(
+        &self,
+        instances: &HashMap<String, Arc<RwLock<Instance>>>,
+        model: &str,
+        profile: &Profile,
+        required: (u64, u64),
+    ) -> Result<SpawnPlan, NodeError> {
+        let accounting = self.resource_accounting_for_instances(instances).await;
+        let count = Self::count_profile_instances(instances, model, &profile.id).await;
+        if count
+            + accounting
+                .reservations
+                .profile_count(&format!("{model}:{}", profile.id))
+            >= profile.effective_max_instances(&self.config.model_defaults)
+        {
+            return Err(NodeError::MaxInstancesProfile);
+        }
+        let victims = self
+            .pick_victims_from_accounting(instances, &accounting, required)
+            .await?;
+        Ok(SpawnPlan {
+            victims,
+            revision: accounting.reservations.revision,
+        })
+    }
+
+    #[cfg(test)]
     async fn pick_victims(
         &self,
         instances_map: &HashMap<String, Arc<RwLock<Instance>>>,
         required_vram: u64,
         required_sysmem: u64,
+    ) -> Result<Vec<String>, NodeError> {
+        let accounting = self.resource_accounting_for_instances(instances_map).await;
+        self.pick_victims_from_accounting(
+            instances_map,
+            &accounting,
+            (required_vram, required_sysmem),
+        )
+        .await
+    }
+
+    async fn pick_victims_from_accounting(
+        &self,
+        instances_map: &HashMap<String, Arc<RwLock<Instance>>>,
+        accounting: &ResourceAccounting,
+        (required_vram, required_sysmem): (u64, u64),
     ) -> Result<Vec<String>, NodeError> {
         struct Candidate {
             id: String,
@@ -1050,16 +1179,19 @@ impl NodeState {
         }
 
         let mut candidates = Vec::new();
-        let resource_snapshot = self
-            .calculate_resource_snapshot_for_instances(instances_map)
-            .await;
-        self.observe_resource_snapshot(&resource_snapshot);
+        let resource_snapshot = &accounting.resources;
+        self.observe_resource_snapshot(resource_snapshot);
         let mut curr_vram = resource_snapshot.effective_vram_mb;
         let mut curr_sysmem = resource_snapshot.effective_sysmem_mb;
+        let mut curr_instances = instances_map.len() + accounting.reservations.node_total();
 
         for (id, inst_lock) in instances_map.iter() {
             let inst = inst_lock.read().await;
-            let (inst_vram, inst_sysmem) = self.get_memory_for_instance(&inst).await;
+            let (inst_vram, inst_sysmem) = accounting
+                .instance_memory
+                .get(id)
+                .copied()
+                .unwrap_or_default();
 
             // Can only evict idle instances
             if inst.in_flight_requests == 0 {
@@ -1075,7 +1207,12 @@ impl NodeState {
         let max_vram = self.config.max_vram_mb;
         let max_sysmem = self.config.max_sysmem_mb;
 
-        if curr_vram + required_vram <= max_vram && curr_sysmem + required_sysmem <= max_sysmem {
+        let fits = |vram: u64, sysmem: u64, count: usize| {
+            vram.saturating_add(required_vram) <= max_vram
+                && sysmem.saturating_add(required_sysmem) <= max_sysmem
+                && count < self.config.max_instances_per_node
+        };
+        if fits(curr_vram, curr_sysmem, curr_instances) {
             return Ok(Vec::new());
         }
 
@@ -1087,12 +1224,18 @@ impl NodeState {
         for candidate in candidates {
             curr_vram = curr_vram.saturating_sub(candidate.vram);
             curr_sysmem = curr_sysmem.saturating_sub(candidate.sysmem);
+            curr_instances = curr_instances.saturating_sub(1);
             victims.push(candidate.id);
 
-            if curr_vram + required_vram <= max_vram && curr_sysmem + required_sysmem <= max_sysmem
-            {
+            if fits(curr_vram, curr_sysmem, curr_instances) {
                 return Ok(victims);
             }
+        }
+
+        if curr_vram.saturating_add(required_vram) <= max_vram
+            && curr_sysmem.saturating_add(required_sysmem) <= max_sysmem
+        {
+            return Err(NodeError::MaxInstancesNode);
         }
 
         // Log detailed info about why resources are insufficient
@@ -1709,6 +1852,8 @@ impl NodeState {
                         }
 
                         let key = format!("{}:{}", model_name, profile.id);
+                        #[cfg(test)]
+                        guardrail_tests::pause_at(&self.test_hooks.before_enqueue).await;
                         let (tx, rx) = oneshot::channel();
                         let queue_token;
 
@@ -1781,29 +1926,11 @@ impl NodeState {
                         // and wake the queue's front waiter if it cleared.
                         if matches!(
                             e,
-                            NodeError::MaxInstancesProfile | NodeError::MaxInstancesNode
+                            NodeError::MaxInstancesProfile
+                                | NodeError::MaxInstancesNode
+                                | NodeError::InsufficientResources
                         ) {
-                            let gate_cleared = {
-                                let instances_map = self.instances.read().await;
-                                let profile_count = Self::count_profile_instances(
-                                    &instances_map,
-                                    model_name,
-                                    &profile.id,
-                                )
-                                .await;
-                                let max_instances =
-                                    profile.effective_max_instances(&self.config.model_defaults);
-                                let profile_ok = profile_count
-                                    + self.spawn_reservations.profile_count(&key)
-                                    < max_instances;
-                                let node_ok = instances_map.len()
-                                    + self.spawn_reservations.node_total()
-                                    < self.config.max_instances_per_node;
-                                profile_ok && node_ok
-                            };
-                            if gate_cleared {
-                                self.notify_queue(model_name, &profile.id).await;
-                            }
+                            self.wake_queue_if_admissible(model_name, profile).await;
                         }
 
                         // Wait for queue notification with optional timeout
@@ -1993,104 +2120,35 @@ impl NodeState {
                 // Lost the race or instance started draining — fall through to spawn/queue
             }
 
-            // 3. Check profile max instances. In-flight spawn reservations
-            // count toward capacity: a spawn that already passed these checks
-            // but hasn't reached the map yet must block a second contender
-            // here (it queues and is served by the winner's instance) instead
-            // of letting it spawn a duplicate that would be killed at
-            // insertion time.
             let profile_key = format!("{}:{}", model_name, profile.id);
-            let profile_count =
-                Self::count_profile_instances(&instances_map, model_name, &profile.id).await;
-            let reserved_profile = self.spawn_reservations.profile_count(&profile_key);
-            let max_instances = profile.effective_max_instances(&self.config.model_defaults);
-            if profile_count + reserved_profile >= max_instances {
-                return Err(NodeError::MaxInstancesProfile);
-            }
-
-            // 4. Build args early to compute args_hash for memory estimation
-            // This is needed before pick_victims to know required memory
             let (pre_args, _model_arg_present, _hf_repo_arg_present) = build_pre_args(profile);
             let args_hash = compute_args_hash(&pre_args);
             let (required_vram, required_sysmem) =
                 self.get_memory_estimate(&args_hash, profile).await;
-
-            // 4. Check Memory, Node Guardrails & Identify Victims
-            let mut victims = self
-                .pick_victims(&instances_map, required_vram, required_sysmem)
+            let plan = self
+                .plan_spawn(
+                    &instances_map,
+                    model_name,
+                    profile,
+                    (required_vram, required_sysmem),
+                )
                 .await?;
 
-            // In-flight spawn reservations occupy node capacity too. They are
-            // not in the map, so they can never be picked as eviction victims
-            // — the eviction math below only frees map entries.
-            let current_instances = instances_map.len() + self.spawn_reservations.node_total();
-            let max_node_instances = self.config.max_instances_per_node;
-
-            if current_instances + 1 > max_node_instances {
-                let mut additional_needed = current_instances + 1 - max_node_instances;
-                if additional_needed > victims.len() {
-                    additional_needed -= victims.len();
-                } else {
-                    additional_needed = 0;
-                }
-
-                if additional_needed > 0 {
-                    let mut idle_candidates = Vec::new();
-                    for (id, inst_lock) in instances_map.iter() {
-                        if victims.iter().any(|existing| existing == id) {
-                            continue;
-                        }
-                        let inst = inst_lock.read().await;
-                        if inst.in_flight_requests == 0 {
-                            idle_candidates.push((id.clone(), inst.last_activity));
-                        }
-                    }
-
-                    idle_candidates.sort_by_key(|(_, last_activity)| *last_activity);
-
-                    for (id, _) in idle_candidates {
-                        victims.push(id.clone());
-                        additional_needed = additional_needed.saturating_sub(1);
-                        if additional_needed == 0 {
-                            break;
-                        }
-                    }
-                }
-
-                if additional_needed > 0 {
-                    warn!(
-                        "Max instances per node ({}) reached; cannot spawn additional instances",
-                        max_node_instances
-                    );
-                    return Err(NodeError::MaxInstancesNode);
-                }
-            }
-
-            if !victims.is_empty() {
-                // Remove victims from the map before we drop the global lock.
-                // Re-verify each victim is still idle to prevent race condition where
-                // a request was assigned between pick_victims() and now.
-                let mut removed_instances = Vec::new();
-                for id in victims {
-                    // Re-verify victim is still idle before removal
-                    if let Some(inst_lock) = instances_map.get(&id) {
-                        let inst = inst_lock.read().await;
-                        if inst.in_flight_requests > 0 {
-                            // Victim became active between pick_victims and now, skip it
-                            info!(
-                                instance_id = %id,
-                                in_flight = %inst.in_flight_requests,
-                                "Victim became active during eviction, skipping"
-                            );
-                            continue;
-                        }
-                        drop(inst);
-                    }
-                    // Now safe to remove
-                    if let Some(inst_lock) = instances_map.remove(&id) {
-                        removed_instances.push(inst_lock);
-                    }
-                }
+            if !plan.victims.is_empty() {
+                // No new assignments can occur under the map write lock. A
+                // reservation can still disappear independently, so commit
+                // only if the accounting revision remains current. Otherwise
+                // re-plan rather than evicting an unnecessary warm instance.
+                let Some(removed_instances) =
+                    self.spawn_reservations.with_revision(plan.revision, || {
+                        plan.victims
+                            .iter()
+                            .filter_map(|id| instances_map.remove(id))
+                            .collect::<Vec<_>>()
+                    })
+                else {
+                    continue;
+                };
 
                 // Collect ports and release them BEFORE dropping instances lock
                 let mut ports_to_release: Vec<u16> = Vec::new();
@@ -2155,28 +2213,17 @@ impl NodeState {
                 }
             }
 
-            // All capacity checks passed and we are committed to spawning.
-            // Reserve the slot before releasing the write lock so concurrent
-            // contenders see this in-flight spawn in the checks above. The
-            // guard releases on every error/cancellation path; on success it
-            // is handed off at map insertion, where the instance starts being
-            // counted via the map instead. On abandonment (spawn failure or
-            // request cancellation) capacity frees up without any instance
-            // reaching the map, so no later slot-release or termination event
-            // would ever wake requests that queued because of this
-            // reservation — wake them here. Drop is sync and the queue locks
-            // are async, so the work happens in a spawned task (same pattern
-            // as SlotReleaseGuard).
+            // Reserve count and memory under the admission lock. The guard
+            // wakes waiters if abandoned; any spawned child retains its memory
+            // lease until exit. Count hands off to the map at insertion.
             let abandon_state = self.clone();
             let mut spawn_reservation = self.spawn_reservations.reserve(
                 profile_key,
+                (required_vram, required_sysmem),
                 Some(Box::new(move || {
                     tokio::spawn(async move {
-                        // Drains scheduled because this reservation occupied
-                        // node capacity may no longer be needed; re-evaluate
-                        // before waking waiters.
-                        abandon_state.maybe_cancel_drains().await;
                         abandon_state.notify_all_queues().await;
+                        abandon_state.gossip_trigger.notify_one();
                     });
                 })),
             );
@@ -2184,13 +2231,16 @@ impl NodeState {
             // Release outer write lock before entering retry loop (will re-acquire as needed)
             drop(instances_map);
 
+            #[cfg(test)]
+            guardrail_tests::pause_at(&self.test_hooks.after_reserve).await;
+
             // Retry loop for port allocation and spawn (handles TOCTOU race on ports)
             const MAX_SPAWN_RETRIES: usize = 3;
             let mut spawn_attempt = 0;
             let (instance_id, port, inst_arc, is_cold_start, final_args) = loop {
                 spawn_attempt += 1;
 
-                let instance_id = Ulid::new().to_string();
+                let instance_id = spawn_reservation.memory().id().to_string();
                 let port_overridden = port_override.is_some();
                 let port = match port_override {
                     Some(p) => {
@@ -2246,6 +2296,7 @@ impl NodeState {
                     args_hash.clone(),
                     is_cold_start,
                 );
+                new_instance.memory_reservation = Some(spawn_reservation.memory());
                 new_instance.llama_cpp_version = llama_cpp_version;
                 if reserve_slot {
                     // Claim the spawning request's slot before the instance
@@ -2257,6 +2308,25 @@ impl NodeState {
                     new_instance.in_flight_requests = 1;
                 }
                 let inst_arc = Arc::new(RwLock::new(new_instance));
+
+                // Resample immediately before every exec, including port
+                // retries. Our own promise is already included exactly once;
+                // do not add the candidate estimate again. Preparation above
+                // may have waited while external VRAM usage changed.
+                {
+                    let instances = self.instances.read().await;
+                    let resources = self
+                        .resource_accounting_for_instances(&instances)
+                        .await
+                        .resources;
+                    if resources.effective_vram_mb > self.config.max_vram_mb
+                        || resources.effective_sysmem_mb > self.config.max_sysmem_mb
+                    {
+                        drop(instances);
+                        self.release_port(port).await;
+                        return Err(NodeError::InsufficientResources);
+                    }
+                }
 
                 // Try to spawn BEFORE inserting into map to avoid race condition
                 // where is_alive() returns false because child is None
@@ -2391,16 +2461,6 @@ impl NodeState {
             let ready_model = model_name.to_string();
             let ready_profile = profile.id.clone();
             tokio::spawn(async move {
-                // Refresh peak-memory accounting for this model's instances.
-                // Runs here (not inline after insertion) so the spawn path
-                // stays await-free between map insertion and returning the
-                // pre-claimed slot to the caller — see the INVARIANT comment
-                // at the insertion site. LOCK_ORDER: must run before the
-                // instance read guard below (instances is lock 1).
-                ready_state
-                    .update_peak_memory(&ready_model, &ready_profile)
-                    .await;
-
                 let inst = inst_clone.read().await;
                 if let Err(e) = inst
                     .wait_for_ready(startup_timeout, api_key, &http_client)
@@ -2471,6 +2531,15 @@ impl NodeState {
                     // LOCK_ORDER: release the instance lock (4) before
                     // notify_queue acquires `queues` (2).
                     drop(inst);
+
+                    // Partial startup samples must never teach a subsequent
+                    // spawn a smaller estimate. Record only completed loads.
+                    ready_state
+                        .update_peak_memory(&ready_model, &ready_profile)
+                        .await;
+                    // Releasing excess startup commitment can also make room
+                    // for another profile, even without a request completing.
+                    ready_state.notify_all_queues().await;
 
                     // Wake queued waiters for this model:profile, up to the
                     // ready instance's spare concurrency — and before the
@@ -2547,7 +2616,7 @@ impl NodeState {
     pub async fn get_self_peer_state(&self) -> PeerState {
         let resources = self.calculate_resource_snapshot().await;
         let instances = self.instances.read().await;
-        let active_instances = instances.len();
+        let active_instances = resources.active_instances as usize;
         let max_instances = self.config.max_instances_per_node;
 
         // Collect currently loaded models and count instances per model
@@ -2576,19 +2645,10 @@ impl NodeState {
                         let hash_metrics = self.metrics.get_hash_metrics(&args_hash).await;
                         let (estimated_vram, estimated_sysmem) =
                             self.get_memory_estimate_for_key(key).await;
-                        let has_learned_memory = self.metrics.has_memory_data(&args_hash).await;
                         (
                             hash_metrics.tokens_per_second(),
-                            if has_learned_memory {
-                                hash_metrics.peak_vram_mb.load(Ordering::Relaxed)
-                            } else {
-                                estimated_vram
-                            },
-                            if has_learned_memory {
-                                hash_metrics.peak_sysmem_mb.load(Ordering::Relaxed)
-                            } else {
-                                estimated_sysmem
-                            },
+                            estimated_vram,
+                            estimated_sysmem,
                         )
                     } else {
                         (0.0, 0, 0)
@@ -2615,19 +2675,10 @@ impl NodeState {
                         let hash_metrics = self.metrics.get_hash_metrics(&args_hash).await;
                         let (estimated_vram, estimated_sysmem) =
                             self.get_memory_estimate_for_key(key).await;
-                        let has_learned_memory = self.metrics.has_memory_data(&args_hash).await;
                         (
                             hash_metrics.tokens_per_second(),
-                            if has_learned_memory {
-                                hash_metrics.peak_vram_mb.load(Ordering::Relaxed)
-                            } else {
-                                estimated_vram
-                            },
-                            if has_learned_memory {
-                                hash_metrics.peak_sysmem_mb.load(Ordering::Relaxed)
-                            } else {
-                                estimated_sysmem
-                            },
+                            estimated_vram,
+                            estimated_sysmem,
                         )
                     } else {
                         (0.0, 0, 0)
@@ -3029,6 +3080,46 @@ impl NodeState {
         woken
     }
 
+    async fn wake_queue_if_admissible(&self, model: &str, profile: &Profile) {
+        self.notify_waiters_for_available_slots(model, &profile.id)
+            .await;
+        let (args, _, _) = build_pre_args(profile);
+        let required = self
+            .get_memory_estimate(&compute_args_hash(&args), profile)
+            .await;
+        let can_spawn = {
+            let instances = self.instances.read().await;
+            self.plan_spawn(&instances, model, profile, required)
+                .await
+                .is_ok()
+        };
+        if can_spawn {
+            self.notify_queue(model, &profile.id).await;
+        }
+    }
+
+    /// External GPU users do not emit instance lifecycle events. Recheck
+    /// memory-blocked queues on the normal maintenance tick so they cannot
+    /// sleep forever after device headroom returns.
+    async fn wake_admissible_queues(&self) {
+        let keys: Vec<_> = self.queues.read().await.keys().cloned().collect();
+        for key in keys {
+            let queued = self
+                .queues
+                .read()
+                .await
+                .get(&key)
+                .is_some_and(|q| !q.is_empty());
+            if !queued {
+                continue;
+            }
+            if let Some((model, profile)) = self.resolve_model(&key).await {
+                self.wake_queue_if_admissible(&model, &profile).await;
+            }
+        }
+        self.capacity_notify.notify_waiters();
+    }
+
     /// Remove a pending token after waiter successfully acquires slot or times out.
     async fn remove_pending_token(&self, model_name: &str, profile_id: &str, token: u64) {
         let key = format!("{model_name}:{profile_id}");
@@ -3267,6 +3358,7 @@ impl NodeState {
             if let Err(e) = self.check_idle_instances().await {
                 error!("Error in eviction loop: {}", e);
             }
+            self.wake_admissible_queues().await;
 
             // Metrics Persistence
             self.persist_metrics_snapshot().await;
@@ -3278,6 +3370,9 @@ impl NodeState {
         let instances = self.instances.read().await;
         for inst_lock in instances.values() {
             let inst = inst_lock.read().await;
+            if !inst.is_ready() {
+                continue;
+            }
             if let Some(pid) = inst.get_pid() {
                 let (vram, sysmem) = self.memory_sampler.sample(pid);
                 if vram > 0 || sysmem > 0 {
@@ -3908,7 +4003,7 @@ mod tests {
         assert!(!peer_supports_profile(&peer, "gpt", "fast"));
     }
 
-    fn sample_profile() -> Profile {
+    pub(super) fn sample_profile() -> Profile {
         Profile {
             id: "default".into(),
             description: None,
@@ -3941,7 +4036,7 @@ mod tests {
         }
     }
 
-    fn attach_live_test_child(inst: &Instance) {
+    pub(super) fn attach_live_test_child(inst: &Instance) {
         let child = tokio::process::Command::new("sleep")
             .arg("60")
             .spawn()
@@ -3949,7 +4044,7 @@ mod tests {
         *inst.child.lock() = Some(child);
     }
 
-    fn gpu_snapshot(used_mb: u64, total_mb: u64) -> GpuMemorySnapshot {
+    pub(super) fn gpu_snapshot(used_mb: u64, total_mb: u64) -> GpuMemorySnapshot {
         GpuMemorySnapshot {
             used_mb,
             free_mb: total_mb.saturating_sub(used_mb),
@@ -4014,7 +4109,7 @@ mod tests {
 
     // --- Integration-like test for dynamic peer discovery ---
 
-    fn minimal_node_config() -> NodeConfig {
+    pub(super) fn minimal_node_config() -> NodeConfig {
         NodeConfig {
             node_id: "node-local".to_string(),
             listen_addr: "0.0.0.0:8080".to_string(),
@@ -4275,7 +4370,7 @@ mod tests {
         // reached the instances map yet.
         let guard = state
             .spawn_reservations
-            .reserve("test:default".to_string(), None);
+            .reserve("test:default".to_string(), (0, 0), None);
 
         let err = state
             .try_get_or_spawn("test", &profile, false, "test", false)
@@ -4322,9 +4417,10 @@ mod tests {
 
         // A different profile's in-flight spawn occupies the node's only
         // slot. It is not in the map, so it cannot be evicted to make room.
-        let _guard = state
-            .spawn_reservations
-            .reserve("other-model:default".to_string(), None);
+        let _guard =
+            state
+                .spawn_reservations
+                .reserve("other-model:default".to_string(), (0, 0), None);
 
         let err = state
             .try_get_or_spawn("test", &profile, false, "test", false)
