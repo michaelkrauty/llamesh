@@ -915,11 +915,7 @@ On chosen node (or standalone):
    * Dispatch the request to that instance.
 5. If no instance has capacity and total instances < `max_instances` for that profile and resource guardrails allow:
 
-   * Reserve the capacity slot (per-profile and node-wide) before releasing the
-     instances lock to spawn: in-flight spawn reservations count toward the
-     capacity checks, so a concurrent contender queues instead of spawning a
-     duplicate. Reservations are RAII-released on every failure path and handed
-     off to the instances map on successful insertion.
+   * Reserve the capacity slot (per-profile and node-wide) and estimated VRAM/sysmem before releasing the instances lock. Slot accounting transfers to the instances map on insertion; memory commitments follow the process through loading and teardown, including cancellation and failure cleanup.
    * Start a new instance with spawn retry and port rotation (up to 3 retries on OS-level failure).
    * After spawn, perform post-spawn race detection as defense in depth: if another request somehow raced and consumed capacity, kill the just-spawned process to avoid waste (with reservations gating admission, this path is not expected to fire).
    * Queue the request until the instance is ready.
@@ -936,6 +932,7 @@ On chosen node (or standalone):
 
 * Each request has a `max_wait_in_queue_ms` configured globally or per model.
 * A `max_wait_in_queue_ms` of 0 means infinite wait (no timeout).
+* After enqueueing, recheck admission, including capacity obtainable by evicting idle instances, to close notification races. Periodic maintenance also rechecks queued profiles against current memory usage so an external GPU consumer freeing memory can unblock them without an instance lifecycle event.
 * If the request stays in queue longer than that (and the timeout is non-zero):
 
   * Remove it from the queue and return 503 `queue_timeout`.
@@ -1038,19 +1035,21 @@ If the request is proxied cross-node:
 
 ## Memory & Resource Guardrails
 
-Before starting a new instance, the node must verify resources:
+Before admitting a new instance, the node verifies resources using fresh telemetry. It samples again immediately before every process spawn, including retries; device usage is never cached at proxy startup.
 
-1. Compute VRAM/sysmem attributed to running llamesh-managed instances using live process samples or learned values.
+1. Sample VRAM/sysmem attributed to managed processes, including processes removed from the instance map but still stopping.
 2. Sample device-wide GPU memory when telemetry is available.
-3. Compute non-evictable external VRAM:
+3. Compute non-evictable external VRAM from observed allocations, then add memory promised to pending or loading instances that has not yet been allocated:
 
    ```text
-   external_vram = device_used_vram - llamesh_tracked_vram, saturating at 0
-   effective_vram = llamesh_tracked_vram + external_vram
+   external_vram = max(device_used_vram - observed_managed_vram, 0)
+   unallocated_commitment = sum(max(startup_estimate - process_observation, 0))
+   effective_vram = observed_managed_vram + external_vram + unallocated_vram_commitment
+   effective_sysmem = observed_managed_sysmem + unallocated_sysmem_commitment
    ```
 
-   If device telemetry is unavailable, `external_vram` is 0 and the node falls back to llamesh-tracked memory only.
-4. Estimate additional usage for the new instance using learned memory values (keyed by llama-server launch args hash), falling back to optional cookbook estimates.
+   A pending spawn has no observed allocation and reserves its full estimate. Loading processes retain at least that estimate until readiness; afterward, live observations replace it independently for each available memory dimension. Missing process telemetry retains the estimate conservatively, which may overcount allocation already included in device usage. If device telemetry is unavailable, `external_vram` is 0. Commitments are released on confirmed process exit, not merely on removal from the routing map.
+4. Estimate additional usage for the candidate using positive learned memory values (keyed by llama-server launch args hash), falling back independently to optional cookbook VRAM/sysmem estimates. Check and reserve under the instances write lock so concurrent admissions see each other's commitments. A pre-exec retry counts its own existing commitment exactly once.
 5. If starting instance would exceed `max_vram_mb` or `max_sysmem_mb`:
 
    * Try to free space by:
@@ -1061,15 +1060,11 @@ Before starting a new instance, the node must verify resources:
 
      * Either queue request and wait for capacity (bounded by timeout), or immediately return `no_capacity` error depending on configuration.
 
-External VRAM is never counted as evictable capacity. Eviction simulation only
-subtracts memory attributed to llamesh-managed instances.
+External VRAM is never counted as evictable capacity. Eviction simulation subtracts each idle instance's exact contribution from the same accounting snapshot; unmapped stopping processes are not eviction candidates. Admission re-plans if reservations changed before committing an eviction. Peer headroom uses the same commitment-aware accounting.
 
 ### Cookbook Estimates
 
-Profiles may define optional `estimated_vram_mb` and `estimated_sysmem_mb`
-values. These are cold-start admission hints only. Once runtime sampling has
-observed a profile's launch-args hash, learned peak memory replaces the static
-estimate for future scheduling.
+Profiles may define optional `estimated_vram_mb` and `estimated_sysmem_mb` values. These provide startup admission estimates until a completed load supplies positive learned values for the corresponding dimension. A positive RSS sample does not replace an unavailable VRAM estimate with zero. With neither an estimate nor usable learned data, that dimension remains unknown and cannot be reserved in advance.
 
 ### Learned Memory
 
@@ -1078,7 +1073,7 @@ Memory usage is automatically learned at runtime:
 * **VRAM**: Sampled via NVIDIA NVML (if available)
 * **Device VRAM**: Device-wide NVML memory telemetry is sampled to account for non-llamesh GPU consumers.
 * **System memory**: Sampled via `/proc/[pid]/status` (VmRSS)
-* **Continuous sampling**: Memory is sampled every 10 seconds throughout the instance lifetime, not just during cold-start.
+* **Continuous sampling**: Memory is sampled every 10 seconds. Only ready instances contribute learned values, so a partial load cannot replace a full startup estimate. Reserved memory is never recorded as an actual observation.
 * **Peak tracking**: Uses atomic `fetch_max` so values can only grow over the instance lifetime, capturing the true peak usage.
 
 Learned values are persisted in the metrics JSON file (at `metrics_path`) and keyed by a SHA-256 hash of the llama-server launch arguments. This means:
