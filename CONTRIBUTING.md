@@ -38,7 +38,7 @@ The Linux mDNS TTL regression (`cargo test --test integration_test_mdns_ttl`) re
 
 The mDNS wrapper discovery tests (`cargo test --bin llamesh discovery::mdns::network_tests`) use the same isolation prerequisites to verify two-peer discovery, connectable IPv4/IPv6 endpoints, and service withdrawal without configured peers.
 
-The peer relocation regressions (`cargo test --test integration_test_peer_address_refresh`) additionally require PID namespaces and the release mock server binary. They verify that mDNS-discovered peers changing listener ports remain routable through both Noise and plaintext HTTP while the requesting node stays running.
+The peer relocation regressions (`cargo test --test integration_test_peer_address_refresh`) additionally require PID namespaces and the release mock server binary. They verify that mDNS-discovered and same-host loopback peers changing listener ports remain routable through both Noise and plaintext HTTP while the requesting node stays running.
 
 ## Pull Requests
 

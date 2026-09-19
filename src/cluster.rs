@@ -397,7 +397,7 @@ fn parse_peer_url(address: &str) -> Option<reqwest::Url> {
 fn source_peer_url(advertised: &str, source: std::net::SocketAddr) -> Option<String> {
     // Dual-stack sockets can report IPv4 sources as mapped IPv6 addresses.
     let ip = source.ip().to_canonical();
-    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+    if ip.is_unspecified() || ip.is_multicast() {
         return None;
     }
     if matches!(ip, std::net::IpAddr::V4(ip) if ip.is_broadcast()) {
@@ -557,8 +557,14 @@ pub async fn process_gossip_message(
         // port; the TCP source port is ephemeral and must never be routed to.
         if !resolved {
             let existing = peers.get(&peer_state.node_id);
+            // Same-host peers may follow a loopback source, but local ingress
+            // (for example a reverse proxy) must not replace a non-loopback route.
+            let source = source_addr.filter(|source| {
+                !source.ip().to_canonical().is_loopback()
+                    || existing.is_none_or(|peer| is_loopback_address(&peer.address))
+            });
             if let Some(derived_address) =
-                source_addr.and_then(|source| source_peer_url(&peer_state.address, source))
+                source.and_then(|source| source_peer_url(&peer_state.address, source))
             {
                 if existing.map(|peer| &peer.address) != Some(&derived_address) {
                     info!(
@@ -1175,6 +1181,23 @@ mod tests {
             let peer = receive_address(&state, advertised, Some(source)).await;
             assert_eq!(peer.address, expected);
             assert!(peer.address_from_source);
+        }
+    }
+
+    #[tokio::test]
+    async fn same_host_peers_follow_loopback_listener_changes() {
+        for (advertised, source, expected) in [
+            ("127.0.0.1", "127.0.0.1:50000", "127.0.0.1"),
+            ("[::1]", "[::1]:50000", "[::1]"),
+            ("127.0.0.1", "[::ffff:127.0.0.1]:50000", "127.0.0.1"),
+        ] {
+            let state = address_test_state(&[]).await;
+            for port in [8080, 9000] {
+                let peer =
+                    receive_address(&state, &format!("http://{advertised}:{port}"), Some(source))
+                        .await;
+                assert_eq!(peer.address, format!("http://{expected}:{port}"));
+            }
         }
     }
 

@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Refresh locally source-derived peer routing addresses when subsequent direct gossip reports a changed source IP, listener port, or scheme. Preserve advertised, configured, and transitively learned routes; retain existing inferred endpoints when source information is unavailable or unusable. Address provenance stays local and cannot be supplied over gossip.
+- Refresh locally source-derived peer routing addresses when subsequent direct gossip reports a changed source IP, listener port, or scheme, including same-host loopback peers. Preserve advertised, configured, and transitively learned non-loopback routes; retain existing inferred endpoints when source information is unavailable or unusable. Address provenance stays local and cannot be supplied over gossip.
 
 ## [1.21.6] - 2026-09-19
 

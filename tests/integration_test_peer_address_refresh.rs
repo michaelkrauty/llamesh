@@ -23,15 +23,25 @@ const NEW_PORT: u16 = 19082;
 
 #[test]
 fn discovered_peer_port_refreshes_noise_route() {
-    isolated_relocation(true);
+    isolated_relocation(true, false);
 }
 
 #[test]
 fn discovered_peer_port_refreshes_plaintext_route() {
-    isolated_relocation(false);
+    isolated_relocation(false, false);
 }
 
-fn isolated_relocation(noise: bool) {
+#[test]
+fn loopback_peer_port_refreshes_noise_route() {
+    isolated_relocation(true, true);
+}
+
+#[test]
+fn loopback_peer_port_refreshes_plaintext_route() {
+    isolated_relocation(false, true);
+}
+
+fn isolated_relocation(noise: bool, loopback: bool) {
     let namespace = fs::read_link("/proc/self/ns/net").unwrap();
     let Ok(parent_namespace) = std::env::var(PARENT_NETNS) else {
         // Owned by the outer process so even the hard deadline cleans up files.
@@ -81,7 +91,7 @@ fn isolated_relocation(noise: bool) {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(relocation(noise));
+        .block_on(relocation(noise, loopback));
 }
 
 struct Node {
@@ -90,7 +100,14 @@ struct Node {
 }
 
 impl Node {
-    fn start(directory: &Path, id: &str, port: u16, noise: bool, token: &str) -> Self {
+    fn start(
+        directory: &Path,
+        id: &str,
+        port: u16,
+        noise: bool,
+        token: &str,
+        loopback: bool,
+    ) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let binary = std::env::var_os("LLAMESH_ADDRESS_REFRESH_BINARY")
             .map(PathBuf::from)
@@ -102,15 +119,23 @@ impl Node {
         );
         let config = directory.join(format!("{id}.yaml"));
         let cookbook = directory.join(format!("{id}-cookbook.yaml"));
-        // No public_url and no seeds: mDNS must bootstrap real non-loopback
-        // gossip, while wildcard-bound nodes advertise loopback placeholders.
+        // Non-loopback peers bootstrap through mDNS without seeds/public_url.
+        // Loopback B seeds A; A learns B only from incoming gossip, so a fixed
+        // configured B address cannot mask a stale source-derived route.
+        let peers = if loopback && id == "node-b" {
+            format!("[\"http://127.0.0.1:{A_PORT}\"]")
+        } else {
+            "[]".to_owned()
+        };
+        let listen = if loopback { "127.0.0.1" } else { "0.0.0.0" };
+        let mdns = !loopback;
         // Omit enabled for Noise to exercise the production default.
         let plaintext = if noise { "" } else { "    enabled: false\n" };
         fs::write(
             &config,
             format!(
                 r#"node_id: "{id}"
-listen_addr: "0.0.0.0:{port}"
+listen_addr: "{listen}:{port}"
 metrics_path: "{id}-metrics.json"
 shutdown_grace_period_seconds: 2
 max_vram_mb: 1048576
@@ -137,10 +162,10 @@ llama_cpp:
   enabled: false
 cluster:
   enabled: true
-  peers: []
+  peers: {peers}
   gossip_interval_seconds: 1
   discovery:
-    mdns: true
+    mdns: {mdns}
     service_name: "_refresh-test._tcp.local."
   noise:
 {plaintext}    config_dir: "{id}-noise"
@@ -222,9 +247,9 @@ impl Drop for Node {
     }
 }
 
-async fn snapshot(client: &reqwest::Client, port: u16) -> Value {
+async fn snapshot(client: &reqwest::Client, address: &str, port: u16) -> Value {
     match client
-        .get(format!("http://{ADDRESS}:{port}/cluster/nodes"))
+        .get(format!("http://{address}:{port}/cluster/nodes"))
         .send()
         .await
     {
@@ -233,14 +258,14 @@ async fn snapshot(client: &reqwest::Client, port: u16) -> Value {
     }
 }
 
-async fn wait_for_peer(client: &reqwest::Client, expected_port: u16) -> Value {
+async fn wait_for_peer(client: &reqwest::Client, address: &str, expected_port: u16) -> Value {
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
-        let nodes = snapshot(client, A_PORT).await;
-        let peer_nodes = snapshot(client, expected_port).await;
-        if (nodes["nodes"]["node-b"]["address"] == format!("http://{ADDRESS}:{expected_port}")
+        let nodes = snapshot(client, address, A_PORT).await;
+        let peer_nodes = snapshot(client, address, expected_port).await;
+        if (nodes["nodes"]["node-b"]["address"] == format!("http://{address}:{expected_port}")
             && nodes["nodes"]["node-b"]["ready"] == true
-            && peer_nodes["nodes"]["node-a"]["address"] == format!("http://{ADDRESS}:{A_PORT}"))
+            && peer_nodes["nodes"]["node-a"]["address"] == format!("http://{address}:{A_PORT}"))
             || Instant::now() >= deadline
         {
             return nodes;
@@ -249,9 +274,9 @@ async fn wait_for_peer(client: &reqwest::Client, expected_port: u16) -> Value {
     }
 }
 
-async fn infer(client: &reqwest::Client) -> Result<Value, String> {
+async fn infer(client: &reqwest::Client, address: &str) -> Result<Value, String> {
     let response = client
-        .post(format!("http://{ADDRESS}:{A_PORT}/v1/chat/completions"))
+        .post(format!("http://{address}:{A_PORT}/v1/chat/completions"))
         .json(&json!({"model": "remote-model", "messages": [{"role": "user", "content": "hello"}]}))
         .send()
         .await
@@ -267,47 +292,43 @@ async fn infer(client: &reqwest::Client) -> Result<Value, String> {
     Ok(body)
 }
 
-async fn relocation(noise: bool) {
+async fn relocation(noise: bool, loopback: bool) {
+    let address = if loopback { "127.0.0.1" } else { ADDRESS };
     let directory = PathBuf::from(std::env::var_os(TEST_DIR).unwrap());
     let token = base64::engine::general_purpose::STANDARD.encode(rand::random::<[u8; 32]>());
-    let mut a = Node::start(&directory, "node-a", A_PORT, noise, &token);
-    let mut b = Node::start(&directory, "node-b", OLD_PORT, noise, &token);
+    let mut a = Node::start(&directory, "node-a", A_PORT, noise, &token, loopback);
+    let mut b = Node::start(&directory, "node-b", OLD_PORT, noise, &token, loopback);
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(10))
         .build()
         .unwrap();
-    let before = wait_for_peer(&client, OLD_PORT).await;
+    let before = wait_for_peer(&client, address, OLD_PORT).await;
     assert_eq!(
         before["nodes"]["node-b"]["address"],
-        format!("http://{ADDRESS}:{OLD_PORT}"),
+        format!("http://{address}:{OLD_PORT}"),
         "initial discovery/gossip failed: {before}"
     );
     assert_eq!(
         before["nodes"]["node-a"]["address"],
         format!("http://127.0.0.1:{A_PORT}")
     );
-    let initial = infer(&client).await;
+    let initial = infer(&client, address).await;
     assert!(
         initial.is_ok(),
         "initial inference through A must reach B: {initial:?}"
     );
     let key = noise.then(|| fs::read(directory.join("node-b-noise/node.key")).unwrap());
     b.stop().await;
-    let mut b_new = Node::start(&directory, "node-b", NEW_PORT, noise, &token);
-    let after = wait_for_peer(&client, NEW_PORT).await;
-    let restarted = snapshot(&client, NEW_PORT).await;
+    let mut b_new = Node::start(&directory, "node-b", NEW_PORT, noise, &token, loopback);
+    let after = wait_for_peer(&client, address, NEW_PORT).await;
+    let restarted = snapshot(&client, address, NEW_PORT).await;
     assert_eq!(
         restarted["nodes"]["node-b"]["address"],
         format!("http://127.0.0.1:{NEW_PORT}"),
         "restarted B must be healthy at its new listener: {restarted}"
     );
-    assert_eq!(
-        restarted["nodes"]["node-a"]["address"],
-        format!("http://{ADDRESS}:{A_PORT}"),
-        "restarted B must rediscover A: {restarted}"
-    );
-    let forwarded = infer(&client).await;
+    let forwarded = infer(&client, address).await;
     assert!(
         a.child.try_wait().unwrap().is_none(),
         "A must remain running throughout relocation"
@@ -320,8 +341,13 @@ async fn relocation(noise: bool) {
     }
     assert_eq!(
         after["nodes"]["node-b"]["address"],
-        format!("http://{ADDRESS}:{NEW_PORT}"),
+        format!("http://{address}:{NEW_PORT}"),
         "A retained a stale peer address after B moved; inference through A: {forwarded:?}"
+    );
+    assert_eq!(
+        restarted["nodes"]["node-a"]["address"],
+        format!("http://{address}:{A_PORT}"),
+        "restarted B must rediscover A: {restarted}"
     );
     assert!(
         forwarded.is_ok(),
