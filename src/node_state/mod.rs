@@ -2799,6 +2799,7 @@ impl NodeState {
         PeerState {
             node_id: self.config.node_id.clone(),
             address,
+            address_from_source: false,
             version: env!("CARGO_PKG_VERSION").to_string(),
             llama_cpp_version,
             last_seen: std::time::SystemTime::now()
@@ -3971,6 +3972,7 @@ mod tests {
         PeerState {
             node_id: "peer-a".into(),
             address: "http://peer-a".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -4204,6 +4206,7 @@ mod tests {
         let peer = PeerState {
             node_id: "remote-peer".into(),
             address: "http://remote-peer".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: now, // Recent
@@ -5313,6 +5316,7 @@ mod tests {
         let peer = PeerState {
             node_id: "test".into(),
             address: "http://test".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5350,6 +5354,7 @@ mod tests {
         let peer = PeerState {
             node_id: "test".into(),
             address: "http://test".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5387,6 +5392,7 @@ mod tests {
         let peer = PeerState {
             node_id: "test".into(),
             address: "http://test".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5426,6 +5432,7 @@ mod tests {
         let peer = PeerState {
             node_id: "test".into(),
             address: "http://test".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5466,6 +5473,7 @@ mod tests {
         let mut loaded_idle_peer = PeerState {
             node_id: "loaded".into(),
             address: "http://loaded".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5504,6 +5512,7 @@ mod tests {
         let unloaded_peer = PeerState {
             node_id: "unloaded".into(),
             address: "http://unloaded".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5557,6 +5566,7 @@ mod tests {
         let mut loaded_busy_peer = PeerState {
             node_id: "loaded".into(),
             address: "http://loaded".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5595,6 +5605,7 @@ mod tests {
         let unloaded_peer = PeerState {
             node_id: "unloaded".into(),
             address: "http://unloaded".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5650,6 +5661,7 @@ mod tests {
         let idle_peer = PeerState {
             node_id: "idle".into(),
             address: "http://idle".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5678,6 +5690,7 @@ mod tests {
         let busy_peer = PeerState {
             node_id: "busy".into(),
             address: "http://busy".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5723,6 +5736,7 @@ mod tests {
         let mut slow_peer = PeerState {
             node_id: "slow".into(),
             address: "http://slow".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
@@ -5794,6 +5808,7 @@ mod tests {
         let peer = PeerState {
             node_id: "peer".into(),
             address: "http://peer".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 0,

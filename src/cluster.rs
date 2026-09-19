@@ -351,29 +351,6 @@ fn extract_host_from_url(url: &str) -> &str {
     }
 }
 
-/// Extract the port from a URL (e.g., "http://node-b:8080" -> Some(8080))
-fn extract_port_from_url(url: &str) -> Option<u16> {
-    let after_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
-
-    // Handle IPv6 addresses in brackets like [::1]:8080
-    if after_scheme.starts_with('[') {
-        // Find the closing bracket and then look for port after it
-        after_scheme
-            .find(']')
-            .and_then(|idx| after_scheme[idx + 1..].strip_prefix(':'))
-            .and_then(|port_str| port_str.parse().ok())
-    } else {
-        // Regular host:port format
-        after_scheme
-            .rsplit(':')
-            .next()
-            .and_then(|port_str| port_str.parse().ok())
-    }
-}
-
 /// Check if an address URL contains a loopback address (127.x.x.x or localhost)
 fn is_loopback_address(url: &str) -> bool {
     // Extract the host portion from URLs like "http://127.0.0.1:8080" or "http://localhost:8080"
@@ -401,6 +378,43 @@ fn is_loopback_address(url: &str) -> bool {
         || host == "[::1]"
 }
 
+/// Compare configured URLs without guessing DNS aliases or dropping meaningful
+/// scheme, port, or path differences. Bare peer addresses imply HTTP.
+fn same_peer_url(left: &str, right: &str) -> bool {
+    matches!((parse_peer_url(left), parse_peer_url(right)), (Some(left), Some(right)) if left == right)
+}
+
+fn parse_peer_url(address: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(&if address.contains("://") {
+        address.to_string()
+    } else {
+        format!("http://{address}")
+    })
+    .ok()?;
+    matches!(url.scheme(), "http" | "https").then_some(url)
+}
+
+fn source_peer_url(advertised: &str, source: std::net::SocketAddr) -> Option<String> {
+    // Dual-stack sockets can report IPv4 sources as mapped IPv6 addresses.
+    let ip = source.ip().to_canonical();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return None;
+    }
+    if matches!(ip, std::net::IpAddr::V4(ip) if ip.is_broadcast()) {
+        return None;
+    }
+    // URL transports cannot retain a link-local IPv6 interface scope.
+    if matches!(ip, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()) {
+        return None;
+    }
+    let advertised = parse_peer_url(advertised)?;
+    let port = advertised
+        .port_or_known_default()
+        .filter(|port| *port != 0)?;
+    let endpoint = std::net::SocketAddr::new(ip, port);
+    Some(format!("{}://{endpoint}", advertised.scheme()))
+}
+
 /// Decide whether a peer version mismatch should be logged now, recording the
 /// version when it should. Returns `true` only when the peer's mismatched
 /// version is newly seen or has changed since the last time we logged about that
@@ -426,6 +440,8 @@ pub async fn process_gossip_message(
 ) {
     let mut peers = state.peers.write().await;
     let mut peer_state = msg.origin;
+    // Provenance belongs to this receiver, never to the incoming advertisement.
+    peer_state.address_from_source = false;
 
     let local_version = env!("CARGO_PKG_VERSION");
     if peer_state.version != local_version {
@@ -500,9 +516,18 @@ pub async fn process_gossip_message(
     if is_loopback_address(&peer_state.address) {
         let mut resolved = false;
 
-        // 1. Check if we have an existing entry with a non-loopback address
+        // Preserve authoritative/configured routes, but allow a locally inferred
+        // endpoint to follow subsequent direct gossip after an address change.
         if let Some(existing) = peers.get(&peer_state.node_id) {
-            if !is_loopback_address(&existing.address) {
+            if !is_loopback_address(&existing.address)
+                && (!existing.address_from_source
+                    || state
+                        .config
+                        .cluster
+                        .peers
+                        .iter()
+                        .any(|seed| same_peer_url(seed, &existing.address)))
+            {
                 debug!(
                     "Preserving existing address {} for peer {} (gossiped address {} is loopback)",
                     existing.address, peer_state.node_id, peer_state.address
@@ -528,22 +553,32 @@ pub async fn process_gossip_message(
             }
         }
 
-        // 3. Use the source socket address as last resort
+        // Refresh only inferred endpoints. The peer advertises its listener
+        // port; the TCP source port is ephemeral and must never be routed to.
         if !resolved {
-            if let Some(addr) = source_addr {
-                let port = extract_port_from_url(&peer_state.address).unwrap_or(8080);
-                let scheme = if peer_state.address.starts_with("https://") {
-                    "https"
-                } else {
-                    "http"
-                };
-                let endpoint = std::net::SocketAddr::new(addr.ip(), port);
-                let derived_address = format!("{scheme}://{endpoint}");
-                info!(
-                    "Using derived address {} for peer {} from source socket (gossiped address {} is loopback)",
-                    derived_address, peer_state.node_id, peer_state.address
-                );
+            let existing = peers.get(&peer_state.node_id);
+            // Same-host peers may follow a loopback source, but local ingress
+            // (for example a reverse proxy) must not replace a non-loopback route.
+            let source = source_addr.filter(|source| {
+                !source.ip().to_canonical().is_loopback()
+                    || existing.is_none_or(|peer| is_loopback_address(&peer.address))
+            });
+            if let Some(derived_address) =
+                source.and_then(|source| source_peer_url(&peer_state.address, source))
+            {
+                if existing.map(|peer| &peer.address) != Some(&derived_address) {
+                    info!(
+                        "Using derived address {} for peer {} from source socket (gossiped address {} is loopback)",
+                        derived_address, peer_state.node_id, peer_state.address
+                    );
+                }
                 peer_state.address = derived_address;
+                peer_state.address_from_source = true;
+            } else if let Some(existing) = existing {
+                // Missing/unusable source information must not erase a working
+                // fallback or make it authoritative for the next update.
+                peer_state.address = existing.address.clone();
+                peer_state.address_from_source = existing.address_from_source;
             }
         }
     }
@@ -575,6 +610,7 @@ pub async fn process_gossip_message(
                 PeerState {
                     node_id: info.node_id,
                     address: info.address,
+                    address_from_source: false,
                     version: "unknown".to_string(),
                     // Not yet heard from directly; filled in on first gossip.
                     llama_cpp_version: "unknown".to_string(),
@@ -688,6 +724,7 @@ mod tests {
         PeerState {
             node_id: node_id.to_string(),
             address: format!("http://{node_id}"),
+            address_from_source: false,
             version: version.to_string(),
             llama_cpp_version: "unknown".to_string(),
             last_seen: 1000,
@@ -823,6 +860,7 @@ mod tests {
         let origin_peer = PeerState {
             node_id: "node-origin".into(),
             address: "http://node-origin".into(),
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "origincpp1".into(),
             last_seen: 1000,
@@ -961,6 +999,7 @@ mod tests {
                 PeerState {
                     node_id: "remote-peer".into(),
                     address: "http://node-b:8080".into(), // Real hostname
+                    address_from_source: false,
                     version: "0.1.0".into(),
                     llama_cpp_version: "unknown".into(),
                     last_seen: 1000,
@@ -991,6 +1030,7 @@ mod tests {
         let gossip_peer = PeerState {
             node_id: "remote-peer".into(),
             address: "http://127.0.0.1:8080".into(), // Loopback - should be ignored
+            address_from_source: false,
             version: "0.1.0".into(),
             llama_cpp_version: "unknown".into(),
             last_seen: 2000,
@@ -1070,30 +1110,240 @@ mod tests {
         assert_eq!(extract_host_from_url("localhost:8080"), "localhost");
     }
 
-    #[test]
-    fn test_extract_port_from_url_ipv4() {
-        assert_eq!(extract_port_from_url("http://192.168.1.1:8080"), Some(8080));
-        assert_eq!(extract_port_from_url("https://10.0.0.1:443"), Some(443));
+    async fn address_test_state(seeds: &[&str]) -> NodeState {
+        let mut config = minimal_node_config();
+        config.cluster.noise.enabled = false;
+        config.cluster.peers = seeds.iter().map(|seed| seed.to_string()).collect();
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap()
+    }
+
+    async fn receive_address(
+        state: &NodeState,
+        advertised: &str,
+        source: Option<&str>,
+    ) -> PeerState {
+        let mut origin = peer_state_with_version("peer", env!("CARGO_PKG_VERSION"));
+        origin.address = advertised.into();
+        origin.current_requests = 7;
+        process_gossip_message(
+            state,
+            GossipMessage {
+                origin,
+                known_peers: vec![],
+            },
+            source.map(|source| source.parse().unwrap()),
+        )
+        .await;
+        let peer = state.peers.read().await.get("peer").unwrap().clone();
+        assert_eq!(peer.current_requests, 7);
+        assert!(peer.last_seen > 1000);
+        peer
+    }
+
+    #[tokio::test]
+    async fn inferred_addresses_follow_direct_gossip_ip_port_and_scheme_changes() {
+        let state = address_test_state(&[]).await;
+        for (advertised, source, expected) in [
+            (
+                "http://127.0.0.1:8080",
+                "192.0.2.1:50000",
+                "http://192.0.2.1:8080",
+            ),
+            (
+                "http://127.0.0.1:8080",
+                "192.0.2.2:50001",
+                "http://192.0.2.2:8080",
+            ),
+            (
+                "http://127.0.0.1:9000",
+                "192.0.2.2:50002",
+                "http://192.0.2.2:9000",
+            ),
+            (
+                "http://[::1]:9000",
+                "[2001:db8::1]:50003",
+                "http://[2001:db8::1]:9000",
+            ),
+            (
+                "http://[::1]:9000",
+                "[2001:db8::2]:50004",
+                "http://[2001:db8::2]:9000",
+            ),
+            (
+                "https://[::1]:8443",
+                "[2001:db8::2]:50005",
+                "https://[2001:db8::2]:8443",
+            ),
+        ] {
+            let peer = receive_address(&state, advertised, Some(source)).await;
+            assert_eq!(peer.address, expected);
+            assert!(peer.address_from_source);
+        }
+    }
+
+    #[tokio::test]
+    async fn same_host_peers_follow_loopback_listener_changes() {
+        for (advertised, source, expected) in [
+            ("127.0.0.1", "127.0.0.1:50000", "127.0.0.1"),
+            ("[::1]", "[::1]:50000", "[::1]"),
+            ("127.0.0.1", "[::ffff:127.0.0.1]:50000", "127.0.0.1"),
+        ] {
+            let state = address_test_state(&[]).await;
+            for port in [8080, 9000] {
+                let peer =
+                    receive_address(&state, &format!("http://{advertised}:{port}"), Some(source))
+                        .await;
+                assert_eq!(peer.address, format!("http://{expected}:{port}"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_unusable_source_preserves_refreshable_address() {
+        let state = address_test_state(&[]).await;
+        receive_address(&state, "http://127.0.0.1:8080", Some("192.0.2.1:50000")).await;
+        for source in [
+            None,
+            Some("127.0.0.1:50001"),
+            Some("[::1]:50001"),
+            Some("[::ffff:127.0.0.1]:50001"),
+            Some("0.0.0.0:50001"),
+            Some("[::]:50001"),
+            Some("[::ffff:0.0.0.0]:50001"),
+            Some("224.0.0.1:50001"),
+            Some("255.255.255.255:50001"),
+            Some("[::ffff:224.0.0.1]:50001"),
+            Some("[::ffff:255.255.255.255]:50001"),
+            Some("[ff02::1]:50001"),
+            Some("[fe80::1%2]:50001"),
+        ] {
+            let peer = receive_address(&state, "http://127.0.0.1:9000", source).await;
+            assert_eq!(peer.address, "http://192.0.2.1:8080");
+            assert!(peer.address_from_source);
+        }
+        for advertised in ["http://127.0.0.1:invalid", "http://127.0.0.1:0"] {
+            let peer = receive_address(&state, advertised, Some("192.0.2.2:50002")).await;
+            assert_eq!(peer.address, "http://192.0.2.1:8080");
+            assert!(peer.address_from_source);
+        }
+        let peer = receive_address(&state, "http://127.0.0.1:9000", Some("192.0.2.2:50003")).await;
+        assert_eq!(peer.address, "http://192.0.2.2:9000");
+        assert!(peer.address_from_source);
+    }
+
+    #[tokio::test]
+    async fn advertised_hostname_and_public_ip_urls_take_and_keep_precedence() {
+        for advertised in [
+            "https://gateway.example:9443/mesh",
+            "https://192.0.2.1:9443",
+        ] {
+            let state = address_test_state(&["http://peer:8888"]).await;
+            // A direct public advertisement also overrides a selected seed.
+            receive_address(&state, "http://127.0.0.1:8080", Some("192.0.2.1:50000")).await;
+            let peer = receive_address(&state, advertised, Some("192.0.2.2:50001")).await;
+            assert_eq!(peer.address, advertised);
+            assert!(!peer.address_from_source);
+            let peer =
+                receive_address(&state, "http://127.0.0.1:9000", Some("192.0.2.3:50002")).await;
+            assert_eq!(peer.address, advertised);
+            assert!(!peer.address_from_source);
+        }
+    }
+
+    #[tokio::test]
+    async fn current_public_advertisement_promotes_an_inferred_address() {
+        let state = address_test_state(&[]).await;
+        receive_address(&state, "http://127.0.0.1:8080", Some("192.0.2.1:50000")).await;
+        let peer = receive_address(&state, "http://192.0.2.1:8080", Some("192.0.2.2:50001")).await;
+        assert!(!peer.address_from_source);
+        let peer = receive_address(&state, "http://127.0.0.1:9000", Some("192.0.2.3:50002")).await;
+        assert_eq!(peer.address, "http://192.0.2.1:8080");
+        assert!(!peer.address_from_source);
+    }
+
+    #[tokio::test]
+    async fn configured_seeds_protect_hostname_and_matching_inferred_routes() {
+        let state = address_test_state(&["https://peer:9443"]).await;
+        for source in ["192.0.2.1:50000", "192.0.2.2:50001"] {
+            let peer = receive_address(&state, "http://127.0.0.1:8080", Some(source)).await;
+            assert_eq!(peer.address, "https://peer:9443");
+            assert!(!peer.address_from_source);
+        }
+        // This seed's host is not the node ID. Once the derived URL matches it,
+        // preserve the explicitly configured route rather than following ingress.
+        let state = address_test_state(&["192.0.2.1:80/"]).await;
+        receive_address(&state, "http://127.0.0.1:80", Some("192.0.2.1:50000")).await;
+        let peer = receive_address(&state, "http://127.0.0.1:9000", Some("192.0.2.2:50001")).await;
+        assert_eq!(peer.address, "http://192.0.2.1:80");
+        assert!(!peer.address_from_source);
+    }
+
+    #[tokio::test]
+    async fn transitive_public_routes_are_not_mistaken_for_local_inference() {
+        for address in ["https://gateway.example:9443", "https://192.0.2.1:9443"] {
+            let state = address_test_state(&[]).await;
+            process_gossip_message(
+                &state,
+                GossipMessage {
+                    origin: peer_state_with_version("relay", env!("CARGO_PKG_VERSION")),
+                    known_peers: vec![PeerInfo {
+                        node_id: "peer".into(),
+                        address: address.into(),
+                    }],
+                },
+                Some("192.0.2.10:50000".parse().unwrap()),
+            )
+            .await;
+            let peer =
+                receive_address(&state, "http://127.0.0.1:8080", Some("192.0.2.2:50001")).await;
+            assert_eq!(peer.address, address);
+            assert!(!peer.address_from_source);
+        }
     }
 
     #[test]
-    fn test_extract_port_from_url_ipv6() {
-        assert_eq!(extract_port_from_url("http://[::1]:8080"), Some(8080));
+    fn seed_url_comparison_only_normalizes_equivalent_urls() {
+        for (left, right) in [
+            ("peer:80", "http://peer/"),
+            ("HTTPS://PEER:443/mesh", "https://peer/mesh"),
+            ("[2001:db8::1]:8080", "http://[2001:db8::1]:8080/"),
+        ] {
+            assert!(same_peer_url(left, right));
+        }
+        for right in [
+            "https://peer:80/mesh",
+            "http://peer:8080/mesh",
+            "http://peer/other",
+            "http://peer/mesh?token=value",
+            "http://other/mesh",
+        ] {
+            assert!(!same_peer_url("http://peer/mesh", right));
+        }
+        assert!(!same_peer_url("http://[", "http://["));
+    }
+
+    #[test]
+    fn source_urls_use_listener_ports_and_standard_scheme_defaults() {
+        for (advertised, expected) in [
+            ("127.0.0.1:8080", "http://192.0.2.1:8080"),
+            ("http://localhost", "http://192.0.2.1:80"),
+            ("https://[::1]", "https://192.0.2.1:443"),
+        ] {
+            assert_eq!(
+                source_peer_url(advertised, "192.0.2.1:50000".parse().unwrap()).as_deref(),
+                Some(expected)
+            );
+        }
         assert_eq!(
-            extract_port_from_url("http://[2001:db8::1]:9000"),
-            Some(9000)
+            source_peer_url(
+                "http://[::1]:8080",
+                "[::ffff:192.0.2.1]:50000".parse().unwrap()
+            )
+            .as_deref(),
+            Some("http://192.0.2.1:8080")
         );
-    }
-
-    #[test]
-    fn test_extract_port_from_url_no_port() {
-        assert_eq!(extract_port_from_url("http://localhost"), None);
-        assert_eq!(extract_port_from_url("http://[::1]"), None);
-    }
-
-    #[test]
-    fn test_extract_port_from_url_invalid() {
-        assert_eq!(extract_port_from_url("http://localhost:abc"), None);
-        assert_eq!(extract_port_from_url("http://host:99999"), None); // Port > u16::MAX
     }
 }

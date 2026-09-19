@@ -24,6 +24,11 @@ pub struct PeerModelStats {
 pub struct PeerState {
     pub node_id: String,
     pub address: String,
+    /// Whether this node inferred the address from an incoming gossip socket.
+    /// Local provenance only: advertised, configured, and transitive addresses
+    /// must not become source-derived through serialization or peer input.
+    #[serde(skip)]
+    pub address_from_source: bool,
     pub version: String,
     /// llama.cpp commit of the binary currently serving on this node, or
     /// `"unknown"` if no build has been recorded yet. Mirrors the value the node
@@ -125,10 +130,11 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_state_serde_roundtrip() {
-        let state = PeerState {
+    fn test_peer_state_serde_roundtrip_keeps_address_provenance_local() {
+        let mut state = PeerState {
             node_id: "node-1".into(),
             address: "http://localhost:8080".into(),
+            address_from_source: false,
             version: "1.0.0".into(),
             llama_cpp_version: "b2c3d4e5f".into(),
             last_seen: 12345,
@@ -152,8 +158,12 @@ mod tests {
             ready: true,
             loaded_models: vec!["model:fast".into()],
         };
+        state.address_from_source = true;
         let json = serde_json::to_string(&state).unwrap();
+        let mut wire: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(wire.get("address_from_source").is_none());
         let parsed: PeerState = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.address_from_source);
         assert_eq!(parsed.node_id, "node-1");
         assert_eq!(parsed.address, "http://localhost:8080");
         assert_eq!(parsed.version, "1.0.0");
@@ -166,6 +176,10 @@ mod tests {
         assert_eq!(parsed.max_sysmem, 64000);
         assert!(parsed.ready);
         assert_eq!(parsed.loaded_models, vec!["model:fast"]);
+
+        wire["address_from_source"] = serde_json::json!(true);
+        let injected: PeerState = serde_json::from_value(wire).unwrap();
+        assert!(!injected.address_from_source);
     }
 
     #[test]
@@ -187,6 +201,7 @@ mod tests {
         }"#;
         let parsed: PeerState = serde_json::from_str(json).unwrap();
         assert!(parsed.ready); // Should default to true
+        assert!(!parsed.address_from_source);
 
         // Missing "llama_cpp_version" (older peer) defaults to "unknown" rather
         // than failing the gossip deserialize.
