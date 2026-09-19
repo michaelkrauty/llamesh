@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.5] - 2026-09-19
+
+### Fixed
+
+- Large received mDNS record TTLs no longer overflow expiration arithmetic, which could panic the discovery worker in debug builds or calculate incorrect expiration times in release builds. Upgrade the discovery dependency to include the upstream fix and verify continued discovery with isolated large-TTL packet regressions.
+
 ## [1.21.4] - 2026-09-18
 
 ### Fixed

@@ -1162,6 +1162,8 @@ Peer discovery uses two complementary methods, both additive:
 * **mDNS (primary, zero-config)**: Enabled by default. Nodes advertise and discover peers on the LAN using the `_llama-mesh._tcp.local` service name. No configuration required for single-subnet deployments.
 * **Explicit peer URLs (secondary)**: For WAN or cross-subnet connections, peers can be listed explicitly in `cluster.peers`. These are merged with mDNS-discovered peers.
 
+Received mDNS record TTLs use widened expiration arithmetic so large values cannot overflow intermediate calculations and terminate the discovery worker. The regression suite exercises received packets in an isolated network namespace and verifies subsequent discovery and daemon responsiveness.
+
 First gossip tick fires immediately on startup (no initial delay).
 
 ### Gossip Metadata
