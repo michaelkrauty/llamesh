@@ -78,6 +78,8 @@ llama_cpp:
   enabled: false
 cluster:
   enabled: true
+  discovery:
+    mdns: false
   peers: ["{peer}"]
   gossip_interval_seconds: 1
 http:

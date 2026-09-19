@@ -148,7 +148,7 @@ impl Discovery {
     pub fn new(
         config: &crate::config::ClusterConfig,
         node_id: &str,
-        listen_port: u16,
+        listen_addr: std::net::SocketAddr,
         public_key: &str,
     ) -> anyhow::Result<Self> {
         let peers = Arc::new(RwLock::new(HashSet::new()));
@@ -167,7 +167,7 @@ impl Discovery {
             Some(mdns::MdnsDiscovery::new(
                 &config.discovery.service_name,
                 node_id,
-                listen_port,
+                listen_addr,
                 public_key,
                 peers.clone(),
             )?)
@@ -214,9 +214,8 @@ impl Discovery {
     }
 
     /// Shutdown discovery
-    #[allow(dead_code)] // Reserved for graceful shutdown API
-    pub fn shutdown(&mut self) {
-        if let Some(mdns) = self.mdns.take() {
+    pub fn shutdown(&self) {
+        if let Some(mdns) = &self.mdns {
             mdns.shutdown();
         }
     }

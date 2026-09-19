@@ -537,7 +537,8 @@ pub async fn process_gossip_message(
                 } else {
                     "http"
                 };
-                let derived_address = format!("{}://{}:{}", scheme, addr.ip(), port);
+                let endpoint = std::net::SocketAddr::new(addr.ip(), port);
+                let derived_address = format!("{scheme}://{endpoint}");
                 info!(
                     "Using derived address {} for peer {} from source socket (gossiped address {} is loopback)",
                     derived_address, peer_state.node_id, peer_state.address
@@ -655,7 +656,10 @@ mod tests {
                 peers: vec![],
                 gossip_interval_seconds: 5,
                 max_concurrent_gossip: 16,
-                discovery: Default::default(),
+                discovery: crate::config::DiscoveryConfig {
+                    mdns: false,
+                    ..Default::default()
+                },
                 noise: Default::default(),
                 circuit_breaker: Default::default(),
                 version_mismatch_action: "warn".to_string(),
@@ -889,6 +893,55 @@ mod tests {
         assert!(!is_loopback_address("http://node-a.example.com:8080"));
         assert!(!is_loopback_address("http://node-b:8080"));
         assert!(!is_loopback_address("https://10.0.0.1:443"));
+    }
+
+    #[tokio::test]
+    async fn test_gossip_source_address_fallback_supports_both_ip_families() {
+        let mut config = minimal_node_config();
+        config.cluster.noise.enabled = false;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+
+        for (index, (advertised, source, expected)) in [
+            (
+                "http://127.0.0.1:8080",
+                "192.0.2.1:50000",
+                "http://192.0.2.1:8080",
+            ),
+            (
+                "http://[::1]:9000",
+                "[2001:db8::1]:50000",
+                "http://[2001:db8::1]:9000",
+            ),
+            (
+                "https://127.0.0.1:8443",
+                "[2001:db8::2]:50000",
+                "https://[2001:db8::2]:8443",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let node_id = format!("peer-{index}");
+            let mut origin = peer_state_with_version(&node_id, env!("CARGO_PKG_VERSION"));
+            origin.address = advertised.into();
+            process_gossip_message(
+                &state,
+                GossipMessage {
+                    origin,
+                    known_peers: vec![],
+                },
+                Some(source.parse().unwrap()),
+            )
+            .await;
+
+            let peers = state.peers.read().await;
+            let address = &peers.get(&node_id).unwrap().address;
+            assert_eq!(address, expected);
+            assert!(reqwest::Url::parse(address).is_ok());
+        }
     }
 
     #[tokio::test]

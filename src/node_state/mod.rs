@@ -514,20 +514,14 @@ impl NodeState {
 
         // Initialize mDNS discovery if enabled
         let discovery = if config.cluster.enabled && config.cluster.discovery.mdns {
-            // Parse listen port from addr string (e.g., "0.0.0.0:8080")
-            let listen_port = config
-                .listen_addr
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(8080);
+            let listen_addr = config.listen_addr.parse::<std::net::SocketAddr>()?;
 
             let public_key = noise_context
                 .as_ref()
                 .map(|ctx| ctx.public_key_display())
                 .unwrap_or_default();
 
-            match Discovery::new(&config.cluster, &config.node_id, listen_port, &public_key) {
+            match Discovery::new(&config.cluster, &config.node_id, listen_addr, &public_key) {
                 Ok(disc) => {
                     info!(
                         service_name = %config.cluster.discovery.service_name,
@@ -2757,12 +2751,17 @@ impl NodeState {
                 } else {
                     "http"
                 };
-                if addr.starts_with("0.0.0.0") {
-                    let port = addr.split(':').nth(1).unwrap_or("8080");
-                    format!("{scheme}://127.0.0.1:{port}")
-                } else {
-                    format!("{scheme}://{addr}")
+                if let Ok(mut socket) = addr.parse::<std::net::SocketAddr>() {
+                    if socket.ip().is_unspecified() {
+                        socket.set_ip(if socket.is_ipv4() {
+                            std::net::Ipv4Addr::LOCALHOST.into()
+                        } else {
+                            std::net::Ipv6Addr::LOCALHOST.into()
+                        });
+                    }
+                    return format!("{scheme}://{socket}");
                 }
+                format!("{scheme}://{addr}")
             });
 
         let supported_models = {
@@ -4152,7 +4151,10 @@ mod tests {
                 peers: vec![], // Start with NO peers
                 gossip_interval_seconds: 5,
                 max_concurrent_gossip: 16,
-                discovery: Default::default(),
+                discovery: crate::config::DiscoveryConfig {
+                    mdns: false,
+                    ..Default::default()
+                },
                 noise: Default::default(),
                 circuit_breaker: Default::default(),
                 version_mismatch_action: "warn".to_string(),
@@ -4773,6 +4775,24 @@ mod tests {
         // With no build recorded, get_version() yields the "unknown" sentinel,
         // which is what gossip and /cluster/nodes will carry for this node.
         assert_eq!(self_peer.llama_cpp_version, "unknown");
+    }
+
+    #[tokio::test]
+    async fn wildcard_listener_gossip_uses_resolvable_loopback_placeholder() {
+        for (listen, expected) in [
+            ("0.0.0.0:8080", "http://127.0.0.1:8080"),
+            ("[::]:8080", "http://[::1]:8080"),
+            ("[fd00::1]:8080", "http://[fd00::1]:8080"),
+        ] {
+            let mut config = minimal_node_config();
+            config.cluster.enabled = false;
+            config.listen_addr = listen.into();
+            let build_manager = BuildManager::new(config.llama_cpp.clone());
+            let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                .await
+                .unwrap();
+            assert_eq!(state.get_self_peer_state().await.address, expected);
+        }
     }
 
     #[tokio::test]

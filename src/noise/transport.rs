@@ -436,6 +436,8 @@ fn connect_addr_from_url(peer_base_url: &str) -> Result<(String, u16)> {
     let host = url
         .host_str()
         .ok_or_else(|| NoiseError::Transport("Peer URL missing host".into()))?
+        // URL hosts retain IPv6 brackets; the TCP (host, port) tuple must not.
+        .trim_matches(['[', ']'])
         .to_string();
     let port = url
         .port_or_known_default()
@@ -494,6 +496,29 @@ impl Stream for NoiseBodyStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_connect_addr_from_url_preserves_host_and_port() {
+        for (url, host, port) in [
+            ("http://192.0.2.1:8080", "192.0.2.1", 8080),
+            ("mesh.example:9000", "mesh.example", 9000),
+            ("https://mesh.example", "mesh.example", 443),
+        ] {
+            assert_eq!(connect_addr_from_url(url).unwrap(), (host.into(), port));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_addr_from_url_ipv6_is_resolvable_as_tcp_tuple() {
+        for url in ["http://[2001:db8::1]:8080", "[2001:db8::1]:8080"] {
+            let addr = connect_addr_from_url(url).unwrap();
+            assert_eq!(addr, ("2001:db8::1".into(), 8080));
+            // Exercise the same tuple resolver as TcpStream::connect without
+            // requiring an IPv6 interface or connecting to the example address.
+            let resolved: Vec<_> = tokio::net::lookup_host(addr).await.unwrap().collect();
+            assert_eq!(resolved, vec!["[2001:db8::1]:8080".parse().unwrap()]);
+        }
+    }
 
     #[test]
     fn test_parse_http_request_get() {
