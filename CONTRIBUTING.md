@@ -34,6 +34,8 @@ introduced it.
 
 For changes to the log-query scripts, also run `python3 tests/log_tools_test.py` (requires Bash and `jq`; SSH is mocked).
 
+The Linux mDNS TTL regression (`cargo test --test integration_test_mdns_ttl`) requires `unshare` (util-linux), `ip` (iproute2), `timeout` (coreutils), and permission to create unprivileged user and network namespaces. It injects DNS packets only inside an isolated network namespace, never onto the host network. Missing isolation prerequisites fail the test explicitly.
+
 ## Pull Requests
 
 - **Open a tracking issue first** describing the problem or proposal, and
