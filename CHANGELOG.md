@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.6] - 2026-09-19
+
+### Fixed
+
+- Populate mDNS advertisements with listener-compatible interface addresses so nodes can discover each other without configured peers. Ignore self-advertisements, replace stale discovered endpoints, and withdraw services on shutdown.
+- Format discovered IPv6 endpoints and source-derived gossip URLs correctly, and pass bare IPv6 hosts to the Noise connector. Prefer IPv4 when available; IPv6 discovery supports unscoped addresses, including unique-local addresses, but excludes link-local addresses requiring unsupported URL zone identifiers.
+
 ## [1.21.5] - 2026-09-19
 
 ### Fixed

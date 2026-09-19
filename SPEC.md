@@ -1162,6 +1162,10 @@ Peer discovery uses two complementary methods, both additive:
 * **mDNS (primary, zero-config)**: Enabled by default. Nodes advertise and discover peers on the LAN using the `_llama-mesh._tcp.local` service name. No configuration required for single-subnet deployments.
 * **Explicit peer URLs (secondary)**: For WAN or cross-subnet connections, peers can be listed explicitly in `cluster.peers`. These are merged with mDNS-discovered peers.
 
+Advertisements automatically track interface addresses compatible with the configured listener: IPv4 for `0.0.0.0`, IPv6 for `[::]`, or the specific bound address. Each service uses a distinct SRV hostname so other services on the same host cannot contribute incompatible cached addresses. Self-advertisements are ignored, endpoint updates replace the previous discovered address, and orderly shutdown withdraws the service.
+
+Discovered endpoints prefer IPv4 and otherwise use bracketed IPv6, including unique-local addresses. IPv6 link-local addresses are excluded because the cluster URL transports do not support zone identifiers; use IPv4 or an unscoped IPv6 address for discovery. An IPv6 wildcard listener advertises IPv6 only, without assuming platform-specific IPv4 dual-stack behavior.
+
 Received mDNS record TTLs use widened expiration arithmetic so large values cannot overflow intermediate calculations and terminate the discovery worker. The regression suite exercises received packets in an isolated network namespace and verifies subsequent discovery and daemon responsiveness.
 
 First gossip tick fires immediately on startup (no initial delay).

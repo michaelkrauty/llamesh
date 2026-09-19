@@ -522,6 +522,10 @@ async fn main() -> anyhow::Result<()> {
     // Graceful shutdown of instances
     shutdown_state.shutdown_all_instances().await;
 
+    if let Some(discovery) = shutdown_state.discovery.clone() {
+        tokio::task::spawn_blocking(move || discovery.shutdown()).await?;
+    }
+
     Ok(())
 }
 

@@ -277,6 +277,8 @@ llama_cpp:
   enabled: false
 cluster:
   enabled: true
+  discovery:
+    mdns: false
   peers: ["http://127.0.0.1:9193"]
   gossip_interval_seconds: 2
 http:
@@ -341,6 +343,8 @@ llama_cpp:
   enabled: false
 cluster:
   enabled: true
+  discovery:
+    mdns: false
   peers: ["http://127.0.0.1:9192"]
   gossip_interval_seconds: 2
 http:
