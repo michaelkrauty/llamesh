@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::HeaderName;
 use axum::http::Request;
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -540,7 +540,11 @@ async fn handle_tls_connection(
         remote_addr,
     };
 
-    let app = app.layer(Extension(conn_handle));
+    // Gossip needs the accepted socket address as well as the certificate
+    // identity; the make-service below supplies only the latter.
+    let app = app
+        .layer(Extension(conn_handle))
+        .layer(Extension(ConnectInfo(remote_addr)));
 
     let mut make_service = app.into_make_service_with_connect_info::<PeerIdentity>();
     let service = match make_service.call(&wrapper).await {

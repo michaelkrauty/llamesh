@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.8] - 2026-09-23
+
+### Fixed
+
+- Preserve the accepted socket address alongside the certificate identity on TLS connections, allowing authenticated gossip to infer and refresh peer routing endpoints without bypassing certificate or node ID validation.
+- Select an explicit Rustls crypto provider for TLS server configuration and client-certificate verification, preventing startup panics when both compiled-in providers are enabled.
+
 ## [1.21.7] - 2026-09-19
 
 ### Fixed
