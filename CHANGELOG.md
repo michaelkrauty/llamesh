@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.9] - 2026-09-23
+
+### Fixed
+
+- Detect each connection's protocol independently so silent clients and incomplete protocol prefixes cannot block other HTTP, h2c, TLS, or Noise connections. Preserve detection deadlines and protocol dispatch, cancel pending detection during shutdown, and check persistent draining state before waiting for another connection.
+
 ## [1.21.8] - 2026-09-23
 
 ### Fixed

@@ -415,6 +415,11 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
     loop {
         let accept_fut = listener.accept();
         let shutdown_fut = state.shutdown_notify.notified();
+        // Subscribe before checking the persistent flag so shutdown cannot be
+        // lost between loop iterations (notify_waiters does not retain a permit).
+        if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
 
         let (tcp_stream, remote_addr) = tokio::select! {
             res = accept_fut => {
@@ -436,23 +441,6 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
             break;
         }
 
-        // Detect protocol from first bytes (with timeout to prevent connection exhaustion)
-        let detect_timeout = Duration::from_millis(config.http.protocol_detect_timeout_ms);
-        let protocol = match timeout(detect_timeout, protocol_detect::detect(&tcp_stream)).await {
-            Ok(Ok(p)) => p,
-            Ok(Err(e)) => {
-                tracing::debug!("Protocol detection failed: {}", e);
-                continue;
-            }
-            Err(_) => {
-                tracing::debug!(
-                    remote_addr = %remote_addr,
-                    "Protocol detection timed out, closing connection"
-                );
-                continue;
-            }
-        };
-
         let state = state.clone();
         let app = app.clone();
         let tls_acceptor = tls_acceptor.clone();
@@ -461,6 +449,33 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
 
         tokio::spawn(
             async move {
+                // A silent or incomplete prefix must only delay this connection.
+                let shutdown_fut = state.shutdown_notify.notified();
+                if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let detect_timeout = Duration::from_millis(http_config.protocol_detect_timeout_ms);
+                let detection = tokio::select! {
+                    result = timeout(detect_timeout, protocol_detect::detect(&tcp_stream)) => result,
+                    _ = shutdown_fut => return,
+                };
+                let protocol = match detection {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(e)) => {
+                        tracing::debug!("Protocol detection failed: {}", e);
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            remote_addr = %remote_addr,
+                            "Protocol detection timed out, closing connection"
+                        );
+                        return;
+                    }
+                };
+                if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 match protocol {
                     DetectedProtocol::Tls => {
                         // TLS connection - do TLS handshake then HTTP

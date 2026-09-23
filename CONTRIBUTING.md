@@ -42,6 +42,8 @@ The peer relocation regressions (`cargo test --test integration_test_peer_addres
 
 The TLS gossip regressions (`cargo test --test integration_test_tls_gossip`) require Linux and the `openssl` executable. They generate temporary certificates and exercise authenticated source-address inference, endpoint refresh, and identity rejection through a real TLS listener.
 
+The protocol admission regressions (`cargo test --test integration_test_protocol_admission`) require Linux with `/proc` access to the test child. They verify that silent or incomplete connections do not block independent HTTP requests or shutdown, while detection deadlines and fragmented request handling remain intact.
+
 ## Pull Requests
 
 - **Open a tracking issue first** describing the problem or proposal, and
