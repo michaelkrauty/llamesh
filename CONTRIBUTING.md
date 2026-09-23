@@ -40,6 +40,8 @@ The mDNS wrapper discovery tests (`cargo test --bin llamesh discovery::mdns::net
 
 The peer relocation regressions (`cargo test --test integration_test_peer_address_refresh`) additionally require PID namespaces and the release mock server binary. They verify that mDNS-discovered and same-host loopback peers changing listener ports remain routable through both Noise and plaintext HTTP while the requesting node stays running.
 
+The TLS gossip regressions (`cargo test --test integration_test_tls_gossip`) require Linux and the `openssl` executable. They generate temporary certificates and exercise authenticated source-address inference, endpoint refresh, and identity rejection through a real TLS listener.
+
 ## Pull Requests
 
 - **Open a tracking issue first** describing the problem or proposal, and

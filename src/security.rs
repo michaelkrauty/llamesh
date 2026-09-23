@@ -105,7 +105,12 @@ pub async fn load_server_config(
     let certs = load_certs(&server_config.cert_path)?;
     let key = load_private_key(&server_config.key_path)?;
 
-    let builder = ServerConfig::builder();
+    // The dependency graph also enables ring for outbound HTTPS. Choose the
+    // server's default provider explicitly rather than relying on an ambiguous
+    // process-wide default when both providers are compiled in.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()?;
 
     let config = if let Some(cluster_tls) = cluster_config.filter(|c| c.enabled) {
         let ca_certs = load_certs(&cluster_tls.ca_cert_path)?;
@@ -122,10 +127,13 @@ pub async fn load_server_config(
         // cannot distinguish cluster vs public traffic since both share this listener.
         // If strict cluster isolation is needed, consider separate listeners or
         // always requiring client certs with an "anonymous" cert for public clients.
-        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-            .allow_unauthenticated()
-            .build()
-            .context("Failed to build client verifier")?;
+        let client_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(root_store),
+            provider,
+        )
+        .allow_unauthenticated()
+        .build()
+        .context("Failed to build client verifier")?;
 
         builder
             .with_client_cert_verifier(client_verifier)
