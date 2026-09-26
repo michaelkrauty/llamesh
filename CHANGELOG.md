@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.10] - 2026-09-26
+
+### Fixed
+
+- Close inbound TLS connections that do not finish negotiation within 30 seconds, preventing stalled handshakes from retaining sockets and tasks indefinitely. The deadline covers only the handshake, leaving established HTTPS requests unaffected.
+
 ## [1.21.9] - 2026-09-23
 
 ### Fixed

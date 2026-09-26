@@ -11,6 +11,43 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn tls_client(dir: &Path) -> rustls::ClientConnection {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in rustls::pki_types::CertificateDer::pem_file_iter(dir.join("ca.pem")).unwrap() {
+        roots.add(cert.unwrap()).unwrap();
+    }
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    rustls::ClientConnection::new(std::sync::Arc::new(config), "127.0.0.1".try_into().unwrap())
+        .unwrap()
+}
+
+// Read and verify the server's complete flight, leaving our Finished unsent.
+async fn receive_server_flight(
+    socket: &mut tokio::net::TcpStream,
+    tls: &mut rustls::ClientConnection,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut buf = [0; 16384];
+        while tls.is_handshaking() {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "server closed during handshake");
+            tls.read_tls(&mut &buf[..n]).unwrap();
+            tls.process_new_packets().unwrap();
+        }
+        assert!(tls.wants_write(), "client Finished must still be pending");
+    })
+    .await
+    .expect("server did not complete its TLS flight");
+}
 
 struct Fixture {
     child: Child,
@@ -349,4 +386,104 @@ async fn tls_public_https_without_cluster_tls() {
     // Startup verifies a public HTTPS response using the ephemeral CA.
     let fixture = Fixture::start(false).await;
     assert_eq!(fixture.nodes().await["receiver"]["node_id"], "receiver");
+}
+
+#[tokio::test]
+async fn tls_handshake_deadline_closes_stalled_connections() {
+    let fixture = Fixture::start(true).await;
+    let address = fixture.url.strip_prefix("https://").unwrap();
+    let started = tokio::time::Instant::now();
+    let mut prefix = tokio::net::TcpStream::connect(address).await.unwrap();
+    prefix.write_all(&[0x16, 0x03]).await.unwrap();
+
+    let mut flight = tokio::net::TcpStream::connect(address).await.unwrap();
+    let mut tls = tls_client(fixture.dir.path());
+    let mut hello = Vec::new();
+    tls.write_tls(&mut hello).unwrap();
+    flight.write_all(&hello).await.unwrap();
+    receive_server_flight(&mut flight, &mut tls).await;
+
+    // Fresh clients ensure these requests perform new TLS handshakes.
+    async fn fresh_https(fixture: &Fixture) {
+        let response = client(fixture.dir.path(), None, "127.0.0.1")
+            .get(format!("{}/version", fixture.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    fresh_https(&fixture).await;
+
+    let deadline = started + Duration::from_secs(40);
+    let closes = |mut socket: tokio::net::TcpStream, phase: &'static str| async move {
+        let mut buf = [0; 4096];
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    Err(e) => panic!("{phase}: unexpected socket error: {e}"),
+                }
+            }
+            assert!(
+                started.elapsed() >= Duration::from_secs(25),
+                "{phase}: connection rejected before handshake deadline"
+            );
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{phase}: TLS connection remained open past 40s deadline"));
+    };
+    tokio::join!(
+        closes(prefix, "TLS prefix"),
+        closes(flight, "client Finished")
+    );
+    fresh_https(&fixture).await;
+}
+
+#[tokio::test]
+async fn tls_fragmented_client_hello_completes() {
+    use std::io::{Read, Write};
+    let fixture = Fixture::start(false).await;
+    let mut socket = tokio::net::TcpStream::connect(fixture.url.strip_prefix("https://").unwrap())
+        .await
+        .unwrap();
+    let mut tls = tls_client(fixture.dir.path());
+    let mut hello = Vec::new();
+    tls.write_tls(&mut hello).unwrap();
+    socket.write_all(&hello[..1]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket.write_all(&hello[1..2]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket.write_all(&hello[2..]).await.unwrap();
+    receive_server_flight(&mut socket, &mut tls).await;
+    tls.writer()
+        .write_all(b"GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut outgoing = Vec::new();
+    while tls.wants_write() {
+        tls.write_tls(&mut outgoing).unwrap();
+    }
+    socket.write_all(&outgoing).await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut response = Vec::new();
+        let mut buf = [0; 16384];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0, "TLS closed without an HTTP response");
+            tls.read_tls(&mut &buf[..n]).unwrap();
+            tls.process_new_packets().unwrap();
+            match tls.reader().read_to_end(&mut response) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("TLS response read failed: {e}"),
+            }
+            if response.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                return response;
+            }
+        }
+    })
+    .await
+    .expect("fragmented TLS handshake did not yield HTTP response");
+    assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
 }

@@ -1212,6 +1212,7 @@ When enabled, Noise is used for cluster gossip and peer request forwarding. mTLS
 mTLS is still supported but deprecated in favor of Noise Protocol:
 
 * TLS 1.3 with mutual TLS.
+* All inbound TLS handshakes, including public HTTPS, have a fixed 30-second deadline after protocol detection, matching Noise negotiation. Expiry closes the connection; this deadline does not limit established HTTP requests.
 * Nodes trust a common CA.
 * Node identity is derived from certificate subject (e.g. `CN=node-a`) and strictly enforced against the sender's claimed node ID.
 * Accepted TLS gossip carries both the certificate identity and the connection's remote socket address. Peers advertising loopback placeholders can infer and refresh routing endpoints using that source IP and the advertised listener port, subject to the address precedence rules above. Source metadata does not bypass certificate or node ID checks.
