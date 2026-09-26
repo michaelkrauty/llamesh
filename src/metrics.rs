@@ -979,7 +979,10 @@ pub async fn render_prometheus_with_circuit_breaker(
         let map = metrics.hash_metrics.read().await;
         map.iter()
             .map(|(hash, m)| {
-                let display_names: Vec<String> = m.display_names.lock().iter().cloned().collect();
+                let mut display_names: Vec<String> =
+                    m.display_names.lock().iter().cloned().collect();
+                // Name order affects series identity; keep it stable across snapshot reloads.
+                display_names.sort_unstable();
                 let labels = format!(
                     "{{hash=\"{}\",names=\"{}\"}}",
                     escape_label_value(hash),
@@ -1404,6 +1407,70 @@ mod tests {
         // Unrelated persisted counters still load alongside the new fields.
         assert_eq!(snapshot.requests_total, 5);
         assert_eq!(snapshot.errors_total, 1);
+    }
+
+    #[tokio::test]
+    async fn render_canonical_names_survive_snapshot_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.json");
+        let mut metrics = Metrics::new();
+        let hm = metrics.get_hash_metrics("shared-hash").await;
+        // Many aliases avoid the weak two-name case, where random iteration
+        // happens to match canonical order half the time.
+        for index in (0..12).rev() {
+            hm.add_display_name(&format!("model-{index:02}:default"));
+        }
+        hm.add_display_name("z\"\\\n:default");
+        hm.requests_total.store(7, Ordering::Relaxed);
+        hm.errors_total.store(2, Ordering::Relaxed);
+        hm.tokens_generated_total.store(123, Ordering::Relaxed);
+        hm.observe_latency(17);
+        hm.observe_memory(100, 200);
+
+        let mut outputs =
+            vec![render_prometheus_with_circuit_breaker(&metrics, None, "test", 0).await];
+        for _ in 0..4 {
+            let snapshot = metrics
+                .snapshot("node".into(), "test".into(), None, 0)
+                .await;
+            tokio::fs::write(&path, serde_json::to_vec(&snapshot).unwrap())
+                .await
+                .unwrap();
+            metrics = Metrics::load(&path).await;
+            outputs.push(render_prometheus_with_circuit_breaker(&metrics, None, "test", 0).await);
+        }
+
+        let names = (0..12)
+            .map(|index| format!("model-{index:02}:default"))
+            .collect::<Vec<_>>()
+            .join(",");
+        // Assert the wire escaping independently of the production helper.
+        let labels = format!("{{hash=\"shared-hash\",names=\"{names},z\\\"\\\\\\n:default\"}}");
+        for (reload, output) in outputs.iter().enumerate() {
+            for (family, value) in [
+                ("proxy_hash_requests_total", 7),
+                ("proxy_hash_errors_total", 2),
+                ("proxy_hash_tokens_generated_total", 123),
+                ("proxy_hash_total_latency_ms", 17),
+                // The bounded latency sample window intentionally resets.
+                (
+                    "proxy_hash_p95_latency_ms",
+                    if reload == 0 { 17 } else { 0 },
+                ),
+                ("proxy_hash_peak_vram_mb", 100),
+                ("proxy_hash_peak_sysmem_mb", 200),
+            ] {
+                let actual: Vec<_> = output
+                    .lines()
+                    .filter(|line| line.starts_with(&format!("{family}{{")))
+                    .collect();
+                assert_eq!(
+                    actual,
+                    vec![format!("{family}{labels} {value}")],
+                    "canonical labels and values after {reload} reloads"
+                );
+            }
+        }
     }
 
     #[tokio::test]

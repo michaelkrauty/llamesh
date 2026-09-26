@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.13] - 2026-09-26
+
+### Fixed
+
+- Sort shared model/profile names in per-hash Prometheus labels so restoring metrics after a restart preserves series identity for unchanged name sets and persisted counters. Previously unsorted label values transition once to the canonical order on upgrade; historical series are not merged.
+
 ## [1.21.12] - 2026-09-26
 
 ### Fixed
