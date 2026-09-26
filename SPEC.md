@@ -214,7 +214,7 @@ cluster:
 
 # HTTP server options
 http:
-  request_body_limit_bytes: 1048576
+  request_body_limit_bytes: 1048576      # maximum collected body size for inference, prewarm, and HTTP gossip
   idle_timeout_seconds: 120
   body_read_timeout_ms: 30000            # timeout for reading request body (default: 30s)
   protocol_detect_timeout_ms: 10000      # timeout for protocol detection on new connections (default: 10s)
@@ -749,6 +749,8 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
   * `type`: `"conflict"`.
   * Conditions:
     * Administrative operations where a concurrent action conflicts (e.g., triggering a rebuild while one is already in progress).
+* `413 Payload Too Large`:
+  * Administrative prewarm or HTTP gossip JSON exceeds `request_body_limit_bytes`, including streamed bodies without a declared length. Inference endpoints retain their existing 400 response for body collection errors.
 * `500 Internal Server Error`:
   * `type`: `"internal_error"`.
   * Conditions:

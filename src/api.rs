@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::HeaderName;
 use axum::http::Request;
 use axum::{
-    extract::{ConnectInfo, FromRequest, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -415,6 +415,7 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
         // exactly what `/v1/models` advertises.
         .route("/v1/models/*model", get(router::get_model))
         .route("/cluster/gossip", post(cluster::handle_gossip))
+        .layer(DefaultBodyLimit::max(config.http.request_body_limit_bytes))
         .with_state(state.clone());
 
     let addr: SocketAddr = addr_str.parse()?;

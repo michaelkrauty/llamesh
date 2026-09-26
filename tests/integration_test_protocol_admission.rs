@@ -26,6 +26,10 @@ impl Drop for Server {
 
 impl Server {
     async fn start(detect_ms: u64) -> Self {
+        Self::with_body_limit(detect_ms, 1048576).await
+    }
+
+    async fn with_body_limit(detect_ms: u64, body_limit: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -63,7 +67,7 @@ cluster:
   discovery: {{mdns: false}}
   noise: {{enabled: false}}
 http:
-  request_body_limit_bytes: 1048576
+  request_body_limit_bytes: {body_limit}
   idle_timeout_seconds: 60
   protocol_detect_timeout_ms: {detect_ms}
   body_read_timeout_ms: {BODY_MS}
@@ -340,6 +344,126 @@ async fn json_body_completion_and_rejections() {
             .unwrap();
         assert_eq!(response.status().as_u16(), 422);
     }
+}
+
+async fn json_body_limit(h2: bool, path: &str, raised: bool) {
+    let limit = if raised { 2 * 1024 * 1024 + 1024 } else { 4096 };
+    let server = Server::with_body_limit(DETECT_MS, limit).await;
+    let client = body_client(h2);
+    let template = json_body(&server, path).await;
+    // Reject first, using distinct peer IDs so a previously accepted gossip
+    // cannot hide an erroneous state mutation by an oversized request.
+    for streamed in [false, true] {
+        for size in [limit + 1, limit, limit - 1] {
+            let peer = format!("size-peer-{streamed}-{size}");
+            let mut value: serde_json::Value = serde_json::from_str(&template).unwrap();
+            if path == "/cluster/gossip" {
+                value["origin"]["node_id"] = peer.clone().into();
+            }
+            let mut json = serde_json::to_vec(&value).unwrap();
+            assert!(json.len() < size);
+            // JSON whitespace counts toward the byte limit without changing
+            // handler semantics or requiring a huge parsed string allocation.
+            json.resize(size, b' ');
+            let body = if streamed {
+                let bytes = bytes::Bytes::from(json);
+                let chunks: Vec<_> = (0..bytes.len())
+                    .step_by(1024)
+                    .map(|start| {
+                        Ok::<_, std::io::Error>(bytes.slice(start..(start + 1024).min(bytes.len())))
+                    })
+                    .collect();
+                // wrap_stream has no exact byte size: HTTP/1 uses chunked
+                // framing, HTTP/2 DATA arrives without Content-Length.
+                reqwest::Body::wrap_stream(futures::stream::iter(chunks))
+            } else {
+                reqwest::Body::from(json)
+            };
+            let request = client
+                .post(format!("http://{}{path}", server.addr))
+                .header("content-type", "application/json")
+                .body(body)
+                .build()
+                .unwrap();
+            if streamed {
+                assert!(request.headers().get("content-length").is_none());
+            }
+            let response = client.execute(request).await.unwrap();
+            assert_eq!(
+                response.version(),
+                if h2 {
+                    reqwest::Version::HTTP_2
+                } else {
+                    reqwest::Version::HTTP_11
+                }
+            );
+            let expected = if size > limit {
+                413
+            } else if path == "/admin/prewarm" {
+                404
+            } else {
+                200
+            };
+            let status = response.status().as_u16();
+            let response_body = response.text().await.unwrap();
+            if path == "/cluster/gossip" {
+                let nodes: serde_json::Value = client
+                    .get(format!("http://{}/cluster/nodes", server.addr))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                assert_eq!(nodes["nodes"].get(&peer).is_some(), size <= limit,
+                    "gossip state disagrees with admission: size={size}, limit={limit}, streamed={streamed}, status={status}");
+            }
+            assert_eq!(
+                status, expected,
+                "{path}: size={size}, limit={limit}, streamed={streamed}, response={response_body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn http1_prewarm_small_body_limit() {
+    json_body_limit(false, "/admin/prewarm", false).await;
+}
+
+#[tokio::test]
+async fn h2c_prewarm_small_body_limit() {
+    json_body_limit(true, "/admin/prewarm", false).await;
+}
+
+#[tokio::test]
+async fn http1_gossip_small_body_limit() {
+    json_body_limit(false, "/cluster/gossip", false).await;
+}
+
+#[tokio::test]
+async fn h2c_gossip_small_body_limit() {
+    json_body_limit(true, "/cluster/gossip", false).await;
+}
+
+#[tokio::test]
+async fn http1_prewarm_raised_body_limit() {
+    json_body_limit(false, "/admin/prewarm", true).await;
+}
+
+#[tokio::test]
+async fn h2c_prewarm_raised_body_limit() {
+    json_body_limit(true, "/admin/prewarm", true).await;
+}
+
+#[tokio::test]
+async fn http1_gossip_raised_body_limit() {
+    json_body_limit(false, "/cluster/gossip", true).await;
+}
+
+#[tokio::test]
+async fn h2c_gossip_raised_body_limit() {
+    json_body_limit(true, "/cluster/gossip", true).await;
 }
 
 async fn version_on_socket(stream: &mut TcpStream, suffix: &[u8]) {
