@@ -44,6 +44,8 @@ The TLS ingress regressions (`cargo test --test integration_test_tls_gossip`) re
 
 The protocol admission regressions (`cargo test --test integration_test_protocol_admission`) require Linux with `/proc` access to the test child. They verify that silent or incomplete connections do not block independent HTTP requests or shutdown, while detection deadlines and fragmented request handling remain intact. They also exercise configured JSON body-read deadlines, byte limits, and rejection compatibility for administrative prewarm and gossip over HTTP/1.1 and h2c, including streamed bodies and limits above the framework default.
 
+The administrative drain regressions (`cargo test --test integration_test_admin_drain`) require Linux and the release mock server binary; they use isolated proxy process groups and established HTTP/1.1 and h2c connections to verify admission stops after SIGTERM, including early rejection of malformed, oversized, and stalled prewarm bodies.
+
 ## Pull Requests
 
 - **Open a tracking issue first** describing the problem or proposal, and

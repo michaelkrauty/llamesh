@@ -259,6 +259,9 @@ async fn rebuild_llama_handler(
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
     }
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::errors::AppError::node_draining().into_response();
+    }
 
     let build_status = state.build_manager.build_status();
 
@@ -298,11 +301,22 @@ async fn rebuild_llama_handler(
 
 async fn prewarm_handler(
     State(state): State<Arc<NodeState>>,
-    headers: HeaderMap,
-    TimedJson(body): TimedJson<serde_json::Value>,
+    request: Request<Body>,
 ) -> impl axum::response::IntoResponse {
-    if let Err(e) = check_auth(&state, &headers) {
+    if let Err(e) = check_auth(&state, request.headers()) {
         return e.into_response();
+    }
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::errors::AppError::node_draining().into_response();
+    }
+    let TimedJson(body) = match TimedJson::<serde_json::Value>::from_request(request, &state).await
+    {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    // Shutdown may begin while an admitted request is still sending its body.
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::errors::AppError::node_draining().into_response();
     }
 
     let model_req = body.get("model").and_then(|v| v.as_str());
@@ -1163,6 +1177,53 @@ fn spawn_signal_listener(state: Arc<NodeState>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn prewarm_rechecks_draining_after_body_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: crate::config::NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "body-drain-test", "listen_addr": "127.0.0.1:0",
+            "max_vram_mb": 1, "max_sysmem_mb": 1, "default_model": "unused",
+            "metrics_path": dir.path().join("metrics.json"),
+            "model_defaults": {"max_instances_per_model": 1,
+                "max_concurrent_requests_per_instance": 1,
+                "max_queue_size_per_model": 1, "max_wait_in_queue_ms": 1000},
+            "llama_cpp": {"enabled": false, "repo_url": "",
+                "repo_path": dir.path(), "build_path": dir.path(),
+                "binary_path": dir.path().join("unused"), "branch": "master",
+                "build_args": [], "build_command_args": [], "auto_update_interval_seconds": 0},
+            "cluster": {"enabled": false, "peers": [], "gossip_interval_seconds": 5,
+                "discovery": {"mdns": false}, "noise": {"enabled": false}},
+            "http": {"request_body_limit_bytes": 1024, "idle_timeout_seconds": 60},
+            "auth": {"enabled": true, "required_header": "x-api-key", "allowed_keys": ["secret"]}
+        }))
+        .unwrap();
+        let manager = crate::build_manager::BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(
+            NodeState::new(config, crate::config::Cookbook { models: vec![] }, manager)
+                .await
+                .unwrap(),
+        );
+        let draining = state.draining.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            // The initial guards have run; shutdown starts during extraction.
+            assert!(!draining.swap(true, std::sync::atomic::Ordering::Relaxed));
+            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(br#"{"model":"unused"}"#))
+        }));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/admin/prewarm")
+            .header("content-type", "application/json")
+            .header("x-api-key", "secret")
+            .body(body)
+            .unwrap();
+        let response = prewarm_handler(State(state.clone()), request)
+            .await
+            .into_response();
+        assert!(state.draining.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "5");
+    }
 
     #[test]
     fn version_payload_includes_llama_cpp_version_when_authorized() {
