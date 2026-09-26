@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.12] - 2026-09-26
+
+### Fixed
+
+- Apply `http.request_body_limit_bytes` to administrative prewarm and HTTP gossip JSON bodies instead of Axum's fixed 2 MiB default. Both smaller and larger configured limits now take effect, including for streamed bodies without a declared length; oversized JSON requests receive 413 before handler processing.
+
 ## [1.21.11] - 2026-09-26
 
 ### Fixed

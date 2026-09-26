@@ -42,7 +42,7 @@ The peer relocation regressions (`cargo test --test integration_test_peer_addres
 
 The TLS ingress regressions (`cargo test --test integration_test_tls_gossip`) require Linux and the `openssl` executable. They generate temporary certificates and exercise authenticated source-address inference, endpoint refresh, identity rejection, fragmented handshakes, and stalled-handshake closure through a real TLS listener. The deadline regression takes approximately 30 seconds.
 
-The protocol admission regressions (`cargo test --test integration_test_protocol_admission`) require Linux with `/proc` access to the test child. They verify that silent or incomplete connections do not block independent HTTP requests or shutdown, while detection deadlines and fragmented request handling remain intact. They also exercise configured JSON body-read deadlines and rejection compatibility for administrative prewarm and gossip over HTTP/1.1 and h2c.
+The protocol admission regressions (`cargo test --test integration_test_protocol_admission`) require Linux with `/proc` access to the test child. They verify that silent or incomplete connections do not block independent HTTP requests or shutdown, while detection deadlines and fragmented request handling remain intact. They also exercise configured JSON body-read deadlines, byte limits, and rejection compatibility for administrative prewarm and gossip over HTTP/1.1 and h2c, including streamed bodies and limits above the framework default.
 
 ## Pull Requests
 
