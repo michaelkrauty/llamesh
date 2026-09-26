@@ -533,10 +533,16 @@ async fn handle_tls_connection(
     // Grab raw fd before TLS consumes the stream (fd survives the TLS wrapper)
     let conn_handle = ConnectionHandle::new(tcp_stream.as_raw_fd());
 
-    let tls_stream = match acceptor.accept(tcp_stream).await {
-        Ok(s) => s,
-        Err(e) => {
+    // Bound negotiation separately from protocol detection and HTTP serving,
+    // matching the Noise handshake deadline without limiting request duration.
+    let tls_stream = match timeout(Duration::from_secs(30), acceptor.accept(tcp_stream)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             tracing::debug!("TLS handshake failed: {}", e);
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(%remote_addr, "TLS handshake timed out after 30s");
             return;
         }
     };
