@@ -818,7 +818,7 @@ Key `proxy_*` series exposed. Gauges reflect the current moment; most counters a
 * `POST /admin/prewarm` -> request pre-warming of a model/profile.
 * `POST /admin/rebuild-llama` -> trigger on-demand `llama.cpp` rebuild.
 
-While draining, both administrative POST handlers reject new authorized requests with 503, error type `draining`, and `Retry-After: 5`, including over existing connections. Authentication is checked before the draining flag.
+While draining, both administrative POST handlers reject new authorized requests with 503, error type `draining`, and `Retry-After: 5`, including over existing connections. Authentication and drain admission are checked before reading a prewarm body; its configured body deadline and byte limit still apply to admitted requests. Prewarm rechecks draining after body extraction before starting work.
 
 ---
 

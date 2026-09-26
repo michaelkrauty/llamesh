@@ -1,13 +1,14 @@
 #![cfg(target_os = "linux")]
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::{Request, StatusCode};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
+use hyper::{body::Frame, Request, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use nix::sys::{prctl::set_child_subreaper, signal, wait};
 use nix::unistd::Pid;
 use serde_json::{json, Value};
 use std::{
+    convert::Infallible,
     net::TcpListener,
     os::unix::process::CommandExt,
     path::Path,
@@ -17,6 +18,8 @@ use std::{
 use tokio::{net::TcpStream, time::timeout};
 
 const DEADLINE: Duration = Duration::from_secs(15);
+const EARLY_REJECTION: Duration = Duration::from_secs(2);
+type RequestBody = UnsyncBoxBody<Bytes, Infallible>;
 
 struct ProxyGroup(Child);
 
@@ -37,8 +40,8 @@ impl Drop for ProxyGroup {
 
 // Explicit senders cannot silently reconnect after the listener shuts down.
 enum Connection {
-    Http1(hyper::client::conn::http1::SendRequest<Full<Bytes>>),
-    H2(hyper::client::conn::http2::SendRequest<Full<Bytes>>),
+    Http1(hyper::client::conn::http1::SendRequest<RequestBody>),
+    H2(hyper::client::conn::http2::SendRequest<RequestBody>),
 }
 
 impl Connection {
@@ -68,16 +71,34 @@ impl Connection {
         key: &str,
         body: Option<Value>,
     ) -> (StatusCode, hyper::HeaderMap, Value) {
-        let request = Request::builder()
-            .method(if body.is_some() { "POST" } else { "GET" })
+        self.raw_request(
+            path,
+            key,
+            if body.is_some() { "POST" } else { "GET" },
+            Full::new(Bytes::from(body.map(|v| v.to_string()).unwrap_or_default())).boxed_unsync(),
+            None,
+        )
+        .await
+    }
+
+    async fn raw_request(
+        &mut self,
+        path: &str,
+        key: &str,
+        method: &str,
+        body: RequestBody,
+        length: Option<usize>,
+    ) -> (StatusCode, hyper::HeaderMap, Value) {
+        let mut request = Request::builder()
+            .method(method)
             .uri(format!("http://localhost{path}"))
             .header("host", "localhost")
             .header("x-api-key", key)
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(
-                body.map(|v| v.to_string()).unwrap_or_default(),
-            )))
-            .unwrap();
+            .header("content-type", "application/json");
+        if let Some(length) = length {
+            request = request.header("content-length", length);
+        }
+        let request = request.body(body).unwrap();
         timeout(DEADLINE, async {
             let response = match self {
                 Self::Http1(sender) => sender.send_request(request).await,
@@ -89,7 +110,9 @@ impl Connection {
             (
                 parts.status,
                 parts.headers,
-                serde_json::from_slice(&bytes).unwrap(),
+                serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                    Value::String(String::from_utf8_lossy(&bytes).into_owned())
+                }),
             )
         })
         .await
@@ -127,7 +150,8 @@ async fn admin_drain(h2: bool) {
         "llama_cpp_ports": {"ranges": ranges},
         "model_defaults": {"max_instances_per_model": 1, "max_concurrent_requests_per_instance": 1,
             "max_queue_size_per_model": 10, "max_wait_in_queue_ms": 30000},
-        "http": {"request_body_limit_bytes": 1048576, "idle_timeout_seconds": 60},
+        "http": {"request_body_limit_bytes": 1048576, "idle_timeout_seconds": 60,
+            "body_read_timeout_ms": 5000},
         "llama_cpp": {
             "enabled": false, "repo_url": "", "repo_path": ".", "build_path": ".",
             "binary_path": mock, "branch": "master", "build_args": [],
@@ -243,6 +267,19 @@ async fn admin_drain(h2: bool) {
     })
     .await
     .expect("held inference never acquired its slot");
+    // Early HTTP/1 rejection may close a connection with an unread body. Give
+    // each case its own already-probed connection; none can reconnect later.
+    let mut body_cases = Vec::new();
+    for key in ["secret", "wrong"] {
+        for kind in ["malformed", "oversized", "stalled"] {
+            let mut connection = Connection::open(address, h2).await;
+            assert_eq!(
+                connection.request("/readyz", "secret", None).await.0,
+                StatusCode::OK
+            );
+            body_cases.push((key, kind, connection));
+        }
+    }
     signal::kill(Pid::from_raw(proxy.0.id() as i32), signal::Signal::SIGTERM).unwrap();
     timeout(DEADLINE, async {
         loop {
@@ -287,6 +324,48 @@ async fn admin_drain(h2: bool) {
         assert_eq!(headers["retry-after"], "5");
         assert_eq!(body["error"]["type"], "draining");
     }
+    let mut failures = Vec::new();
+    for (key, kind, mut connection) in body_cases {
+        let body = match kind {
+            "malformed" => Full::new(Bytes::from_static(b"{")).boxed_unsync(),
+            // Only send oversized Content-Length, avoiding a client-side broken
+            // pipe when HTTP/1 closes after rejecting an unread upload early.
+            "oversized" | "stalled" => {
+                StreamBody::new(futures::stream::pending::<Result<Frame<Bytes>, Infallible>>())
+                    .boxed_unsync()
+            }
+            _ => unreachable!(),
+        };
+        // This bound is well below the configured five-second body deadline.
+        let response = timeout(
+            EARLY_REJECTION,
+            connection.raw_request(
+                "/admin/prewarm",
+                key,
+                "POST",
+                body,
+                (kind == "oversized").then_some(1048577),
+            ),
+        )
+        .await;
+        let expected = if key == "secret" {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::UNAUTHORIZED
+        };
+        match response {
+            Ok((status, headers, body))
+                if status == expected
+                    && (key != "secret"
+                        || (headers.get("retry-after").is_some_and(|v| v == "5")
+                            && body["error"]["type"] == "draining")) => {}
+            result => failures.push(format!("{key}/{kind}: expected {expected}, got {result:?}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "body admission failures: {failures:#?}"
+    );
     let (_, _, nodes) = control.request("/cluster/nodes", "secret", None).await;
     assert_eq!(nodes["nodes"]["admin-drain-test"]["active_instances"], 1);
     assert!(

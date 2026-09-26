@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Reject new administrative prewarm and manual rebuild requests while the node is draining, including requests on connections accepted before shutdown. Authorized requests receive the existing structured 503 `draining` response with `Retry-After`; authentication failures retain their 401 response.
+- Reject new administrative prewarm and manual rebuild requests while the node is draining, including requests on connections accepted before shutdown. Authentication and drain admission precede prewarm body extraction, so stalled or invalid bodies cannot delay rejection. Authorized requests receive the existing structured 503 `draining` response with `Retry-After`; authentication failures receive 401.
 
 ## [1.21.13] - 2026-09-26
 
