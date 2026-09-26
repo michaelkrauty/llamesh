@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.11] - 2026-09-26
+
+### Fixed
+
+- Enforce `http.body_read_timeout_ms` when reading JSON for administrative prewarm and HTTP gossip requests. Incomplete bodies now receive a structured 408 response instead of waiting indefinitely; model loading and gossip processing remain outside the body-read deadline.
+
 ## [1.21.10] - 2026-09-26
 
 ### Fixed

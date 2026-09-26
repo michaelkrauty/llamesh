@@ -9,6 +9,7 @@ use tokio::{
 
 const FAST: Duration = Duration::from_secs(2);
 const DETECT_MS: u64 = 10_000;
+const BODY_MS: u64 = 500;
 
 struct Server {
     child: Child,
@@ -65,6 +66,7 @@ http:
   request_body_limit_bytes: 1048576
   idle_timeout_seconds: 60
   protocol_detect_timeout_ms: {detect_ms}
+  body_read_timeout_ms: {BODY_MS}
 "#
             ),
         )
@@ -87,25 +89,38 @@ http:
             addr,
             _dir: dir,
         };
+        let client = body_client(false);
+        let mut last_error = None;
         timeout(Duration::from_secs(10), async {
             loop {
                 assert!(
                     server.child.try_wait().unwrap().is_none(),
-                    "server exited during startup"
+                    "server at {addr} exited during startup: {last_error:?}"
                 );
-                if let Ok(mut stream) = TcpStream::connect(addr).await {
-                    version_on_socket(
-                        &mut stream,
-                        b"GET /version HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-                    )
-                    .await;
-                    break;
+                // A successful TCP connect alone does not establish readiness.
+                // Retry only startup transport failures, within this bound;
+                // requests made by the tests below retain strict assertions.
+                match client.get(format!("http://{addr}/version")).send().await {
+                    Ok(response) => {
+                        assert_eq!(response.status(), reqwest::StatusCode::OK);
+                        match response.json::<serde_json::Value>().await {
+                            Ok(body) => {
+                                assert!(body["version"].is_string(), "{addr}: {body}");
+                                break;
+                            }
+                            Err(error) if error.is_decode() => {
+                                panic!("invalid startup response from {addr}: {error}")
+                            }
+                            Err(error) => last_error = Some(error),
+                        }
+                    }
+                    Err(error) => last_error = Some(error),
                 }
                 sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("server startup timed out");
+        .unwrap_or_else(|_| panic!("server startup at {addr} timed out: {last_error:?}"));
         server
     }
 
@@ -176,6 +191,154 @@ http:
         );
         let body: serde_json::Value = response.json().await.unwrap();
         assert!(body["version"].is_string());
+    }
+}
+
+fn body_client(h2: bool) -> reqwest::Client {
+    let builder = reqwest::Client::builder().no_proxy().timeout(FAST);
+    if h2 {
+        builder.http2_prior_knowledge()
+    } else {
+        builder.http1_only()
+    }
+    .build()
+    .unwrap()
+}
+
+async fn json_body(server: &Server, path: &str) -> String {
+    if path == "/admin/prewarm" {
+        return r#"{"model":"missing"}"#.into();
+    }
+    let nodes: serde_json::Value = body_client(false)
+        .get(format!("http://{}/cluster/nodes", server.addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut origin = nodes["nodes"]["protocol-admission-test"].clone();
+    origin["node_id"] = "body-deadline-peer".into();
+    serde_json::json!({"origin": origin, "known_peers": []}).to_string()
+}
+
+async fn body_deadline(h2: bool, path: &str) {
+    let server = Server::start(DETECT_MS).await;
+    let json = json_body(&server, path).await;
+    let partial = bytes::Bytes::copy_from_slice(&json.as_bytes()[..json.len() - 1]);
+    // Emit real DATA (or an HTTP/1 chunk), then leave the request body open.
+    let body = futures::stream::once(async { Ok::<_, std::io::Error>(partial) });
+    let body = futures::StreamExt::chain(body, futures::stream::pending());
+    let started = std::time::Instant::now();
+    let response = body_client(h2)
+        .post(format!("http://{}{path}", server.addr))
+        .header("content-type", "application/json")
+        .body(reqwest::Body::wrap_stream(body))
+        .send()
+        .await
+        .expect("JSON body deadline did not produce a response");
+    assert_eq!(response.status(), reqwest::StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(
+        response.version(),
+        if h2 {
+            reqwest::Version::HTTP_2
+        } else {
+            reqwest::Version::HTTP_11
+        }
+    );
+    assert!(started.elapsed() >= Duration::from_millis(BODY_MS / 2));
+    let error: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "request_timeout");
+
+    let nodes: serde_json::Value = body_client(h2)
+        .get(format!("http://{}/cluster/nodes", server.addr))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        nodes["nodes"].get("body-deadline-peer").is_none(),
+        "incomplete gossip mutated peer state"
+    );
+}
+
+#[tokio::test]
+async fn http1_prewarm_body_deadline() {
+    body_deadline(false, "/admin/prewarm").await;
+}
+
+#[tokio::test]
+async fn h2c_prewarm_body_deadline() {
+    body_deadline(true, "/admin/prewarm").await;
+}
+
+#[tokio::test]
+async fn http1_gossip_body_deadline() {
+    body_deadline(false, "/cluster/gossip").await;
+}
+
+#[tokio::test]
+async fn h2c_gossip_body_deadline() {
+    body_deadline(true, "/cluster/gossip").await;
+}
+
+#[tokio::test]
+async fn json_body_completion_and_rejections() {
+    for h2 in [false, true] {
+        let server = Server::start(DETECT_MS).await;
+        let client = body_client(h2);
+        for path in ["/admin/prewarm", "/cluster/gossip"] {
+            let json = json_body(&server, path).await;
+            for fragmented in [false, true] {
+                let body = if fragmented {
+                    let split = json.len() / 2;
+                    let first = bytes::Bytes::copy_from_slice(&json.as_bytes()[..split]);
+                    let second = bytes::Bytes::copy_from_slice(&json.as_bytes()[split..]);
+                    let chunks = futures::StreamExt::chain(
+                        futures::stream::once(async { Ok::<_, std::io::Error>(first) }),
+                        futures::stream::once(async {
+                            sleep(Duration::from_millis(20)).await;
+                            Ok::<_, std::io::Error>(second)
+                        }),
+                    );
+                    reqwest::Body::wrap_stream(chunks)
+                } else {
+                    reqwest::Body::from(json.clone())
+                };
+                let response = client
+                    .post(format!("http://{}{path}", server.addr))
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status().as_u16(),
+                    if path == "/admin/prewarm" { 404 } else { 200 }
+                );
+            }
+            for (content_type, body, expected) in
+                [("text/plain", "{}", 415), ("application/json", "{", 400)]
+            {
+                let response = client
+                    .post(format!("http://{}{path}", server.addr))
+                    .header("content-type", content_type)
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), expected);
+            }
+        }
+        let response = client
+            .post(format!("http://{}/cluster/gossip", server.addr))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 422);
     }
 }
 
