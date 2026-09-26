@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.14] - 2026-09-26
+
+### Fixed
+
+- Reject new administrative prewarm and manual rebuild requests while the node is draining, including requests on connections accepted before shutdown. Authorized requests receive the existing structured 503 `draining` response with `Retry-After`; authentication failures retain their 401 response.
+
 ## [1.21.13] - 2026-09-26
 
 ### Fixed

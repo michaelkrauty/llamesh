@@ -259,6 +259,9 @@ async fn rebuild_llama_handler(
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
     }
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::errors::AppError::node_draining().into_response();
+    }
 
     let build_status = state.build_manager.build_status();
 
@@ -303,6 +306,9 @@ async fn prewarm_handler(
 ) -> impl axum::response::IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();
+    }
+    if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::errors::AppError::node_draining().into_response();
     }
 
     let model_req = body.get("model").and_then(|v| v.as_str());
