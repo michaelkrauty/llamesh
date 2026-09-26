@@ -744,7 +744,7 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
 * `408 Request Timeout`:
   * `type`: `"request_timeout"`.
   * Conditions:
-    * Request body read timed out (`body_read_timeout_ms`).
+    * Request body read timed out (`body_read_timeout_ms`). This bounds body collection for inference endpoints, administrative prewarm, and HTTP gossip, including HTTPS and h2c ingress. It does not limit subsequent model loading or handler processing.
 * `409 Conflict`:
   * `type`: `"conflict"`.
   * Conditions:

@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::http::HeaderName;
 use axum::http::Request;
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, FromRequest, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -105,6 +105,35 @@ fn check_auth(
             })),
         )
     })
+}
+
+/// JSON extraction with the configured body-read deadline, separate from any
+/// subsequent handler work (such as loading a model during prewarm).
+pub(crate) struct TimedJson<T>(pub T);
+
+#[axum::async_trait]
+impl<T: serde::de::DeserializeOwned> FromRequest<Arc<NodeState>> for TimedJson<T> {
+    type Rejection = axum::response::Response;
+
+    async fn from_request(
+        req: Request<Body>,
+        state: &Arc<NodeState>,
+    ) -> Result<Self, Self::Rejection> {
+        match timeout(
+            Duration::from_millis(state.config.http.body_read_timeout_ms),
+            Json::<T>::from_request(req, state),
+        )
+        .await
+        {
+            Ok(result) => result
+                .map(|Json(value)| Self(value))
+                .map_err(IntoResponse::into_response),
+            Err(_) => Err(
+                crate::errors::AppError::request_timeout("Request body read timed out")
+                    .into_response(),
+            ),
+        }
+    }
 }
 
 /// Waits for SIGINT/SIGTERM, sets draining=true, notifies waiters, then returns.
@@ -270,7 +299,7 @@ async fn rebuild_llama_handler(
 async fn prewarm_handler(
     State(state): State<Arc<NodeState>>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
     if let Err(e) = check_auth(&state, &headers) {
         return e.into_response();

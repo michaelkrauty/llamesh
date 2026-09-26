@@ -1,3 +1,4 @@
+use crate::api::TimedJson;
 use crate::node_state::NodeState;
 use crate::node_state::PeerState;
 use crate::security::PeerIdentity;
@@ -269,7 +270,7 @@ pub async fn handle_gossip(
     State(state): State<Arc<NodeState>>,
     maybe_identity: Option<ConnectInfo<PeerIdentity>>,
     maybe_socket: Option<ConnectInfo<std::net::SocketAddr>>,
-    Json(msg): Json<GossipMessage>,
+    TimedJson(msg): TimedJson<GossipMessage>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let cluster_tls_enabled = state
         .config
