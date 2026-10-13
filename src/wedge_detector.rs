@@ -5,7 +5,10 @@
 //! ~0% GPU — cannot be generating the response the client is waiting on. Such an
 //! instance pins its slot forever (the request never completes), which stalls a
 //! graceful drain and blocks idle eviction (the same failure
-//! `upstream_read_timeout_ms` bounds per-request). This module decides, from a
+//! `upstream_read_timeout_ms` bounds per-request). Streaming responses waiting
+//! on their clients do not count: a client that stops reading stops the proxy
+//! from reading the instance, which can then sit idle without being hung.
+//! This module decides, from a
 //! single activity sample, whether an instance looks wedged *this tick*; the
 //! caller layers a sustained-time window on top before acting, so a transient
 //! lull is never mistaken for a wedge.
@@ -27,6 +30,11 @@ pub const GPU_EPS_UTIL: u32 = 1;
 pub struct WedgeInputs {
     /// Requests currently occupying a slot on this instance.
     pub in_flight: usize,
+    /// Of those, streaming responses waiting on their client rather than on the
+    /// instance: the proxy handed the client a chunk and the client has not
+    /// taken it. A stalled client stops the proxy reading the instance's
+    /// output, so the instance can go idle without being hung.
+    pub awaiting_downstream: usize,
     /// CPU busy-cores measured over the last interval, or `None` when no prior
     /// sample exists yet (the first observation of a pid). Without a delta we
     /// cannot judge activity, so the instance is treated as not wedged.
@@ -74,7 +82,11 @@ pub enum WedgeVerdict {
 /// signal we cannot trust, or simply not holding a slot, all yield `NotWedged`.
 pub fn evaluate_wedge(i: &WedgeInputs) -> WedgeVerdict {
     // An instance not serving a request is expected to sit idle; never flag it.
-    if i.in_flight == 0 {
+    // Neither is one whose every request is waiting on its client: that
+    // idleness is downstream backpressure, which killing the instance would not
+    // relieve. A request still waiting on the instance while it is idle is the
+    // wedge signal, even alongside requests blocked on their clients.
+    if i.in_flight <= i.awaiting_downstream {
         return WedgeVerdict::NotWedged;
     }
 
@@ -162,6 +174,7 @@ mod tests {
     ) -> WedgeInputs {
         WedgeInputs {
             in_flight,
+            awaiting_downstream: 0,
             cpu_busy_cores: cpu,
             gpu_sm_util: gpu,
             gpu_present,
@@ -184,6 +197,30 @@ mod tests {
             evaluate_wedge(&inputs(0, None, None, false, false, false)),
             WedgeVerdict::NotWedged
         );
+    }
+
+    #[test]
+    fn requests_waiting_on_clients_are_not_wedged() {
+        // Flat CPU and GPU on a trusted GPU node would otherwise be a wedge, but
+        // every in-flight request is a stream blocked on its client.
+        let mut i = inputs(1, Some(0.0), Some(0), true, true, false);
+        i.awaiting_downstream = 1;
+        assert_eq!(evaluate_wedge(&i), WedgeVerdict::NotWedged);
+        i.in_flight = 2;
+        i.awaiting_downstream = 2;
+        assert_eq!(evaluate_wedge(&i), WedgeVerdict::NotWedged);
+    }
+
+    #[test]
+    fn request_waiting_on_idle_instance_is_wedged_alongside_blocked_client() {
+        // One stream is blocked on its client, but another request is waiting
+        // on an instance that is doing no work.
+        let mut i = inputs(2, Some(0.0), Some(0), true, true, false);
+        i.awaiting_downstream = 1;
+        assert_eq!(evaluate_wedge(&i), WedgeVerdict::WedgedThisTick);
+        // Activity still clears it.
+        i.cpu_busy_cores = Some(1.0);
+        assert_eq!(evaluate_wedge(&i), WedgeVerdict::NotWedged);
     }
 
     #[test]

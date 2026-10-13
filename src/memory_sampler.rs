@@ -34,6 +34,9 @@ pub struct MemorySampler {
     device_vram_override: std::sync::Mutex<std::collections::VecDeque<GpuMemorySnapshot>>,
     #[cfg(test)]
     process_memory_overrides: std::sync::Mutex<HashMap<u32, ProcessMemorySample>>,
+    /// GPU presence and per-process SM utilization reported instead of NVML.
+    #[cfg(test)]
+    gpu_activity_override: std::sync::Mutex<Option<(bool, HashMap<u32, u32>)>>,
 }
 
 fn bytes_to_mib_floor(bytes: u64) -> u64 {
@@ -75,7 +78,14 @@ impl MemorySampler {
             device_vram_override: std::sync::Mutex::new(Default::default()),
             #[cfg(test)]
             process_memory_overrides: std::sync::Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            gpu_activity_override: std::sync::Mutex::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_gpu_activity_override(&self, gpu_present: bool, sm_util: HashMap<u32, u32>) {
+        *self.gpu_activity_override.lock().unwrap() = Some((gpu_present, sm_util));
     }
 
     #[cfg(test)]
@@ -204,6 +214,10 @@ impl MemorySampler {
     /// CPU-only host that still has the NVML library/driver returns zero
     /// devices, and must take the CPU-only activity path, not the GPU one.
     pub fn has_gpu(&self) -> bool {
+        #[cfg(test)]
+        if let Some((gpu_present, _)) = &*self.gpu_activity_override.lock().unwrap() {
+            return *gpu_present;
+        }
         self.nvml
             .as_ref()
             .and_then(|nvml| nvml.device_count().ok())
@@ -238,6 +252,10 @@ impl MemorySampler {
         &self,
         last_seen_ts: Option<u64>,
     ) -> (HashMap<u32, u32>, Option<u64>, bool) {
+        #[cfg(test)]
+        if let Some((gpu_present, sm_util)) = &*self.gpu_activity_override.lock().unwrap() {
+            return (sm_util.clone(), None, *gpu_present);
+        }
         let mut by_pid: HashMap<u32, u32> = HashMap::new();
         let mut max_ts: Option<u64> = None;
 

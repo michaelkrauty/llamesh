@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -337,6 +337,11 @@ pub struct Instance {
     pub llama_cpp_version: Option<String>,
     /// Accounting ownership follows the child through asynchronous teardown.
     pub memory_reservation: Option<Arc<crate::node_state::MemoryReservation>>,
+    /// Streaming responses from this instance that are waiting on their client:
+    /// a chunk was handed to the downstream writer, which has not asked for the
+    /// next one. The wedged-instance watchdog does not count such requests as
+    /// waiting on the instance.
+    pub streams_awaiting_downstream: Arc<AtomicUsize>,
 }
 
 /// Transfer process ownership before returning: dropping a caller's wait must
@@ -440,6 +445,7 @@ impl Instance {
             evictable_after: Mutex::new(None),
             llama_cpp_version: None,
             memory_reservation: None,
+            streams_awaiting_downstream: Arc::new(AtomicUsize::new(0)),
         }
     }
 

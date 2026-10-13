@@ -15,7 +15,7 @@ use axum::{
 use bytes::Bytes;
 use futures::{future::BoxFuture, Stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::{
     collections::HashSet,
@@ -1139,10 +1139,14 @@ pub async fn route_request(
                 Ok(instance_lock) => {
                     guard.set_instance(instance_lock.clone());
 
-                    let (target_host, target_port) = {
+                    let (target_host, target_port, streams_awaiting_downstream) = {
                         let mut inst = instance_lock.write().await;
                         inst.last_activity = std::time::Instant::now();
-                        (inst.host.clone(), inst.port)
+                        (
+                            inst.host.clone(),
+                            inst.port,
+                            inst.streams_awaiting_downstream.clone(),
+                        )
                     };
 
                     let url = format!("http://{target_host}:{target_port}{path_and_query}");
@@ -1305,6 +1309,7 @@ pub async fn route_request(
                                     tokens_counter,
                                     error_recorder,
                                     false,
+                                    Some(streams_awaiting_downstream),
                                 ))
                             } else {
                                 // `send()` resolves at the response headers, so a
@@ -1930,22 +1935,26 @@ impl Drop for AutoCleanup {
     }
 }
 
+/// `downstream_wait` is the serving instance's count of streams waiting on
+/// their clients (local responses only; see `DownstreamWait`).
 fn build_streaming_response(
     resp: reqwest::Response,
     cleanup: BoxFuture<'static, ()>,
     tokens_generated: Arc<AtomicU64>,
     error_recorder: BodyReadErrorRecorder,
     peer_stream: bool,
+    downstream_wait: Option<Arc<AtomicUsize>>,
 ) -> Response<Body> {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let stream = CleanupStream::new(
+    let mut stream = CleanupStream::new(
         resp.bytes_stream(),
         cleanup,
         tokens_generated,
         error_recorder,
         peer_stream,
     );
+    stream.downstream_wait = downstream_wait.map(DownstreamWait::new);
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -1990,7 +1999,7 @@ async fn peer_response_to_client(
                 // spawn-failure fallback path, which streams whatever status the
                 // peer returned; the primary path only surfaces 2xx).
                 let peer_stream = resp.status().is_success();
-                build_streaming_response(resp, cleanup, tokens_generated, None, peer_stream)
+                build_streaming_response(resp, cleanup, tokens_generated, None, peer_stream, None)
             } else {
                 handle_non_streaming_response(resp, cleanup, tokens_generated, None).await
             }
@@ -2076,6 +2085,49 @@ where
     /// True when this stream forwards a cluster peer's response body. A
     /// mid-stream abort then increments `PEER_STREAM_BODY_ABORTS` (once).
     peer_stream: bool,
+    /// Tracks whether a local instance's response is waiting on its client.
+    downstream_wait: Option<DownstreamWait>,
+}
+
+/// Marks a streamed response from a local instance as waiting on its client
+/// from the moment a chunk is handed to the downstream writer until the writer
+/// polls for the next one. A writer stops polling only while it cannot send
+/// what it already has, so a response left in this state is blocked on its
+/// client, not on the instance. The count is shared with the instance, where
+/// the wedged-instance watchdog uses it to avoid stopping an instance that is
+/// idle only because a client stopped reading.
+struct DownstreamWait {
+    awaiting: Arc<AtomicUsize>,
+    waiting: bool,
+}
+
+impl DownstreamWait {
+    fn new(awaiting: Arc<AtomicUsize>) -> Self {
+        Self {
+            awaiting,
+            waiting: false,
+        }
+    }
+
+    /// The writer asked for the next chunk.
+    fn polled(&mut self) {
+        if std::mem::take(&mut self.waiting) {
+            self.awaiting.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A chunk was handed to the writer.
+    fn handed_off(&mut self) {
+        if !std::mem::replace(&mut self.waiting, true) {
+            self.awaiting.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for DownstreamWait {
+    fn drop(&mut self) {
+        self.polled();
+    }
 }
 
 impl<S, E> CleanupStream<S, E>
@@ -2099,6 +2151,7 @@ where
             error_recorder,
             error_recorded: false,
             peer_stream,
+            downstream_wait: None,
         }
     }
 }
@@ -2171,6 +2224,26 @@ where
     type Item = Result<Bytes, E>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(wait) = self.downstream_wait.as_mut() {
+            wait.polled();
+        }
+        let poll = self.as_mut().poll_upstream(cx);
+        if let (Poll::Ready(Some(Ok(_))), Some(wait)) = (&poll, self.downstream_wait.as_mut()) {
+            wait.handed_off();
+        }
+        poll
+    }
+}
+
+impl<S, E> CleanupStream<S, E>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    /// Poll the upstream body, counting tokens and running cleanup at its end.
+    fn poll_upstream(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, E>>> {
         match self.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 // Skip token counting if disabled due to buffer overflow
@@ -3105,5 +3178,149 @@ mod tests {
             before + 1,
             "a clean peer stream does not count"
         );
+    }
+
+    fn tracked_stream<S>(inner: S) -> (CleanupStream<S, std::io::Error>, Arc<AtomicUsize>)
+    where
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    {
+        let awaiting = Arc::new(AtomicUsize::new(0));
+        let mut stream = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            false,
+        );
+        stream.downstream_wait = Some(DownstreamWait::new(awaiting.clone()));
+        (stream, awaiting)
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_marks_chunks_awaiting_the_writer() {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        let (mut s, awaiting) = tracked_stream(rx);
+        let waiting = || awaiting.load(Ordering::Relaxed);
+
+        tx.unbounded_send(Ok(Bytes::from("data: {}\n"))).unwrap();
+        assert!(s.next().await.is_some());
+        assert_eq!(waiting(), 1, "chunk handed to the writer");
+        assert!(futures::poll!(s.next()).is_pending());
+        assert_eq!(waiting(), 0, "writer asked for more; waiting on upstream");
+
+        tx.unbounded_send(Err(std::io::Error::other("reset")))
+            .unwrap();
+        assert!(matches!(s.next().await, Some(Err(_))));
+        assert_eq!(waiting(), 0, "an error is not handed off");
+
+        tx.unbounded_send(Ok(Bytes::from("data: {}\n"))).unwrap();
+        assert!(s.next().await.is_some());
+        assert_eq!(waiting(), 1);
+        drop(s);
+        assert_eq!(waiting(), 0, "dropping the response releases the mark");
+
+        let (mut s, awaiting) = tracked_stream(body_stream(vec![Ok(Bytes::from("x"))]));
+        while s.next().await.is_some() {}
+        assert_eq!(awaiting.load(Ordering::Relaxed), 0, "end of stream");
+    }
+
+    /// Serve one HTTP/1.1 response with a tracked streaming body through hyper,
+    /// the same stack that serves API clients.
+    async fn serve_tracked_stream<S>(inner: S) -> (std::net::SocketAddr, Arc<AtomicUsize>)
+    where
+        S: Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    {
+        let (stream, awaiting) = tracked_stream(inner);
+        let body = std::sync::Mutex::new(Some(Body::from_stream(stream)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(move |_req| {
+                let body = body.lock().unwrap().take().expect("a single request");
+                async move { Ok::<_, std::convert::Infallible>(Response::new(body)) }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(tcp), service)
+                .await;
+        });
+        (addr, awaiting)
+    }
+
+    async fn request_stream(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+        use tokio::io::AsyncWriteExt;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: test\r\n\r\n")
+            .await
+            .unwrap();
+        client
+    }
+
+    /// Wait until `condition` has held continuously for `stable_for`.
+    async fn wait_until_stable(condition: impl Fn() -> bool, stable_for: Duration) {
+        timeout(Duration::from_secs(10), async {
+            let mut since = None;
+            loop {
+                if !condition() {
+                    since = None;
+                } else if since.get_or_insert_with(std::time::Instant::now).elapsed() >= stable_for
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition did not hold");
+    }
+
+    #[tokio::test]
+    async fn stream_blocked_on_a_stalled_client_stays_awaiting_downstream() {
+        // An upstream that always has more output, like a generating instance,
+        // and a client that never reads the response.
+        let inner = futures::stream::repeat_with(|| Ok(Bytes::from(vec![b'x'; 16 * 1024])));
+        let (addr, awaiting) = serve_tracked_stream(inner).await;
+        let client = request_stream(addr).await;
+        // Once socket buffers fill, the server stops polling for more.
+        wait_until_stable(
+            || awaiting.load(Ordering::Relaxed) == 1,
+            Duration::from_millis(300),
+        )
+        .await;
+        // A client that disconnects releases the stream.
+        drop(client);
+        wait_until_stable(
+            || awaiting.load(Ordering::Relaxed) == 0,
+            Duration::from_millis(50),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stream_waiting_on_a_silent_upstream_is_not_awaiting_downstream() {
+        use tokio::io::AsyncReadExt;
+        // An upstream that sends one chunk and then goes silent, like a hung
+        // instance, and a client that reads everything it is sent.
+        let inner = futures::stream::iter([Ok(Bytes::from("data: first\n\n"))])
+            .chain(futures::stream::pending());
+        let (addr, awaiting) = serve_tracked_stream(inner).await;
+        let mut client = request_stream(addr).await;
+        let mut received = Vec::new();
+        timeout(Duration::from_secs(10), async {
+            while !received.windows(11).any(|w| w == b"data: first") {
+                let mut buf = [0u8; 4096];
+                let n = client.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "server closed the stream");
+                received.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("chunk not delivered");
+        wait_until_stable(
+            || awaiting.load(Ordering::Relaxed) == 0,
+            Duration::from_millis(300),
+        )
+        .await;
     }
 }
