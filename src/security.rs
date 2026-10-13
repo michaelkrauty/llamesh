@@ -196,7 +196,19 @@ fn load_private_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'stat
 }
 
 pub fn build_cluster_client(config: &Option<ClusterTlsConfig>) -> Result<Client> {
-    let mut builder = ClientBuilder::new();
+    build_cluster_client_with_connect_timeout(config, crate::cluster::PEER_CONNECT_TIMEOUT)
+}
+
+fn build_cluster_client_with_connect_timeout(
+    config: &Option<ClusterTlsConfig>,
+    connect_timeout: std::time::Duration,
+) -> Result<Client> {
+    // reqwest's connect timeout covers TCP connect and the TLS handshake.
+    let mut builder = ClientBuilder::new()
+        .connect_timeout(connect_timeout)
+        .tcp_keepalive(crate::cluster::PEER_TCP_KEEPALIVE_TIME)
+        .tcp_keepalive_interval(crate::cluster::PEER_TCP_KEEPALIVE_INTERVAL)
+        .tcp_keepalive_retries(crate::cluster::PEER_TCP_KEEPALIVE_RETRIES);
 
     if let Some(tls) = config {
         if tls.enabled {
@@ -362,5 +374,26 @@ mod tests {
         let identity = extract_peer_identity(&certs);
         assert!(identity.node_id.is_none());
         assert!(!identity.authenticated);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_client_connect_timeout_covers_stalled_tls_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/cluster/gossip", listener.local_addr().unwrap());
+        // Accept the TCP connection, then never answer the TLS handshake.
+        let silent_peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut sink).await;
+        });
+
+        let client =
+            build_cluster_client_with_connect_timeout(&None, std::time::Duration::from_millis(200))
+                .unwrap();
+        let started = std::time::Instant::now();
+        let error = client.get(&url).send().await.unwrap_err();
+        assert!(error.is_connect() && error.is_timeout(), "{error:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        silent_peer.abort();
     }
 }

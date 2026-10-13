@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.16] - 2026-10-13
+
+### Fixed
+
+- Detect cluster peers that disappear mid-request. Outbound Noise connections now enable TCP keepalive (probe after 15 seconds of silence, every 15 seconds, fail after 3 unanswered probes), matching the HTTP cluster client, whose keepalive is now configured explicitly. A peer host lost to power failure or a network partition previously left a forwarded request, and the forwarding node's slot, waiting indefinitely; the forward now fails within about a minute as a retryable transport error. A live peer answers keepalive probes while it generates, so long requests are unaffected.
+- Bound outbound peer connection establishment to 30 seconds on both cluster transports, matching the inbound handshake deadline: TCP connect plus the Noise handshake and peer verification, or TCP connect plus TLS. A peer that accepted connections but never completed a handshake could previously hold a forward before the request was sent.
+
 ## [1.21.15] - 2026-10-13
 
 ### Fixed

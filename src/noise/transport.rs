@@ -134,39 +134,31 @@ pub async fn request(
     context: &NoiseContext,
     request: OutboundNoiseRequest<'_>,
 ) -> Result<NoiseHttpResponse> {
+    request_with_connect_timeout(context, request, crate::cluster::PEER_CONNECT_TIMEOUT).await
+}
+
+async fn request_with_connect_timeout(
+    context: &NoiseContext,
+    request: OutboundNoiseRequest<'_>,
+    connect_timeout: Duration,
+) -> Result<NoiseHttpResponse> {
     let fut = async {
-        let connect_addr = connect_addr_from_url(request.peer_base_url)?;
-        let mut stream = TcpStream::connect(connect_addr).await?;
-        let mut session = crate::noise::handshake::initiate(
-            &mut stream,
-            &context.keypair,
-            &context.cluster_token,
-            &context.node_id,
+        let (mut session, mut stream) = tokio::time::timeout(
+            connect_timeout,
+            connect(
+                context,
+                request.peer_base_url,
+                request.expected_peer_node_id,
+            ),
         )
-        .await?;
-
-        let peer_node_id = session.peer_node_id().unwrap_or("unknown");
-        if let Some(expected_peer_node_id) = request.expected_peer_node_id {
-            if peer_node_id != expected_peer_node_id {
-                return Err(NoiseError::Transport(format!(
-                    "Peer node_id mismatch: expected {expected_peer_node_id}, got {peer_node_id}"
-                )));
-            }
-        }
-
-        let peer_public_key = format!(
-            "noise25519:{}",
-            base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                session.peer_public_key()
-            )
-        );
-        crate::noise::known_peers::verify_peer(
-            &context.known_peers,
-            peer_node_id,
-            &peer_public_key,
-            &context.config,
-        )?;
+        .await
+        .map_err(|_| {
+            NoiseError::Transport(format!(
+                "Timed out after {}s establishing a connection to {}",
+                connect_timeout.as_secs_f64(),
+                request.peer_base_url
+            ))
+        })??;
 
         send_request(
             &mut session,
@@ -192,6 +184,49 @@ pub async fn request(
             .map_err(|_| NoiseError::Transport("Noise request timed out".into()))?,
         None => fut.await,
     }
+}
+
+/// Connect to a peer, complete the Noise handshake, and verify its identity.
+async fn connect(
+    context: &NoiseContext,
+    peer_base_url: &str,
+    expected_peer_node_id: Option<&str>,
+) -> Result<(NoiseSession, TcpStream)> {
+    let connect_addr = connect_addr_from_url(peer_base_url)?;
+    let mut stream = TcpStream::connect(connect_addr).await?;
+    crate::cluster::set_peer_tcp_keepalive(&stream)?;
+    let session = crate::noise::handshake::initiate(
+        &mut stream,
+        &context.keypair,
+        &context.cluster_token,
+        &context.node_id,
+    )
+    .await?;
+
+    let peer_node_id = session.peer_node_id().unwrap_or("unknown");
+    if let Some(expected_peer_node_id) = expected_peer_node_id {
+        if peer_node_id != expected_peer_node_id {
+            return Err(NoiseError::Transport(format!(
+                "Peer node_id mismatch: expected {expected_peer_node_id}, got {peer_node_id}"
+            )));
+        }
+    }
+
+    let peer_public_key = format!(
+        "noise25519:{}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            session.peer_public_key()
+        )
+    );
+    crate::noise::known_peers::verify_peer(
+        &context.known_peers,
+        peer_node_id,
+        &peer_public_key,
+        &context.config,
+    )?;
+
+    Ok((session, stream))
 }
 
 /// Send only an encrypted HTTP response head.
@@ -595,6 +630,97 @@ mod tests {
         let parsed = parse_http_response_head(&response).unwrap();
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.first_body.as_ref(), b"FIRSTBODY");
+    }
+
+    fn test_context(dir: &std::path::Path, node_id: &str, token: &str) -> NoiseContext {
+        NoiseContext {
+            keypair: crate::noise::keypair::NodeKeypair::generate(),
+            cluster_token: token.into(),
+            known_peers: crate::noise::known_peers::KnownPeers::load_or_create(
+                &dir.join(format!("{node_id}-known-peers")),
+            )
+            .unwrap(),
+            config: crate::config::ClusterNoiseConfig::default(),
+            node_id: node_id.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_enables_peer_tcp_keepalive() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = crate::noise::token::generate();
+        let server = test_context(dir.path(), "server-node", &token);
+        let client = test_context(dir.path(), "client-node", &token);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            crate::noise::handshake::respond(
+                &mut stream,
+                &server.keypair,
+                &server.cluster_token,
+                &server.node_id,
+            )
+            .await
+            .unwrap();
+            stream
+        });
+
+        let (session, stream) = connect(&client, &url, Some("server-node")).await.unwrap();
+        assert_eq!(session.peer_node_id(), Some("server-node"));
+        let socket = socket2::SockRef::from(&stream);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(
+            socket.tcp_keepalive_time().unwrap(),
+            crate::cluster::PEER_TCP_KEEPALIVE_TIME
+        );
+        assert_eq!(
+            socket.tcp_keepalive_interval().unwrap(),
+            crate::cluster::PEER_TCP_KEEPALIVE_INTERVAL
+        );
+        assert_eq!(
+            socket.tcp_keepalive_retries().unwrap(),
+            crate::cluster::PEER_TCP_KEEPALIVE_RETRIES
+        );
+        drop(responder.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_request_times_out_when_peer_never_completes_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = test_context(dir.path(), "client-node", &crate::noise::token::generate());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        // Accept the TCP connection, then never answer the handshake.
+        let silent_peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink).await;
+        });
+
+        let headers = HeaderMap::new();
+        let started = std::time::Instant::now();
+        let result = request_with_connect_timeout(
+            &client,
+            OutboundNoiseRequest {
+                peer_base_url: &url,
+                expected_peer_node_id: None,
+                method: "POST",
+                path: "/v1/chat/completions",
+                headers: &headers,
+                body: b"{}",
+                timeout_duration: None,
+            },
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let Err(NoiseError::Transport(message)) = result else {
+            panic!("expected a connection-establishment timeout");
+        };
+        assert!(message.contains("establishing a connection"), "{message}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        silent_peer.abort();
     }
 
     #[test]

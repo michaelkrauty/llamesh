@@ -1,6 +1,6 @@
 [package]
 name = "llamesh"
-version = "1.21.15"
+version = "1.21.16"
 edition = "2021"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -56,6 +56,7 @@ getrandom = "0.2"
 http-body = "1"
 http-body-util = "0.1"
 libc = "0.2"
+socket2 = "0.6"
 
 # mDNS discovery
 mdns-sd = "0.19.2"
@@ -63,6 +64,8 @@ regex = "1.12.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Keepalive getters, used to assert peer socket configuration.
+socket2 = { version = "0.6", features = ["all"] }
 mockall = "0.13"
 futures = "0.3"
 tokio = { version = "1", features = ["full", "test-util"] }
