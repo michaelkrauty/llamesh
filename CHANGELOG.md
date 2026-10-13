@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.15] - 2026-10-13
+
+### Fixed
+
+- Retire idle pooled connections to local `llama-server` instances after 2 seconds instead of reqwest's default 90 seconds. `llama-server` closes keep-alive connections after 5 seconds without a request, so a request dispatched on a pooled connection near that boundary could be written to a closing socket and fail with an upstream error before reaching the instance. Back-to-back requests still reuse connections.
+
 ## [1.21.14] - 2026-09-26
 
 ### Fixed
