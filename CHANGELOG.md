@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.17] - 2026-10-13
+
+### Fixed
+
+- The wedged-instance watchdog no longer stops an instance that is idle only because its streaming clients stopped reading. `llama-server` finishes generating into its own buffers when a client stalls and then sits idle with the response undelivered, which the watchdog treated as a hang once `window_ms` elapsed. The proxy now tracks, per instance, streaming responses waiting on their clients, and the watchdog counts only requests still waiting on the instance itself. A genuinely hung instance is still stopped, including when other requests on it are blocked on their clients.
+
 ## [1.21.16] - 2026-10-13
 
 ### Fixed
