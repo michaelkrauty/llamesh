@@ -6,6 +6,8 @@ mod model_index;
 mod peer_state;
 mod port_pool;
 mod spawn_reservations;
+#[cfg(test)]
+mod upstream_client_tests;
 
 pub use model_index::{args_hash_for_profile, build_pre_args, get_args_hash_for_key, ModelIndex};
 pub use peer_state::{PeerModelStats, PeerState};
@@ -464,6 +466,35 @@ impl Drop for SlotReleaseGuard {
     }
 }
 
+/// How long an idle pooled connection to a local `llama-server` may be reused.
+///
+/// `llama-server` closes a keep-alive connection that receives no new request
+/// within 5 seconds (cpp-httplib's `CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND`), while
+/// reqwest pools idle connections for 90 seconds by default. A request sent on a
+/// pooled connection near that boundary races the server's close and fails
+/// before any response arrives; it cannot be retried safely because the proxy
+/// cannot know whether a generation request was processed. Retiring idle
+/// connections well before the server does keeps every reused connection one
+/// the server is still waiting on, at the cost of an occasional loopback
+/// reconnect.
+const LOCAL_UPSTREAM_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Build the HTTP client used for requests to local `llama-server` instances.
+///
+/// `read_timeout_ms` bounds inactivity (silence) from the instance, not total
+/// duration: reqwest resets it on every received chunk, so a slow-but-active
+/// stream is unaffected while a stalled upstream (which would otherwise hold
+/// its in-flight slot forever and block graceful drain) is aborted. 0 disables
+/// it.
+fn build_local_upstream_client(read_timeout_ms: u64) -> reqwest::Result<reqwest::Client> {
+    let mut builder =
+        reqwest::Client::builder().pool_idle_timeout(LOCAL_UPSTREAM_POOL_IDLE_TIMEOUT);
+    if read_timeout_ms > 0 {
+        builder = builder.read_timeout(Duration::from_millis(read_timeout_ms));
+    }
+    builder.build()
+}
+
 impl NodeState {
     pub async fn new(
         config: NodeConfig,
@@ -471,19 +502,7 @@ impl NodeState {
         build_manager: BuildManager,
     ) -> Result<Self> {
         let cluster_client = security::build_cluster_client(&config.cluster_tls)?;
-        // `read_timeout` bounds inactivity (silence) from a local llama-server,
-        // not total duration: reqwest resets it on every received chunk, so a
-        // slow-but-active stream is unaffected while a stalled upstream (which
-        // would otherwise hold its in-flight slot forever and block graceful
-        // drain) is aborted. 0 disables it.
-        let http_client = {
-            let mut builder = reqwest::Client::builder();
-            if config.upstream_read_timeout_ms > 0 {
-                builder =
-                    builder.read_timeout(Duration::from_millis(config.upstream_read_timeout_ms));
-            }
-            builder.build()?
-        };
+        let http_client = build_local_upstream_client(config.upstream_read_timeout_ms)?;
 
         let metrics = Metrics::load(std::path::Path::new(&config.metrics_path)).await;
         let model_index = Arc::new(ModelIndex::new(&cookbook));
