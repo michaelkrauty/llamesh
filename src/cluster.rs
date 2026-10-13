@@ -19,6 +19,36 @@ use tracing::{debug, info};
 /// a gossip task (and its concurrency permit) open indefinitely.
 const GOSSIP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Maximum time to establish an outbound peer connection, on both cluster
+/// transports: TCP connect plus the Noise handshake and peer verification, or
+/// TCP connect plus TLS. Mirrors the inbound handshake deadline, so a peer that
+/// accepts connections but never completes a handshake cannot hold a request
+/// before it is sent. Nothing has been sent when it expires, so the failure is a
+/// transport error the forwarder can safely retry elsewhere.
+pub const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// TCP keepalive for outbound peer connections, on both cluster transports. A
+/// peer host that disappears without closing its connections (power loss, a
+/// network partition) otherwise leaves a request waiting on the connection
+/// indefinitely, because no data is outstanding for TCP to retransmit. Probing
+/// after 15 seconds of silence, every 15 seconds, and giving up after 3
+/// unanswered probes surfaces the loss within about a minute as a transport
+/// error. A live peer's kernel answers the probes even while a long generation
+/// sends no response bytes, so slow requests are unaffected. These are
+/// reqwest's defaults.
+pub const PEER_TCP_KEEPALIVE_TIME: std::time::Duration = std::time::Duration::from_secs(15);
+pub const PEER_TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+pub const PEER_TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Apply [`PEER_TCP_KEEPALIVE_TIME`] and its companions to a connected socket.
+pub fn set_peer_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(PEER_TCP_KEEPALIVE_TIME)
+        .with_interval(PEER_TCP_KEEPALIVE_INTERVAL)
+        .with_retries(PEER_TCP_KEEPALIVE_RETRIES);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub node_id: String,
