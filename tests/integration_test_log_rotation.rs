@@ -3,14 +3,18 @@
 //!
 //! The node runs with `TZ` set to an offset whose local date differs from the
 //! UTC date at the time of the test (UTC+14 from 12:00 UTC on, UTC-12 before),
-//! so a file named by local date would be detected. The current UTC day's file
-//! is also present only in compressed form, as if it had already been rotated:
-//! the node must restore and continue it, because rotating it again would
-//! overwrite the compressed file and lose its entries.
+//! so a file named by local date would be detected. The log directory is laid
+//! out as a version that rotated on local days leaves it on a host east of UTC
+//! between local and UTC midnight: the current UTC day's file was already
+//! rotated and exists only in compressed form, and the entries written since
+//! local midnight, stamped on the current UTC day, are in a file named for the
+//! next day. The node must continue the current day's file with both sets of
+//! entries in order, rather than overwrite the compressed file at the next
+//! rotation or append the next day's entries to the misnamed file.
 
 use chrono::{FixedOffset, Timelike, Utc};
-use std::io::{Read, Write};
-use std::time::Duration;
+use std::io::Write;
+use std::path::Path;
 
 mod common;
 use common::{graceful_stop, llamesh_binary, reset_metrics_file, wait_for_ready};
@@ -18,9 +22,9 @@ use common::{graceful_stop, llamesh_binary, reset_metrics_file, wait_for_ready};
 const LISTEN_ADDR: &str = "127.0.0.1:9253";
 const BASE_URL: &str = "http://127.0.0.1:9253";
 const SUFFIX: &str = "log_rotation";
-const EARLIER_ENTRY: &str = r#"{"timestamp":"earlier","level":"INFO","fields":{"message":"entry written before the restart"}}"#;
+const COMPRESSED_ENTRY: &str = r#"{"timestamp":"compressed","level":"INFO","fields":{"message":"entry from the rotated file"}}"#;
 
-fn config_yaml(log_dir: &std::path::Path) -> String {
+fn config_yaml(log_dir: &Path) -> String {
     format!(
         r#"
 node_id: "test-{SUFFIX}"
@@ -78,35 +82,56 @@ models:
         llama_server_args: ""
 "#;
 
-#[tokio::test]
-async fn log_files_follow_utc_days() {
+struct Run {
+    utc_day: String,
+    local_day: String,
+    next_day_entry: String,
+    ready: bool,
+    files: Vec<String>,
+    contents: String,
+}
+
+/// Lay out the log directory, run the node until it is ready, stop it, and
+/// collect the resulting log files.
+async fn run_node(root: &Path) -> Run {
     let now = Utc::now();
     let (tz, offset_hours) = if now.hour() >= 12 {
         ("<+14>-14", 14)
     } else {
         ("<-12>+12", -12)
     };
-    let utc_day = now.format("%Y-%m-%d").to_string();
+    let today = now.date_naive();
+    let utc_day = today.format("%Y-%m-%d").to_string();
+    let next_day = (today + chrono::Days::new(1))
+        .format("%Y-%m-%d")
+        .to_string();
     let local_day = now
         .with_timezone(&FixedOffset::east_opt(offset_hours * 3600).unwrap())
         .format("%Y-%m-%d")
         .to_string();
-    assert_ne!(utc_day, local_day, "the chosen offset must change the date");
+    let next_day_entry = format!(
+        r#"{{"timestamp":"{utc_day}T00:00:00.000000Z","level":"INFO","fields":{{"message":"entry since local midnight"}}}}"#
+    );
 
-    let root = std::env::current_dir().unwrap();
     let log_dir = root.join(format!("tests/logs_{SUFFIX}"));
     let _ = tokio::fs::remove_dir_all(&log_dir).await;
     tokio::fs::create_dir_all(&log_dir).await.unwrap();
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    writeln!(encoder, "{EARLIER_ENTRY}").unwrap();
+    writeln!(encoder, "{COMPRESSED_ENTRY}").unwrap();
     tokio::fs::write(
         log_dir.join(format!("proxy.log.{utc_day}.gz")),
         encoder.finish().unwrap(),
     )
     .await
     .unwrap();
+    tokio::fs::write(
+        log_dir.join(format!("proxy.log.{next_day}")),
+        format!("{next_day_entry}\n"),
+    )
+    .await
+    .unwrap();
 
-    let metrics_path = reset_metrics_file(&root, SUFFIX).await;
+    let metrics_path = reset_metrics_file(root, SUFFIX).await;
     let config_path = root.join(format!("tests/config_{SUFFIX}.yaml"));
     let cookbook_path = root.join(format!("tests/cookbook_{SUFFIX}.yaml"));
     tokio::fs::write(&config_path, config_yaml(&log_dir))
@@ -114,7 +139,7 @@ async fn log_files_follow_utc_days() {
         .unwrap();
     tokio::fs::write(&cookbook_path, COOKBOOK).await.unwrap();
 
-    let mut proxy_process = tokio::process::Command::new(llamesh_binary(&root))
+    let mut proxy_process = tokio::process::Command::new(llamesh_binary(root))
         .arg("--config")
         .arg(&config_path)
         .arg("--cookbook")
@@ -125,42 +150,71 @@ async fn log_files_follow_utc_days() {
         .expect("failed to start proxy");
     let ready = wait_for_ready(BASE_URL).await;
     graceful_stop(&mut proxy_process).await;
-    // The file writer is non-blocking; give it a moment to drain.
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut names: Vec<String> = std::fs::read_dir(&log_dir)
+    let mut files: Vec<String> = std::fs::read_dir(&log_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .collect();
-    names.sort();
-    let mut contents = String::new();
-    if let Ok(mut file) = std::fs::File::open(log_dir.join(format!("proxy.log.{utc_day}"))) {
-        file.read_to_string(&mut contents).unwrap();
-    }
+    files.sort();
+    let contents =
+        std::fs::read_to_string(log_dir.join(format!("proxy.log.{utc_day}"))).unwrap_or_default();
 
     for path in [&config_path, &cookbook_path, &metrics_path] {
         let _ = tokio::fs::remove_file(path).await;
     }
     let _ = tokio::fs::remove_dir_all(&log_dir).await;
 
-    assert!(ready, "proxy failed to become ready");
-    assert_eq!(
-        names,
-        [format!("proxy.log.{utc_day}")],
-        "expected only the UTC day's file (local day: {local_day})"
+    Run {
+        utc_day,
+        local_day,
+        next_day_entry,
+        ready,
+        files,
+        contents,
+    }
+}
+
+#[tokio::test]
+async fn log_files_follow_utc_days() {
+    let root = std::env::current_dir().unwrap();
+    let mut run = run_node(&root).await;
+    if Utc::now().format("%Y-%m-%d").to_string() != run.utc_day {
+        // The run crossed UTC midnight, so the node rightly moved on to the
+        // next day's file; repeat it within a single day.
+        run = run_node(&root).await;
+    }
+
+    assert!(run.ready, "proxy failed to become ready");
+    assert_ne!(
+        run.utc_day, run.local_day,
+        "the chosen offset must change the date"
     );
-    let mut lines = contents.lines();
+    assert_eq!(
+        run.files,
+        [format!("proxy.log.{}", run.utc_day)],
+        "expected only the UTC day's file (local day: {})",
+        run.local_day
+    );
+    let mut lines = run.contents.lines();
     assert_eq!(
         lines.next(),
-        Some(EARLIER_ENTRY),
-        "the restored day's earlier entries must come first"
+        Some(COMPRESSED_ENTRY),
+        "the rotated file's entries must come first"
+    );
+    assert_eq!(
+        lines.next(),
+        Some(run.next_day_entry.as_str()),
+        "the entries from the next day's file must follow"
     );
     let started: serde_json::Value = lines
         .find(|line| line.contains("Starting llamesh"))
         .map(|line| serde_json::from_str(line).unwrap())
         .expect("the restarted node's entries must follow");
     assert!(
-        started["timestamp"].as_str().unwrap().starts_with(&utc_day),
+        started["timestamp"]
+            .as_str()
+            .unwrap()
+            .starts_with(&run.utc_day),
         "entry timestamps must fall on the file's day: {started}"
     );
 }

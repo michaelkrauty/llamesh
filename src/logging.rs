@@ -1,7 +1,7 @@
 use crate::config::LoggingConfig;
 use logroller::{Compression, LogRollerBuilder, Rotation, RotationAge, TimeZone};
 use std::fs;
-use std::io;
+use std::io::{self, BufRead};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -12,12 +12,19 @@ pub fn init(file_config: Option<&LoggingConfig>) -> anyhow::Result<()> {
     if let Some(cfg) = file_config.filter(|c| c.enabled) {
         std::fs::create_dir_all(&cfg.directory)?;
 
-        // Reported once logging is up; a failure must not keep the node from
-        // starting.
-        let reopened = cfg.compression.then(|| {
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-            reopen_compressed_log(Path::new(&cfg.directory), &cfg.filename, &today)
-        });
+        // Prepare the current day's file before the appender opens it. The
+        // outcomes are reported once logging is up; a failure must not keep
+        // the node from starting.
+        let today = chrono::Utc::now().date_naive();
+        let next_day = (today + chrono::Days::new(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        let today = today.format("%Y-%m-%d").to_string();
+        let directory = Path::new(&cfg.directory);
+        let reopened = cfg
+            .compression
+            .then(|| reopen_compressed_log(directory, &cfg.filename, &today));
+        let adopted = adopt_next_day_log(directory, &cfg.filename, &today, &next_day);
 
         // Daily files follow UTC days, matching the UTC timestamps of the
         // entries they hold. logroller's default is the host's local offset,
@@ -55,6 +62,17 @@ pub fn init(file_config: Option<&LoggingConfig>) -> anyhow::Result<()> {
                 "Failed to restore today's compressed log file; the next rotation will overwrite it"
             ),
             _ => {}
+        }
+        match adopted {
+            Ok(Some(path)) => tracing::info!(
+                path = %path.display(),
+                "Moved entries stamped today from the next day's log file into today's"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Failed to move entries stamped today out of the next day's log file"
+            ),
+            Ok(None) => {}
         }
     } else {
         tracing_subscriber::registry()
@@ -103,6 +121,62 @@ fn reopen_compressed_log(
     // overwrites the leftover with `current`, which holds the same entries.
     let _ = fs::remove_file(&compressed);
     Ok(Some(current))
+}
+
+/// Move the entries of `<filename>.<next_day>` to the end of
+/// `<filename>.<day>` when that file's first entry is stamped on `day`.
+/// Returns the path the entries were moved from, or `None` if there was
+/// nothing to move.
+///
+/// A version that rotated on local days named its file after the local date,
+/// which east of UTC is already the next UTC day between local and UTC
+/// midnight. Upgrading in that window would leave that interval's entries in
+/// the next day's file, which the appender opens at the next rotation and
+/// appends the next day's entries to. A next-day file whose entries are
+/// stamped on the next day, written before the clock was set back, is left
+/// alone.
+fn adopt_next_day_log(
+    directory: &Path,
+    filename: &str,
+    day: &str,
+    next_day: &str,
+) -> io::Result<Option<PathBuf>> {
+    let next = directory.join(format!("{filename}.{next_day}"));
+    let file = match fs::File::open(&next) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut first_entry = String::new();
+    io::BufReader::new(file).read_line(&mut first_entry)?;
+    let stamped_today = serde_json::from_str::<serde_json::Value>(&first_entry)
+        .ok()
+        .and_then(|entry| Some(entry.get("timestamp")?.as_str()?.starts_with(day)))
+        .unwrap_or(false);
+    if !stamped_today {
+        return Ok(None);
+    }
+
+    // Take the file out of the appender's way first, so that an interrupted
+    // move leaves the entries in this file instead of copying them twice.
+    let moving = directory.join(format!("{filename}.{next_day}.moving"));
+    fs::rename(&next, &moving)?;
+    let append = || -> io::Result<()> {
+        let mut current = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(directory.join(format!("{filename}.{day}")))?;
+        io::copy(&mut fs::File::open(&moving)?, &mut current)?;
+        current.sync_all()
+    };
+    append().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("{e} (the entries remain in {})", moving.display()),
+        )
+    })?;
+    let _ = fs::remove_file(&moving);
+    Ok(Some(next))
 }
 
 #[cfg(test)]
@@ -189,6 +263,89 @@ mod tests {
             None
         );
         assert_eq!(entries(&dir), ["proxy.log.2026-01-01.gz"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const NEXT_DAY_ENTRY: &str = r#"{"timestamp":"2026-01-02T23:00:00.000000Z","level":"INFO"}"#;
+
+    #[test]
+    fn moves_entries_stamped_today_out_of_the_next_days_file() {
+        let dir = scratch_dir("adopt");
+        fs::write(dir.join("proxy.log.2026-01-02"), "earlier\n").unwrap();
+        fs::write(
+            dir.join("proxy.log.2026-01-03"),
+            format!("{NEXT_DAY_ENTRY}\nlater\n"),
+        )
+        .unwrap();
+
+        let moved = adopt_next_day_log(&dir, "proxy.log", "2026-01-02", "2026-01-03").unwrap();
+
+        assert_eq!(moved, Some(dir.join("proxy.log.2026-01-03")));
+        assert_eq!(
+            fs::read_to_string(dir.join("proxy.log.2026-01-02")).unwrap(),
+            format!("earlier\n{NEXT_DAY_ENTRY}\nlater\n")
+        );
+        assert_eq!(entries(&dir), ["proxy.log.2026-01-02"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn moves_entries_into_a_new_file_for_today() {
+        let dir = scratch_dir("adopt-new");
+        fs::write(
+            dir.join("proxy.log.2026-01-03"),
+            format!("{NEXT_DAY_ENTRY}\n"),
+        )
+        .unwrap();
+
+        adopt_next_day_log(&dir, "proxy.log", "2026-01-02", "2026-01-03").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("proxy.log.2026-01-02")).unwrap(),
+            format!("{NEXT_DAY_ENTRY}\n")
+        );
+        assert_eq!(entries(&dir), ["proxy.log.2026-01-02"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn leaves_a_next_day_file_stamped_on_its_own_day() {
+        // Written while the clock was ahead of where it is now.
+        let dir = scratch_dir("adopt-own-day");
+        let own_day = r#"{"timestamp":"2026-01-03T01:00:00.000000Z","level":"INFO"}"#;
+        fs::write(dir.join("proxy.log.2026-01-03"), format!("{own_day}\n")).unwrap();
+
+        assert_eq!(
+            adopt_next_day_log(&dir, "proxy.log", "2026-01-02", "2026-01-03").unwrap(),
+            None
+        );
+        assert_eq!(entries(&dir), ["proxy.log.2026-01-03"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn leaves_a_next_day_file_it_cannot_date() {
+        let dir = scratch_dir("adopt-undated");
+        fs::write(dir.join("proxy.log.2026-01-03"), "not json\n").unwrap();
+
+        assert_eq!(
+            adopt_next_day_log(&dir, "proxy.log", "2026-01-02", "2026-01-03").unwrap(),
+            None
+        );
+        assert_eq!(entries(&dir), ["proxy.log.2026-01-03"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nothing_to_move_without_a_next_day_file() {
+        let dir = scratch_dir("adopt-absent");
+        fs::write(dir.join("proxy.log.2026-01-02"), "earlier\n").unwrap();
+
+        assert_eq!(
+            adopt_next_day_log(&dir, "proxy.log", "2026-01-02", "2026-01-03").unwrap(),
+            None
+        );
+        assert_eq!(entries(&dir), ["proxy.log.2026-01-02"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 
