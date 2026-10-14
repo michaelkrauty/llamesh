@@ -100,14 +100,17 @@ async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next:
 ///
 /// Test hook: `MOCK_CONNECTION_CLOSE=1` makes every response the last on its
 /// connection. Test hook: `MOCK_ECHO_REQUEST_HEADERS=1` lists the names of the
-/// received request headers in `x-mock-request-headers`, so tests can check
-/// what the proxy forwarded.
+/// received request headers in `x-mock-request-headers`, and the received
+/// `Connection` value in `x-mock-request-connection`, so tests can check what
+/// the proxy forwarded.
 async fn connection_headers(req: Request, next: Next) -> Response {
-    let received = env_flag("MOCK_ECHO_REQUEST_HEADERS").then(|| {
+    let echo = env_flag("MOCK_ECHO_REQUEST_HEADERS");
+    let received = echo.then(|| {
         let mut names: Vec<&str> = req.headers().keys().map(|name| name.as_str()).collect();
         names.sort_unstable();
         names.join(",")
     });
+    let received_connection = req.headers().get(CONNECTION).filter(|_| echo).cloned();
     let mut response = next.run(req).await;
     let headers = response.headers_mut();
     if env_flag("MOCK_CONNECTION_CLOSE") {
@@ -117,6 +120,9 @@ async fn connection_headers(req: Request, next: Next) -> Response {
     }
     if let Some(value) = received.and_then(|names| HeaderValue::from_str(&names).ok()) {
         headers.insert("x-mock-request-headers", value);
+    }
+    if let Some(value) = received_connection {
+        headers.insert("x-mock-request-connection", value);
     }
     response
 }
