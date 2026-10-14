@@ -33,12 +33,14 @@ read_local_log() {
     fi
 }
 
-# The same on the remote node, in POSIX sh. The path is substituted into the
-# remote command unquoted, so a leading `~` in LLAMESH_REMOTE_LOG_DIR refers to
-# the remote home directory.
+# The same on the remote node. sshd runs the command through the remote
+# user's login shell, which need not be POSIX, so the check runs in `sh -c`
+# with the path as its argument. The path is substituted into the command
+# unquoted, so the login shell expands a leading `~` in LLAMESH_REMOTE_LOG_DIR
+# to the remote home directory.
 read_remote_log() {
     # shellcheck disable=SC2029  # Expanded on the client side on purpose.
-    ssh "$REMOTE_HOST" "f=${REMOTE_LOG_DIR}/${LOG_FILE}; if [ -f \"\$f\" ]; then cat \"\$f\"; elif [ -f \"\$f.gz\" ]; then gzip -dc \"\$f.gz\"; else exit 1; fi"
+    ssh "$REMOTE_HOST" "sh -c 'if [ -f \"\$1\" ]; then cat \"\$1\"; elif [ -f \"\$1.gz\" ]; then gzip -dc \"\$1.gz\"; else exit 1; fi' sh ${REMOTE_LOG_DIR}/${LOG_FILE}"
 }
 
 case "$NODE" in
