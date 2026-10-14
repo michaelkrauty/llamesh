@@ -2,13 +2,13 @@
 # Show cluster health: peer connections, circuit breakers, gossip events
 # Usage: cluster-health.sh [node] [date]
 #   node: local, remote, both (default: both)
-#   date: YYYY-MM-DD (default: today)
+#   date: YYYY-MM-DD, a UTC day (default: today in UTC)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NODE="${1:-both}"
-DATE="${2:-$(date +%Y-%m-%d)}"
+DATE="${2:-$(date -u +%Y-%m-%d)}"
 
 filter_cluster() {
     local node="$1"

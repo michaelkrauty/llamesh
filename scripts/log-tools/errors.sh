@@ -2,7 +2,7 @@
 # Show recent errors and warnings from logs
 # Usage: errors.sh [node] [date] [limit]
 #   node: local, remote, both (default: both)
-#   date: YYYY-MM-DD (default: today)
+#   date: YYYY-MM-DD, a UTC day (default: today in UTC)
 #   limit: max lines (default: 50)
 # Exits nonzero if either log query fails; diagnostics are written to stderr.
 
@@ -10,7 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NODE="${1:-both}"
-DATE="${2:-$(date +%Y-%m-%d)}"
+DATE="${2:-$(date -u +%Y-%m-%d)}"
 LIMIT="${3:-50}"
 
 fetch_and_filter() {

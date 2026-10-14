@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.21] - 2026-10-14
+
+### Fixed
+
+- Rotate log files at UTC midnight and name them by UTC date, matching the UTC timestamps of the entries they hold. Rotation followed the host's local time zone, so on a host west of UTC a file named for one day held entries stamped on the next, cluster nodes in different time zones split days at different instants, and on hosts that observe daylight saving time rotation drifted by an hour after each transition until the next restart, because the local offset was captured once at startup. The `scripts/log-tools` scripts now default to the current UTC day. Files written before the upgrade keep their local-day boundaries, except on a host east of UTC upgraded between local and UTC midnight: there, the entries the previous version had already written to the next day's file are moved to the current day's file, so the next day's file is not started with them.
+- Keep a day's earlier log entries when its file is reopened after it was already rotated and compressed, as happens when a node starts with its clock set back, or once when upgrading on a host east of UTC. The next rotation overwrote the compressed file; the node now restores it at startup and appends to it.
+
 ## [1.21.20] - 2026-10-14
 
 ### Fixed

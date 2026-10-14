@@ -1372,7 +1372,9 @@ cluster:
 
 ## Logging & Tracing
 
-All logs are structured (JSON), one event per line.
+All logs are structured (JSON), one event per line, with UTC timestamps.
+
+With `logging.enabled`, events are also written to `<directory>/<filename>.YYYY-MM-DD`, one file per UTC day, rotated at UTC midnight. With `compression` (the default), a rotated file is gzip-compressed to `<filename>.YYYY-MM-DD.gz`. `max_keep_files` limits how many rotated files are kept. If the current day's file was already rotated when the node starts (for example, because the clock was set back), its compressed file is restored and appended to instead of being overwritten at the next rotation.
 
 Minimum fields for each log event:
 
@@ -1411,7 +1413,7 @@ Examples of log events:
 
 ### Querying Error Logs
 
-`scripts/log-tools/errors.sh [local|remote|both] [YYYY-MM-DD] [limit]` prints recent `WARN` and `ERROR` entries from daily log files (defaults: both nodes, today, 50 entries per node). Entries that carry an `error` field show it after the message. It requires Bash and `jq`, plus SSH for remote queries. Set `LLAMESH_LOCAL_LOG_DIR` to override the repository's `logs` directory. Remote queries require `LLAMESH_REMOTE_HOST`; set `LLAMESH_REMOTE_LOG_DIR` to the remote log directory (default: `./logs`, relative to the SSH login directory).
+`scripts/log-tools/errors.sh [local|remote|both] [YYYY-MM-DD] [limit]` prints recent `WARN` and `ERROR` entries from daily log files (defaults: both nodes, the current UTC day, 50 entries per node). Entries that carry an `error` field show it after the message. It requires Bash and `jq`, plus SSH for remote queries. Set `LLAMESH_LOCAL_LOG_DIR` to override the repository's `logs` directory. Remote queries require `LLAMESH_REMOTE_HOST`; set `LLAMESH_REMOTE_LOG_DIR` to the remote log directory (default: `./logs`, relative to the SSH login directory).
 
 A successful query with no matching entries exits zero. Fetch or JSON parsing failures produce stderr diagnostics and a nonzero exit status. In `both` mode, both nodes are queried even if the first fails; failure on either node makes the overall command fail. Output may be partial when a query fails.
 

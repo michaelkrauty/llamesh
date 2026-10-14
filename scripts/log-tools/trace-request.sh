@@ -2,7 +2,7 @@
 # Trace a request across nodes by request_id or session_id
 # Usage: trace-request.sh <id> [date]
 #   id: request_id or session_id (ULID format)
-#   date: YYYY-MM-DD (default: today)
+#   date: YYYY-MM-DD, a UTC day (default: today in UTC)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,7 +13,7 @@ if [[ -z "${1:-}" ]]; then
 fi
 
 ID="$1"
-DATE="${2:-$(date +%Y-%m-%d)}"
+DATE="${2:-$(date -u +%Y-%m-%d)}"
 
 trace_node() {
     local node="$1"
