@@ -17,7 +17,7 @@ fetch_and_filter() {
     local node="$1"
     "$SCRIPT_DIR/fetch-logs.sh" "$node" "$DATE" | \
         jq -r 'select(.level == "ERROR" or .level == "WARN") |
-            "\(.timestamp | split(".")[0]) [\(.level)] \(.target): \(.fields.message // .fields.event // "no message")"' | \
+            "\(.timestamp | split(".")[0]) [\(.level)] \(.target): \(.fields.message // .fields.event // "no message")\(if .fields.error then " (error: \(.fields.error))" else "" end)"' | \
         tail -n "$LIMIT"
 }
 

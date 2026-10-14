@@ -88,6 +88,29 @@ pub fn strip_leading_whitespace(bytes: &[u8]) -> &[u8] {
     &bytes[start..]
 }
 
+/// Render an error followed by its chain of causes, outermost first, separated
+/// by `": "`.
+///
+/// An HTTP client error's own message rarely says what went wrong: reqwest
+/// reports `error sending request for url (...)` whether the connection was
+/// refused, reset, or closed before the response arrived; that detail lives in
+/// the error's `source()` chain. A cause whose message is already part of the
+/// rendered text is skipped, so an error that embeds its source in its own
+/// message (`IO error: {0}`) is not repeated.
+pub fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let message = cause.to_string();
+        if !message.is_empty() && !rendered.contains(&message) {
+            rendered.push_str(": ");
+            rendered.push_str(&message);
+        }
+        source = cause.source();
+    }
+    rendered
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +249,93 @@ mod tests {
     #[test]
     fn test_trailing_whitespace_preserved() {
         assert_eq!(strip_leading_whitespace(b"hello   "), b"hello   ");
+    }
+
+    /// A test error with a fixed message and an optional cause.
+    #[derive(Debug)]
+    struct Layer {
+        message: &'static str,
+        cause: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+
+    impl Layer {
+        fn new(message: &'static str, cause: Option<Layer>) -> Self {
+            Self {
+                message,
+                cause: cause.map(|c| Box::new(c) as _),
+            }
+        }
+    }
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause.as_ref().map(|c| c.as_ref() as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_without_causes_is_the_message() {
+        assert_eq!(error_chain(&Layer::new("outer", None)), "outer");
+    }
+
+    #[test]
+    fn error_chain_appends_each_cause_outermost_first() {
+        let error = Layer::new(
+            "error sending request",
+            Some(Layer::new(
+                "client error (SendRequest)",
+                Some(Layer::new(
+                    "connection closed before message completed",
+                    None,
+                )),
+            )),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "error sending request: client error (SendRequest): \
+             connection closed before message completed"
+        );
+    }
+
+    #[test]
+    fn error_chain_skips_causes_already_in_the_message() {
+        // Wrappers that format their source into their own message (as
+        // `#[error("IO error: {0}")]` does) must not repeat it, but causes
+        // below them are still appended.
+        let error = Layer::new(
+            "IO error: connection reset",
+            Some(Layer::new(
+                "connection reset",
+                Some(Layer::new("os error 104", None)),
+            )),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "IO error: connection reset: os error 104"
+        );
+    }
+
+    #[test]
+    fn error_chain_skips_empty_causes() {
+        let error = Layer::new(
+            "outer",
+            Some(Layer::new("", Some(Layer::new("root", None)))),
+        );
+        assert_eq!(error_chain(&error), "outer: root");
+    }
+
+    #[test]
+    fn error_chain_renders_std_io_errors() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            Layer::new("tcp connect error", Some(Layer::new("refused", None))),
+        );
+        assert_eq!(error_chain(&error), "tcp connect error: refused");
     }
 }

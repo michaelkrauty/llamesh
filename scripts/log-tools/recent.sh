@@ -20,5 +20,5 @@ if [[ -n "$LEVEL" ]]; then
 fi
 
 "$SCRIPT_DIR/fetch-logs.sh" "$NODE" "$DATE" 2>/dev/null | \
-    jq -r "$jq_filter | \"\(.timestamp | split(\".\")[0]) [\(.level | .[0:4])] \(.target | split(\"::\")[-1]): \(.fields.message // .fields.event // \"?\")\"" 2>/dev/null | \
+    jq -r "$jq_filter | \"\(.timestamp | split(\".\")[0]) [\(.level | .[0:4])] \(.target | split(\"::\")[-1]): \(.fields.message // .fields.event // \"?\")\(if .fields.error then \" (error: \(.fields.error))\" else \"\" end)\"" 2>/dev/null | \
     tail -n "$LINES"

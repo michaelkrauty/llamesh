@@ -225,6 +225,26 @@ async fn reusing_a_connection_after_a_streamed_response_fails() {
 }
 
 #[tokio::test]
+async fn upstream_error_chain_names_why_a_request_failed() {
+    // reqwest's message names only the failed stage; the logged and returned
+    // error text must also carry the cause from its source chain.
+    let (base, _) = start_llama_like_server().await;
+    let client = build_local_upstream_client(0).unwrap();
+    forward(&client, &base, "/stream", false).await.unwrap();
+    let error = forward(&client, &base, "/stream", false).await.unwrap_err();
+    let cause = "connection closed before message completed";
+    assert!(
+        !error.to_string().contains(cause),
+        "reqwest now includes the cause itself: {error}"
+    );
+    let rendered = crate::util::error_chain(&error);
+    assert!(
+        rendered.starts_with("error sending request for url (") && rendered.ends_with(cause),
+        "unexpected rendering: {rendered}"
+    );
+}
+
+#[tokio::test]
 async fn sized_responses_keep_reusing_connections() {
     let (base, connections) = start_llama_like_server().await;
     let client = build_local_upstream_client(0).unwrap();

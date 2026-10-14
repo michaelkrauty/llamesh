@@ -247,7 +247,11 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                                     circuit_breaker
                                         .record_failure(&cb_key, gossip_probe_ticket)
                                         .await;
-                                    debug!("Failed to gossip to {} over Noise: {}", peer_url, e);
+                                    debug!(
+                                        "Failed to gossip to {} over Noise: {}",
+                                        peer_url,
+                                        crate::util::error_chain(&e)
+                                    );
                                 }
                             }
                         }
@@ -287,7 +291,11 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                             circuit_breaker
                                 .record_failure(&cb_key, gossip_probe_ticket)
                                 .await;
-                            debug!("Failed to gossip to {}: {}", url, e);
+                            debug!(
+                                "Failed to gossip to {}: {}",
+                                url,
+                                crate::util::error_chain(&e)
+                            );
                         }
                     }
                 }
