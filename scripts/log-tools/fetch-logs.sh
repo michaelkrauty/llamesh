@@ -23,6 +23,7 @@ LOG_FILE="proxy.log.${DATE}"
 # Print the day's log file, or its gzip-compressed copy: with
 # `logging.compression` enabled (the default), a file is compressed when it
 # rotates and the uncompressed file is removed. Fails if neither exists.
+# Reading a compressed file requires `gzip` on the node that holds it.
 read_local_log() {
     if [[ -f "${LOCAL_LOG_DIR}/${LOG_FILE}" ]]; then
         cat "${LOCAL_LOG_DIR}/${LOG_FILE}"
