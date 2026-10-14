@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.22] - 2026-10-14
+
+### Fixed
+
+- Read compressed log files in `scripts/log-tools`. With `logging.compression` enabled, the default, a log file is gzip-compressed when it rotates and the uncompressed file is removed, but `fetch-logs.sh` only read uncompressed files, so `errors.sh`, `trace-request.sh`, `instances.sh`, and `cluster-health.sh` reported the log file as missing for any day except the current one. `fetch-logs.sh` now falls back to the `.gz` file, locally and over SSH.
+
 ## [1.21.21] - 2026-10-14
 
 ### Fixed
