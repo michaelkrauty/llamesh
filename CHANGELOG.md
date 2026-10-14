@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.23] - 2026-10-14
+
+### Fixed
+
+- Fix intermittent failures of the unit tests that assert on log output. They captured logs with a thread-scoped subscriber, and while that subscriber was the only registered dispatcher, tracing-core cached a callsite that a parallel test first hit on another thread as uninteresting, so the capturing test missed the event; `open_log_reports_effective_backoff` failed in about one full unit-test run in ten. A shared test helper now keeps a second dispatcher registered while it captures. No runtime behavior change.
+
 ## [1.21.22] - 2026-10-14
 
 ### Fixed

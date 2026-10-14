@@ -964,41 +964,9 @@ mod tests {
         assert_eq!(cb.calculate_backoff(u32::MAX), Duration::from_millis(60000));
     }
 
-    /// Minimal `MakeWriter` that captures formatted log output into a shared
-    /// buffer, so tests can assert on emitted fields with no extra dependency
-    /// and no global subscriber.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[tokio::test]
     async fn open_log_reports_effective_backoff() {
-        // A current-thread `#[tokio::test]` keeps the scoped subscriber on the
-        // same thread across awaits, so warn events from the calls below are
-        // captured.
-        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(CaptureWriter(buf.clone()))
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let capture = crate::test_support::capture_logs(tracing::Level::WARN);
 
         let cb = CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 1,
@@ -1014,7 +982,7 @@ mod tests {
         // consecutive_opens = 2 -> backoff 5000 * 2^1 = 10000ms.
         cb.record_failure("p", true).await;
 
-        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        let logged = capture.contents();
         assert!(
             logged.contains("\"backoff_ms\":5000"),
             "expected first open to log backoff_ms=5000; got: {logged}"

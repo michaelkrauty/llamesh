@@ -3375,20 +3375,6 @@ mod tests {
         );
     }
 
-    /// Captures formatted log output for assertions on emitted fields.
-    #[derive(Clone, Default)]
-    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// A body error whose cause is only reachable through `source()`.
     #[derive(Debug)]
     struct BodyError(std::io::Error);
@@ -3408,18 +3394,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_stream_logs_the_cause_of_a_local_body_read_failure() {
         use futures::StreamExt;
-        // A current-thread `#[tokio::test]` keeps the scoped subscriber on this
-        // thread across awaits.
-        let writer = CaptureWriter::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_max_level(tracing::Level::ERROR)
-            .with_writer({
-                let writer = writer.clone();
-                move || writer.clone()
-            })
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let capture = crate::test_support::capture_logs(tracing::Level::ERROR);
 
         let metrics = Arc::new(Metrics::default());
         let hm = metrics.get_hash_metrics("h").await;
@@ -3438,7 +3413,7 @@ mod tests {
         );
         while s.next().await.is_some() {}
 
-        let logged = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+        let logged = capture.contents();
         assert!(
             logged.contains("\"event\":\"local_stream_body_read_failed\""),
             "missing failure event: {logged}"
