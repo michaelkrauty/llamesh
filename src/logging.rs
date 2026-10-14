@@ -21,6 +21,7 @@ pub fn init(file_config: Option<&LoggingConfig>) -> anyhow::Result<()> {
             .to_string();
         let today = today.format("%Y-%m-%d").to_string();
         let directory = Path::new(&cfg.directory);
+        remove_incomplete_copies(directory, &cfg.filename);
         let reopened = cfg
             .compression
             .then(|| reopen_compressed_log(directory, &cfg.filename, &today));
@@ -84,6 +85,36 @@ pub fn init(file_config: Option<&LoggingConfig>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Suffixes of the files that `reopen_compressed_log` and `adopt_next_day_log`
+// write a day's file into before renaming it into place.
+const RESTORING: &str = "restoring";
+const MERGING: &str = "merging";
+
+/// Remove the files a startup interrupted while writing a copy left behind.
+/// A copy is renamed into place as soon as it is complete, and its sources are
+/// kept until then, so any copy still present is incomplete and redundant.
+/// Neither the appender nor its retention limit touches these files.
+fn remove_incomplete_copies(directory: &Path, filename: &str) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let prefix = format!("{filename}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let is_copy = rest.split_once('.').is_some_and(|(day, suffix)| {
+            (suffix == RESTORING || suffix == MERGING)
+                && day.len() == 10
+                && day.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+        });
+        if is_copy {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Decompress `<filename>.<day>.gz` back to `<filename>.<day>` when only the
 /// compressed file exists, so that the day's file is continued. Returns the
 /// restored path, or `None` if there was nothing to restore.
@@ -104,7 +135,7 @@ fn reopen_compressed_log(
         return Ok(None);
     }
 
-    let partial = directory.join(format!("{filename}.{day}.restoring"));
+    let partial = directory.join(format!("{filename}.{day}.{RESTORING}"));
     let restore = || -> io::Result<()> {
         let mut decoder =
             flate2::read::MultiGzDecoder::new(io::BufReader::new(fs::File::open(&compressed)?));
@@ -135,6 +166,11 @@ fn reopen_compressed_log(
 /// appends the next day's entries to. A next-day file whose entries are
 /// stamped on the next day, written before the clock was set back, is left
 /// alone.
+///
+/// The combined file is written beside the current one and renamed over it,
+/// so an interruption leaves either the original files or the combined one.
+/// If the next day's file outlives a completed merge, its first entry is
+/// already in the current file, and it is only removed.
 fn adopt_next_day_log(
     directory: &Path,
     filename: &str,
@@ -142,13 +178,9 @@ fn adopt_next_day_log(
     next_day: &str,
 ) -> io::Result<Option<PathBuf>> {
     let next = directory.join(format!("{filename}.{next_day}"));
-    let file = match fs::File::open(&next) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+    let Some(first_entry) = first_line(&next)? else {
+        return Ok(None);
     };
-    let mut first_entry = String::new();
-    io::BufReader::new(file).read_line(&mut first_entry)?;
     let stamped_today = serde_json::from_str::<serde_json::Value>(&first_entry)
         .ok()
         .and_then(|entry| Some(entry.get("timestamp")?.as_str()?.starts_with(day)))
@@ -157,26 +189,58 @@ fn adopt_next_day_log(
         return Ok(None);
     }
 
-    // Take the file out of the appender's way first, so that an interrupted
-    // move leaves the entries in this file instead of copying them twice.
-    let moving = directory.join(format!("{filename}.{next_day}.moving"));
-    fs::rename(&next, &moving)?;
-    let append = || -> io::Result<()> {
-        let mut current = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(directory.join(format!("{filename}.{day}")))?;
-        io::copy(&mut fs::File::open(&moving)?, &mut current)?;
-        current.sync_all()
-    };
-    append().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("{e} (the entries remain in {})", moving.display()),
-        )
-    })?;
-    let _ = fs::remove_file(&moving);
+    let current = directory.join(format!("{filename}.{day}"));
+    if !contains_line(&current, &first_entry)? {
+        let merging = directory.join(format!("{filename}.{day}.{MERGING}"));
+        let merge = || -> io::Result<()> {
+            let mut output = fs::File::create(&merging)?;
+            match fs::File::open(&current) {
+                Ok(mut existing) => {
+                    io::copy(&mut existing, &mut output)?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            io::copy(&mut fs::File::open(&next)?, &mut output)?;
+            output.sync_all()?;
+            fs::rename(&merging, &current)
+        };
+        if let Err(e) = merge() {
+            let _ = fs::remove_file(&merging);
+            return Err(e);
+        }
+    }
+    fs::remove_file(&next)?;
     Ok(Some(next))
+}
+
+/// The first line of the file at `path` without its line ending, or `None`
+/// if the file does not exist.
+fn first_line(path: &Path) -> io::Result<Option<String>> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut line = String::new();
+    io::BufReader::new(file).read_line(&mut line)?;
+    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+}
+
+/// Whether the file at `path` exists and has a line equal to `line`.
+fn contains_line(path: &Path, line: &str) -> io::Result<bool> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for candidate in io::BufReader::new(file).split(b'\n') {
+        let candidate = candidate?;
+        if candidate.strip_suffix(b"\r").unwrap_or(&candidate) == line.as_bytes() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -305,6 +369,79 @@ mod tests {
             format!("{NEXT_DAY_ENTRY}\n")
         );
         assert_eq!(entries(&dir), ["proxy.log.2026-01-02"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn finishes_a_merge_interrupted_before_the_next_days_file_was_removed() {
+        // The current file already holds the next day's entries, as after a
+        // merge that stopped before removing the next day's file.
+        let dir = scratch_dir("adopt-resume");
+        let merged = format!("earlier\n{NEXT_DAY_ENTRY}\nlater\n");
+        fs::write(dir.join("proxy.log.2026-01-02"), &merged).unwrap();
+        fs::write(
+            dir.join("proxy.log.2026-01-03"),
+            format!("{NEXT_DAY_ENTRY}\nlater\n"),
+        )
+        .unwrap();
+
+        let moved = adopt_next_day_log(&dir, "proxy.log", "2026-01-02", "2026-01-03").unwrap();
+
+        assert_eq!(moved, Some(dir.join("proxy.log.2026-01-03")));
+        assert_eq!(
+            fs::read_to_string(dir.join("proxy.log.2026-01-02")).unwrap(),
+            merged
+        );
+        assert_eq!(entries(&dir), ["proxy.log.2026-01-02"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replaces_a_stale_partial_merge() {
+        let dir = scratch_dir("adopt-stale-merging");
+        fs::write(dir.join("proxy.log.2026-01-02"), "earlier\n").unwrap();
+        fs::write(
+            dir.join("proxy.log.2026-01-03"),
+            format!("{NEXT_DAY_ENTRY}\n"),
+        )
+        .unwrap();
+        fs::write(dir.join("proxy.log.2026-01-02.merging"), "partial").unwrap();
+
+        adopt_next_day_log(&dir, "proxy.log", "2026-01-02", "2026-01-03").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.join("proxy.log.2026-01-02")).unwrap(),
+            format!("earlier\n{NEXT_DAY_ENTRY}\n")
+        );
+        assert_eq!(entries(&dir), ["proxy.log.2026-01-02"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn removes_incomplete_copies_only() {
+        let dir = scratch_dir("incomplete-copies");
+        for name in [
+            "proxy.log.2026-01-01.restoring",
+            "proxy.log.2026-01-02.merging",
+            "proxy.log.2026-01-02",
+            "proxy.log.2026-01-01.gz",
+            "proxy.log.notes.merging",
+            "other.log.2026-01-02.merging",
+        ] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+
+        remove_incomplete_copies(&dir, "proxy.log");
+
+        assert_eq!(
+            entries(&dir),
+            [
+                "other.log.2026-01-02.merging",
+                "proxy.log.2026-01-01.gz",
+                "proxy.log.2026-01-02",
+                "proxy.log.notes.merging",
+            ]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
