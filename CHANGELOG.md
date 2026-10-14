@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.18] - 2026-10-13
+
+### Fixed
+
+- Stop relaying hop-by-hop header fields (RFC 9110 §7.6.1) between clients, local `llama-server` instances, and cluster peers. Responses passed `llama-server`'s keep-alive policy (`Keep-Alive: timeout=5, max=100`) to clients as if it were the proxy's own, and the `Connection: close` that `llama-server` sends when it retires a connection made the proxy close the client's connection as well, disconnecting persistent clients whenever an upstream connection reached its request limit. In the other direction, a client's `Connection: close` was forwarded to local instances, which then closed the pooled upstream connection after each such request. `Connection` and the fields it names, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, and `Upgrade` are now removed from requests and responses on every relay path.
+
 ## [1.21.17] - 2026-10-13
 
 ### Fixed

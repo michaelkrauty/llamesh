@@ -1015,6 +1015,7 @@ Each instance is a `llama-server` process spawned by the proxy:
 Once an instance is selected and ready:
 
 * Proxy takes the OpenAI-style request, resolves `model` to a backend profile, and forwards it to the corresponding `llama-server` OpenAI endpoint (`/v1/chat/completions`, `/v1/embeddings`, etc.) without changing field names or semantics beyond model/profile mapping.
+* Hop-by-hop header fields (RFC 9110 §7.6.1) are never relayed, in either direction, on any path (local instance or cluster peer, streaming or not): `Connection` and every field it names, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, and `Upgrade`. The client's connection to the proxy and the proxy's connections to instances and peers each manage their own persistence and framing, so, for example, the `Connection: close` that `llama-server` sends when it retires a pooled connection does not close the client's connection. `Host` and `Content-Length` are set for each outbound request.
 * For streaming:
 
   * Establish an HTTP connection to `llama-server` via reqwest.

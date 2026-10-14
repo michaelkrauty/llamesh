@@ -1,7 +1,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
-    http::StatusCode,
+    http::{header::CONNECTION, HeaderValue, StatusCode},
     middleware::Next,
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
@@ -94,6 +94,37 @@ async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next:
     next.run(req).await
 }
 
+/// Mimic the connection-management headers `llama-server` (cpp-httplib) puts
+/// on every response: the keep-alive policy, or `Connection: close` on the last
+/// response of a connection. Neither may reach the proxy's clients.
+///
+/// Test hook: `MOCK_CONNECTION_CLOSE=1` makes every response the last on its
+/// connection. Test hook: `MOCK_ECHO_REQUEST_HEADERS=1` lists the names of the
+/// received request headers in `x-mock-request-headers`, so tests can check
+/// what the proxy forwarded.
+async fn connection_headers(req: Request, next: Next) -> Response {
+    let received = env_flag("MOCK_ECHO_REQUEST_HEADERS").then(|| {
+        let mut names: Vec<&str> = req.headers().keys().map(|name| name.as_str()).collect();
+        names.sort_unstable();
+        names.join(",")
+    });
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    if env_flag("MOCK_CONNECTION_CLOSE") {
+        headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    } else {
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5, max=100"));
+    }
+    if let Some(value) = received.and_then(|names| HeaderValue::from_str(&names).ok()) {
+        headers.insert("x-mock-request-headers", value);
+    }
+    response
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value == "1")
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -132,6 +163,7 @@ async fn main() {
             state.clone(),
             auth_middleware,
         ))
+        .layer(axum::middleware::from_fn(connection_headers))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse().unwrap();
