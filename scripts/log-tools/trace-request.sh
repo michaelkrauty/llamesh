@@ -21,7 +21,7 @@ trace_node() {
     echo "=== $label ===" >&2
     "$SCRIPT_DIR/fetch-logs.sh" "$node" "$DATE" 2>/dev/null | \
         jq -r "select(.span.request_id == \"$ID\" or .span.session_id == \"$ID\" or .spans[]?.request_id == \"$ID\" or .spans[]?.session_id == \"$ID\") |
-            \"\(.timestamp | split(\".\")[0]) [\(.level)] \(.target | split(\"::\")[-1]): \(.fields.message // .fields.event // \"?\")\"" 2>/dev/null || echo "(no matches)"
+            \"\(.timestamp | split(\".\")[0]) [\(.level)] \(.target | split(\"::\")[-1]): \(.fields.message // .fields.event // \"?\")\(if .fields.error then \" (error: \(.fields.error))\" else \"\" end)\"" 2>/dev/null || echo "(no matches)"
 }
 
 trace_node "local" "local"

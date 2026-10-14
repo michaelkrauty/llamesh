@@ -758,8 +758,9 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
 * `502 Bad Gateway`:
   * `type`: `"peer_forward_failed"` or `"upstream_error"`.
   * Conditions:
-    * `peer_forward_failed`: Peer forwarding failed (connection error, peer returned error).
-    * `upstream_error`: The local `llama-server` instance returned an error response.
+    * `peer_forward_failed`: A request to a cluster peer failed before the peer responded (connection, handshake, or transport error).
+    * `upstream_error`: A request to a local `llama-server` instance failed before its response was complete (for example, the connection was refused or reset, or `upstream_read_timeout_ms` elapsed), or a peer's response body could not be read. Error responses from an instance are relayed with their own status.
+  * The `message` names the step that failed followed by its underlying causes, for example `Upstream error: error sending request for url (...): operation timed out`.
 * `503 Service Unavailable`:
   * `type`: `"no_capacity"`, `"queue_full"`, `"queue_timeout"`, `"spawn_failures_exhausted"`, `"draining"`, or `"peer_unavailable_retry"`.
   * Conditions:
@@ -1410,7 +1411,7 @@ Examples of log events:
 
 ### Querying Error Logs
 
-`scripts/log-tools/errors.sh [local|remote|both] [YYYY-MM-DD] [limit]` prints recent `WARN` and `ERROR` entries from daily log files (defaults: both nodes, today, 50 entries per node). It requires Bash and `jq`, plus SSH for remote queries. Set `LLAMESH_LOCAL_LOG_DIR` to override the repository's `logs` directory. Remote queries require `LLAMESH_REMOTE_HOST`; set `LLAMESH_REMOTE_LOG_DIR` to the remote log directory (default: `./logs`, relative to the SSH login directory).
+`scripts/log-tools/errors.sh [local|remote|both] [YYYY-MM-DD] [limit]` prints recent `WARN` and `ERROR` entries from daily log files (defaults: both nodes, today, 50 entries per node). Entries that carry an `error` field show it after the message. It requires Bash and `jq`, plus SSH for remote queries. Set `LLAMESH_LOCAL_LOG_DIR` to override the repository's `logs` directory. Remote queries require `LLAMESH_REMOTE_HOST`; set `LLAMESH_REMOTE_LOG_DIR` to the remote log directory (default: `./logs`, relative to the SSH login directory).
 
 A successful query with no matching entries exits zero. Fetch or JSON parsing failures produce stderr diagnostics and a nonzero exit status. In `both` mode, both nodes are queried even if the first fails; failure on either node makes the overall command fail. Output may be partial when a query fails.
 

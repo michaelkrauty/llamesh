@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.20] - 2026-10-14
+
+### Fixed
+
+- Report why requests to local `llama-server` instances and cluster peers fail. Error logs and 502 responses carried only reqwest's description of the step that failed, such as `error sending request for url (...)`, which reads the same whether the connection was refused, reset, closed before the response arrived, or timed out. They now append the error's chain of causes, for example `error sending request for url (...): client error (SendRequest): connection closed before message completed`. A streaming response body that fails mid-stream, previously logged without the error, now records it in an `error` field, and the `scripts/log-tools` scripts print that field. Debug-level gossip failure logs include the causes as well.
+- Correct the `upstream_error` description in SPEC.md: it is returned when a request to a local instance fails before its response is complete, not when the instance returns an error response, which is relayed with its own status.
+
 ## [1.21.19] - 2026-10-13
 
 ### Fixed

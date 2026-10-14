@@ -4,6 +4,7 @@ use crate::errors::AppError;
 use crate::instance::Instance;
 use crate::metrics::{HashMetrics, Metrics};
 use crate::node_state::{NodeError, NodeState};
+use crate::util::error_chain;
 use axum::{
     body::Body,
     extract::{Path, State},
@@ -318,7 +319,10 @@ async fn attempt_peer_forward(
                         .await;
                     return ForwardOutcome::Transport(AppError::new(
                         StatusCode::BAD_GATEWAY,
-                        format!("Failed to read peer response body from {peer_id}: {e}"),
+                        format!(
+                            "Failed to read peer response body from {peer_id}: {}",
+                            error_chain(&e)
+                        ),
                         "peer_body_read_failed",
                     ));
                 }
@@ -332,7 +336,7 @@ async fn attempt_peer_forward(
         } => {
             let body = *body;
             let bytes = match body
-                .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())))
+                .map(|chunk| chunk.map_err(|e| std::io::Error::other(error_chain(&e))))
                 .try_fold(Vec::new(), |mut acc, chunk| async move {
                     acc.extend_from_slice(&chunk);
                     Ok(acc)
@@ -514,7 +518,7 @@ async fn send_peer_request(
         .map_err(|e| {
             AppError::new(
                 StatusCode::BAD_GATEWAY,
-                e.to_string(),
+                error_chain(&e),
                 "peer_forward_failed",
             )
         })?;
@@ -549,7 +553,11 @@ async fn send_peer_request(
             .map_err(|e| {
                 AppError::new(
                     StatusCode::BAD_GATEWAY,
-                    format!("Failed to forward to peer {}: {e}", request.peer_id),
+                    format!(
+                        "Failed to forward to peer {}: {}",
+                        request.peer_id,
+                        error_chain(&e)
+                    ),
                     "peer_forward_failed",
                 )
             })
@@ -1378,12 +1386,13 @@ pub async fn route_request(
                             }
                         }
                         Err(e) => {
-                            error!("Upstream error: {}", e);
+                            let detail = error_chain(&e);
+                            error!("Upstream error: {}", detail);
                             state.metrics.inc_errors();
                             // Guard handles dec_current_requests and in_flight cleanup
                             hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
 
-                            Err(AppError::upstream_error(format!("Upstream error: {e}")))
+                            Err(AppError::upstream_error(format!("Upstream error: {detail}")))
                         }
                     }
                 }
@@ -1898,13 +1907,16 @@ async fn handle_non_streaming_response(
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
+            let detail = error_chain(&e);
             error!(
                 event = "local_body_read_failed",
-                "Failed to read upstream response body: {}", e
+                "Failed to read upstream response body: {}", detail
             );
             record_local_body_read_error(&error_recorder);
-            return AppError::upstream_error(format!("Failed to read upstream response body: {e}"))
-                .into_response();
+            return AppError::upstream_error(format!(
+                "Failed to read upstream response body: {detail}"
+            ))
+            .into_response();
         }
     };
 
@@ -2019,7 +2031,7 @@ fn build_streaming_response_from_parts<S, E>(
 ) -> Response<Body>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
-    E: Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
+    E: std::error::Error + Into<Box<dyn std::error::Error + Send + Sync>> + 'static,
 {
     // Peer (Noise) stream: no local error recorder; a mid-stream abort is
     // counted in `PEER_STREAM_BODY_ABORTS` when `peer_stream` (a successful
@@ -2067,7 +2079,7 @@ async fn peer_response_to_client(
             } else {
                 let _cleanup_guard = AutoCleanup::new(cleanup);
                 match body
-                    .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())))
+                    .map(|chunk| chunk.map_err(|e| std::io::Error::other(error_chain(&e))))
                     .try_fold(Vec::new(), |mut acc, chunk| async move {
                         acc.extend_from_slice(&chunk);
                         Ok(acc)
@@ -2265,6 +2277,7 @@ fn process_line(line: &[u8], counter: &AtomicU64) {
 impl<S, E> Stream for CleanupStream<S, E>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error,
 {
     type Item = Result<Bytes, E>;
 
@@ -2283,6 +2296,7 @@ where
 impl<S, E> CleanupStream<S, E>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::error::Error,
 {
     /// Poll the upstream body, counting tokens and running cleanup at its end.
     fn poll_upstream(
@@ -2390,6 +2404,7 @@ where
                     if self.error_recorder.is_some() {
                         error!(
                             event = "local_stream_body_read_failed",
+                            error = %error_chain(&e),
                             "Local streaming body read failed"
                         );
                     }
@@ -2399,6 +2414,7 @@ where
                         PEER_STREAM_BODY_ABORTS.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             event = "peer_stream_body_aborted",
+                            error = %error_chain(&e),
                             "Forwarded peer streaming body aborted mid-stream"
                         );
                     }
@@ -3356,6 +3372,81 @@ mod tests {
             PEER_STREAM_BODY_ABORTS.load(Ordering::Relaxed),
             before + 1,
             "a clean peer stream does not count"
+        );
+    }
+
+    /// Captures formatted log output for assertions on emitted fields.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A body error whose cause is only reachable through `source()`.
+    #[derive(Debug)]
+    struct BodyError(std::io::Error);
+
+    impl std::fmt::Display for BodyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("request or response body error")
+        }
+    }
+
+    impl std::error::Error for BodyError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_stream_logs_the_cause_of_a_local_body_read_failure() {
+        use futures::StreamExt;
+        // A current-thread `#[tokio::test]` keeps the scoped subscriber on this
+        // thread across awaits.
+        let writer = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer({
+                let writer = writer.clone();
+                move || writer.clone()
+            })
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let metrics = Arc::new(Metrics::default());
+        let hm = metrics.get_hash_metrics("h").await;
+        let reset = std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        );
+        let inner =
+            futures::stream::iter(vec![Ok(Bytes::from("data: {}\n")), Err(BodyError(reset))]);
+        let mut s = CleanupStream::new(
+            inner,
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            Some((metrics, hm)),
+            false,
+        );
+        while s.next().await.is_some() {}
+
+        let logged = String::from_utf8(writer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("\"event\":\"local_stream_body_read_failed\""),
+            "missing failure event: {logged}"
+        );
+        assert!(
+            logged
+                .contains("\"error\":\"request or response body error: connection reset by peer\""),
+            "failure logged without its cause: {logged}"
         );
     }
 
