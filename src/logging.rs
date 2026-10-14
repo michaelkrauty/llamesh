@@ -99,9 +99,9 @@ fn reopen_compressed_log(
         let _ = fs::remove_file(&partial);
         return Err(e);
     }
-    // The entries are now in `current`; a leftover compressed copy would only
-    // be overwritten by the next rotation.
-    fs::remove_file(&compressed)?;
+    // The entries are now in `current`. Should removal fail, the next rotation
+    // overwrites the leftover with `current`, which holds the same entries.
+    let _ = fs::remove_file(&compressed);
     Ok(Some(current))
 }
 
