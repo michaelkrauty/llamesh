@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
+import gzip
 import os
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -28,6 +30,8 @@ class ErrorsScriptTest(unittest.TestCase):
             'case "${FAKE_SSH_RESULT:-ok}" in\n'
             '  ok) cat "${FAKE_REMOTE_LOG:?}" ;;\n'
             "  missing) exit 1 ;;\n"
+            '  run) shift; exec sh -c "$1" ;;\n'
+            '  simple) shift; exec python3 -c "import os, shlex, sys; argv = [os.path.expanduser(a) for a in shlex.split(sys.argv[1])]; os.execvp(argv[0], argv)" "$1" ;;\n'
             "  fail) printf '%s\\n' 'simulated ssh failure' >&2; exit 255 ;;\n"
             "esac\n"
         )
@@ -35,6 +39,9 @@ class ErrorsScriptTest(unittest.TestCase):
 
     def write(self, directory, text):
         (directory / LOG).write_text(text)
+
+    def write_compressed(self, directory, text):
+        (directory / f"{LOG}.gz").write_bytes(gzip.compress(text.encode()))
 
     def invoke(
         self,
@@ -44,6 +51,8 @@ class ErrorsScriptTest(unittest.TestCase):
         host="test-host",
         local_text=None,
         remote_text=None,
+        date=DATE,
+        tz=None,
     ):
         if local_text is not None:
             self.write(self.local, local_text)
@@ -57,8 +66,10 @@ class ErrorsScriptTest(unittest.TestCase):
             "FAKE_SSH_RESULT": result,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
         }
+        if tz is not None:
+            env["TZ"] = tz
         return subprocess.run(
-            ["bash", str(SCRIPT), node, DATE, "2"],
+            ["bash", str(SCRIPT), node, date, "2"],
             env=env,
             text=True,
             capture_output=True,
@@ -142,6 +153,69 @@ class ErrorsScriptTest(unittest.TestCase):
         self.assertIn("parse error", completed.stderr)
         self.assertIn("remote warning", completed.stdout)
         self.assertNotIn("(no errors)", completed.stdout)
+
+
+    def test_reads_compressed_rotated_logs(self):
+        # A rotated file exists only in compressed form when compression is
+        # enabled. The remote cases run the script's real SSH command as the
+        # remote login shell would: `run` as a POSIX shell, `simple` as a shell
+        # such as fish that runs a plain command but not sh syntax.
+        line = '{"timestamp":"2026-01-02T01:02:03.123Z","level":"ERROR","target":"app","fields":{"message":"rotated error"}}\n'
+        self.write_compressed(self.local, line)
+        self.write_compressed(self.remote, line)
+        for node, result in (("local", "ok"), ("remote", "run"), ("remote", "simple")):
+            with self.subTest(node=node, ssh=result):
+                completed = self.invoke(node, result=result)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    completed.stdout, "2026-01-02T01:02:03 [ERROR] app: rotated error\n"
+                )
+
+    def test_prefers_the_uncompressed_file(self):
+        stale = '{"timestamp":"2026-01-02T01:02:03.123Z","level":"ERROR","target":"app","fields":{"message":"compressed copy"}}\n'
+        current = '{"timestamp":"2026-01-02T01:02:04.123Z","level":"ERROR","target":"app","fields":{"message":"current file"}}\n'
+        for directory in (self.local, self.remote):
+            self.write_compressed(directory, stale)
+        for node, result in (("local", "ok"), ("remote", "run")):
+            with self.subTest(node=node):
+                completed = self.invoke(
+                    node, result=result, local_text=current, remote_text=current
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("current file", completed.stdout)
+                self.assertNotIn("compressed copy", completed.stdout)
+
+    def test_missing_compressed_and_uncompressed_remote_log_fails(self):
+        completed = self.invoke("remote", result="run")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Log file not found on", completed.stderr)
+
+    def test_shows_the_error_field(self):
+        completed = self.invoke(
+            local_text='{"timestamp":"2026-01-02T01:02:03.123Z","level":"ERROR","target":"app","fields":{"message":"Local streaming body read failed","error":"connection reset"}}\n'
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout,
+            "2026-01-02T01:02:03 [ERROR] app: Local streaming body read failed (error: connection reset)\n",
+        )
+
+    def test_defaults_to_the_current_utc_day(self):
+        # Log files are named by UTC day. Run under an offset that puts the
+        # local date on a different day, so a default taken from local time
+        # would name the wrong file.
+        now = datetime.now(timezone.utc)
+        tz, hours = ("<+14>-14", 14) if now.hour >= 12 else ("<-12>+12", -12)
+        utc_day = now.strftime("%Y-%m-%d")
+        self.assertNotEqual(utc_day, (now + timedelta(hours=hours)).strftime("%Y-%m-%d"))
+        (self.local / f"proxy.log.{utc_day}").write_text(
+            '{"timestamp":"2026-01-02T01:02:03.123Z","level":"WARN","target":"app","fields":{"message":"today"}}\n'
+        )
+        completed = self.invoke(date="", tz=tz)
+        if datetime.now(timezone.utc).strftime("%Y-%m-%d") != utc_day:
+            self.skipTest("the UTC day changed during the test")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("today", completed.stdout)
 
 
 if __name__ == "__main__":

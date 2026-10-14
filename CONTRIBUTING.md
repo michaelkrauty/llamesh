@@ -32,7 +32,7 @@ cargo test           # all tests pass
 Any new warning or formatting diff is attributable to the change that
 introduced it.
 
-For changes to the log-query scripts, also run `python3 tests/log_tools_test.py` (requires Bash and `jq`; SSH is mocked).
+For changes to the log-query scripts, also run `python3 tests/log_tools_test.py` (requires Bash, `jq`, and `gzip`; SSH is mocked).
 
 The Linux mDNS TTL regression (`cargo test --test integration_test_mdns_ttl`) requires `unshare` (util-linux), `ip` (iproute2), `timeout` (coreutils), and permission to create unprivileged user and network namespaces. It injects DNS packets only inside an isolated network namespace, never onto the host network. Missing isolation prerequisites fail the test explicitly.
 
