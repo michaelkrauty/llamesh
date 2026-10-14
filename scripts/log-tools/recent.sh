@@ -12,7 +12,7 @@ NODE="${1:-local}"
 LINES="${2:-20}"
 LEVEL="${3:-}"
 
-DATE="$(date +%Y-%m-%d)"
+DATE="$(date -u +%Y-%m-%d)"
 
 jq_filter='.'
 if [[ -n "$LEVEL" ]]; then

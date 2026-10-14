@@ -2,14 +2,14 @@
 # Show instance lifecycle events (spawn, ready, evict, kill)
 # Usage: instances.sh [node] [date] [model]
 #   node: local, remote, both (default: both)
-#   date: YYYY-MM-DD (default: today)
+#   date: YYYY-MM-DD, a UTC day (default: today in UTC)
 #   model: filter by model name (optional, partial match)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NODE="${1:-both}"
-DATE="${2:-$(date +%Y-%m-%d)}"
+DATE="${2:-$(date -u +%Y-%m-%d)}"
 MODEL="${3:-}"
 
 filter_instances() {

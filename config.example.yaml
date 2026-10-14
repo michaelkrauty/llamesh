@@ -285,7 +285,8 @@ metrics_path: "./node-metrics.json"
 # File Logging (optional)
 # -----------------------------------------------------------------------------
 
-# Enable file logging with daily rotation and gzip compression.
+# Enable file logging with daily rotation (at UTC midnight, matching the UTC
+# timestamps of the entries) and gzip compression.
 # Logs are written to both console (always) and file (when enabled).
 # logging:
 #   enabled: true              # Enable file logging (default: false)

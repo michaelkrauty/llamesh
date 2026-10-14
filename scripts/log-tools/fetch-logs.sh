@@ -2,7 +2,7 @@
 # Fetch logs from local or remote node
 # Usage: fetch-logs.sh [node] [date]
 #   node: "local", "node-a", "node-b" (default: local)
-#   date: YYYY-MM-DD (default: today)
+#   date: YYYY-MM-DD, a UTC day (default: today in UTC)
 #
 # Configure via environment variables:
 #   LLAMESH_LOCAL_LOG_DIR  - local log directory (default: ./logs)
@@ -12,7 +12,7 @@
 set -euo pipefail
 
 NODE="${1:-local}"
-DATE="${2:-$(date +%Y-%m-%d)}"
+DATE="${2:-$(date -u +%Y-%m-%d)}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOCAL_LOG_DIR="${LLAMESH_LOCAL_LOG_DIR:-${SCRIPT_DIR}/logs}"
