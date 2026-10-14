@@ -18,6 +18,16 @@ pub fn llamesh_binary(root: &Path) -> PathBuf {
 }
 
 pub async fn setup_mock_script(root: &Path, suffix: &str) -> PathBuf {
+    setup_mock_script_with_env(root, suffix, &[]).await
+}
+
+/// Like [`setup_mock_script`], with the given environment variables (the mock
+/// server's `MOCK_*` test hooks) exported to the mock server.
+pub async fn setup_mock_script_with_env(
+    root: &Path,
+    suffix: &str,
+    env: &[(&str, &str)],
+) -> PathBuf {
     let mock_script = root.join(format!("tests/mock_server_{suffix}.sh"));
     let mock_bin = std::env::var_os("CARGO_BIN_EXE_mock_llama_server")
         .map(PathBuf::from)
@@ -29,9 +39,13 @@ pub async fn setup_mock_script(root: &Path, suffix: &str) -> PathBuf {
                 root.join("target/release/mock_llama_server")
             }
         });
+    let exports: String = env
+        .iter()
+        .map(|(name, value)| format!("export {name}={value}\n"))
+        .collect();
     let script_content = format!(
         r#"#!/bin/bash
-BIN="{}"
+{exports}BIN="{}"
 "$BIN" "$@" &
 PID=$!
 trap "kill $PID" EXIT TERM INT

@@ -7,7 +7,10 @@ use crate::node_state::{NodeError, NodeState};
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header::RETRY_AFTER, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
+    http::{
+        header::{CONNECTION, CONTENT_LENGTH, HOST, RETRY_AFTER},
+        HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
+    },
     response::IntoResponse,
     response::Json,
     Extension,
@@ -375,33 +378,51 @@ async fn attempt_peer_forward(
     }
 }
 
-fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &str) -> HeaderMap {
-    let mut forward_headers = HeaderMap::new();
-    for (name, value) in source.iter() {
-        let name_lower = name.as_str().to_lowercase();
-        if matches!(
-            name_lower.as_str(),
-            "host"
-                | "content-length"
-                | "transfer-encoding"
-                | "connection"
-                | "keep-alive"
-                | "proxy-authenticate"
-                | "proxy-authorization"
-                | "te"
-                | "trailer"
-                | "upgrade"
-        ) {
-            continue;
-        }
-        // `append`, not `insert`: a client may send the same header name more
-        // than once (e.g. multiple Cookie lines), and `HeaderMap::iter` yields a
-        // separate pair per value. `insert` would replace all prior values for
-        // the name, silently dropping every value but the last before forwarding
-        // to a peer. `append` preserves them all (the first occurrence still
-        // creates the entry).
-        forward_headers.append(name.clone(), value.clone());
+/// Header fields that describe a single connection rather than the message
+/// (RFC 9110 §7.6.1), plus the obsolete `Proxy-Connection`. The proxy's client,
+/// peer, and `llama-server` connections each negotiate their own persistence,
+/// framing, and upgrades, so these fields are never relayed in either direction.
+const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Remove the hop-by-hop fields from a message about to be relayed: the fixed
+/// set above and any field its sender listed in `Connection`. Relaying them
+/// would apply one connection's state to another; for example, the
+/// `Connection: close` that `llama-server` sends on the last response of a
+/// pooled connection would also close the client's connection to the proxy.
+fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
+    let nominated: Vec<HeaderName> = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .collect();
+    for name in nominated {
+        headers.remove(name);
     }
+    for name in HOP_BY_HOP_HEADERS {
+        headers.remove(name);
+    }
+}
+
+fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &str) -> HeaderMap {
+    // A clone keeps every value of a repeated header (e.g. multiple Cookie
+    // lines), which a per-pair `insert` would collapse to the last one.
+    let mut forward_headers = source.clone();
+    remove_hop_by_hop_headers(&mut forward_headers);
+    // Set by the outbound transport for the forwarded request.
+    forward_headers.remove(HOST);
+    forward_headers.remove(CONTENT_LENGTH);
     forward_headers.insert(
         axum::http::header::HeaderName::from_static("x-llama-mesh-hops"),
         HeaderValue::from_str(&(current_hops + 1).to_string())
@@ -1154,9 +1175,9 @@ pub async fn route_request(
                     info!("Forwarding locally to {}", url);
 
                     let mut headers = parts.headers.clone();
-                    headers.remove(axum::http::header::HOST);
-                    headers.remove(axum::http::header::CONTENT_LENGTH);
-                    headers.remove(axum::http::header::TRANSFER_ENCODING);
+                    remove_hop_by_hop_headers(&mut headers);
+                    headers.remove(HOST);
+                    headers.remove(CONTENT_LENGTH);
 
                     // Inject authorization if the profile defines an API key
                     if let Some(api_key) = profile.get_api_key() {
@@ -1890,7 +1911,14 @@ fn build_non_streaming_body_response(
         info!("Failed to parse response as JSON");
     }
 
-    let mut response = Response::new(Body::from(bytes));
+    relayed_response(status, headers, Body::from(bytes))
+}
+
+/// Build the client-facing response for a response relayed from a local
+/// instance or a peer, without the upstream connection's hop-by-hop fields.
+fn relayed_response(status: StatusCode, mut headers: HeaderMap, body: Body) -> Response<Body> {
+    remove_hop_by_hop_headers(&mut headers);
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
@@ -1955,10 +1983,7 @@ fn build_streaming_response(
         peer_stream,
     );
     stream.downstream_wait = downstream_wait.map(DownstreamWait::new);
-    let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
+    relayed_response(status, headers, Body::from_stream(stream))
 }
 
 fn build_streaming_response_from_parts<S, E>(
@@ -1977,10 +2002,7 @@ where
     // counted in `PEER_STREAM_BODY_ABORTS` when `peer_stream` (a successful
     // streamed peer response — the otherwise-invisible 2xx-body-abort case).
     let stream = CleanupStream::new(stream, cleanup, tokens_generated, None, peer_stream);
-    let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
+    relayed_response(status, headers, Body::from_stream(stream))
 }
 
 async fn peer_response_to_client(
@@ -2718,6 +2740,114 @@ mod tests {
 
         // The request id is set.
         assert_eq!(forwarded.get("x-request-id").unwrap(), "req-123");
+    }
+
+    /// Every hop-by-hop field, plus a custom field the sender marks as
+    /// hop-by-hop by naming it in `Connection`.
+    fn headers_with_hop_by_hop_fields() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.append(CONNECTION, HeaderValue::from_static("close"));
+        headers.append(CONNECTION, HeaderValue::from_static("X-Hop-Scoped , te"));
+        headers.insert("x-hop-scoped", HeaderValue::from_static("1"));
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5, max=100"));
+        headers.insert("proxy-authenticate", HeaderValue::from_static("Basic"));
+        headers.insert(
+            "proxy-authorization",
+            HeaderValue::from_static("Basic eA=="),
+        );
+        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("te", HeaderValue::from_static("trailers"));
+        headers.insert("trailer", HeaderValue::from_static("x-checksum"));
+        headers.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        headers.insert("upgrade", HeaderValue::from_static("websocket"));
+        headers
+    }
+
+    fn assert_no_hop_by_hop_fields(headers: &HeaderMap) {
+        for name in HOP_BY_HOP_HEADERS.iter().chain(&["x-hop-scoped"]) {
+            assert!(headers.get(*name).is_none(), "{name} was relayed");
+        }
+    }
+
+    #[test]
+    fn remove_hop_by_hop_headers_keeps_only_end_to_end_fields() {
+        use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE};
+
+        let mut headers = headers_with_hop_by_hop_fields();
+        headers.append(COOKIE, HeaderValue::from_static("a=1"));
+        headers.append(COOKIE, HeaderValue::from_static("b=2"));
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        remove_hop_by_hop_headers(&mut headers);
+
+        assert_no_hop_by_hop_fields(&headers);
+        assert_eq!(headers.len(), 4, "unexpected fields: {headers:?}");
+        let cookies: Vec<_> = headers.get_all(COOKIE).iter().collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+        assert_eq!(headers[AUTHORIZATION], "Bearer token");
+        assert_eq!(headers[CONTENT_TYPE], "application/json");
+    }
+
+    #[test]
+    fn build_forward_headers_drops_hop_by_hop_fields() {
+        let mut source = headers_with_hop_by_hop_fields();
+        source.insert(HOST, HeaderValue::from_static("example.com"));
+        source.insert(CONTENT_LENGTH, HeaderValue::from_static("2"));
+        source.insert("x-end-to-end", HeaderValue::from_static("kept"));
+
+        let forwarded = build_forward_headers(&source, 0, "req-1");
+
+        assert_no_hop_by_hop_fields(&forwarded);
+        assert!(forwarded.get(HOST).is_none());
+        assert!(forwarded.get(CONTENT_LENGTH).is_none());
+        assert_eq!(forwarded["x-end-to-end"], "kept");
+        assert_eq!(forwarded["x-llama-mesh-hops"], "1");
+    }
+
+    #[test]
+    fn relayed_responses_drop_upstream_connection_fields() {
+        use axum::http::header::CONTENT_TYPE;
+
+        // What `llama-server` sends on the last response of a keep-alive
+        // connection, alongside the fields a client must still receive.
+        let mut upstream = headers_with_hop_by_hop_fields();
+        upstream.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        upstream.insert("x-accel-buffering", HeaderValue::from_static("no"));
+
+        let non_streaming = build_non_streaming_body_response(
+            StatusCode::OK,
+            upstream.clone(),
+            Bytes::from_static(b"{}"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let local_stream = {
+            let mut response = axum::http::Response::new("data: {}\n\n");
+            *response.headers_mut() = upstream.clone();
+            build_streaming_response(
+                reqwest::Response::from(response),
+                Box::pin(async {}),
+                Arc::new(AtomicU64::new(0)),
+                None,
+                false,
+                None,
+            )
+        };
+        let peer_stream = build_streaming_response_from_parts(
+            StatusCode::OK,
+            upstream,
+            futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"data: {}\n\n"))]),
+            Box::pin(async {}),
+            Arc::new(AtomicU64::new(0)),
+            true,
+        );
+
+        for response in [non_streaming, local_stream, peer_stream] {
+            let headers = response.headers();
+            assert_no_hop_by_hop_fields(headers);
+            assert_eq!(headers[CONTENT_TYPE], "text/event-stream");
+            assert_eq!(headers["x-accel-buffering"], "no");
+        }
     }
 
     #[test]
