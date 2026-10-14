@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Tests in `tests/log_tools_test.py` for reading compressed log files (locally and through the remote command, including under a login shell that does not accept `sh` syntax), preferring the uncompressed file when both exist, printing the `error` field, and defaulting to the current UTC day.
+
 ## [1.21.23] - 2026-10-14
 
 ### Fixed
