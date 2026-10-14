@@ -916,7 +916,7 @@ On chosen node (or standalone):
 
    * Scan all matching instances under read lock, track the one with fewest in-flight requests.
    * Upgrade to write lock on the winner, re-check capacity (handles races).
-   * Dispatch the request to that instance. Requests to local instances share one HTTP client that retires idle pooled connections after 2 seconds, well below `llama-server`'s 5-second keep-alive, so a request is never sent on a connection the instance is closing.
+   * Dispatch the request to that instance. Requests to local instances share one HTTP client that retires idle pooled connections after 2 seconds, well below `llama-server`'s 5-second keep-alive. Streamed requests are sent with `Connection: close`, because `llama-server` closes its connection after every streamed response without announcing it. Together these ensure a request is never sent on a connection the instance is closing.
 5. If no instance has capacity and total instances < `max_instances` for that profile and resource guardrails allow:
 
    * Reserve the capacity slot (per-profile and node-wide) and estimated VRAM/sysmem before releasing the instances lock. Slot accounting transfers to the instances map on insertion; memory commitments follow the process through loading and teardown, including cancellation and failure cleanup.

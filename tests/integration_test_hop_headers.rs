@@ -6,8 +6,9 @@
 //! response of a keep-alive connection. Relaying that field would make the
 //! proxy close the client's connection as well, so the test drives several
 //! requests over one raw client connection and requires each to be answered.
-//! `MOCK_ECHO_REQUEST_HEADERS=1` reports the request header names the mock
-//! received, showing which client fields were forwarded.
+//! `MOCK_ECHO_REQUEST_HEADERS=1` reports the request header names and the
+//! `Connection` value the mock received, showing which client fields were
+//! forwarded.
 
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -187,7 +188,7 @@ async fn exchange(reader: &mut BufReader<TcpStream>, request: &[u8]) -> Option<R
         .ok()?
 }
 
-fn assert_relayed_cleanly(response: &RawResponse, label: &str) {
+fn assert_relayed_cleanly(response: &RawResponse, label: &str, stream: bool) {
     assert_eq!(response.status, 200, "{label}: unexpected status");
     for name in ["connection", "keep-alive"] {
         assert!(
@@ -205,12 +206,21 @@ fn assert_relayed_cleanly(response: &RawResponse, label: &str) {
         forwarded.contains(&"x-end-to-end"),
         "{label}: end-to-end client header was not forwarded: {forwarded:?}"
     );
-    for name in HOP_BY_HOP {
+    for name in HOP_BY_HOP.iter().filter(|name| **name != "connection") {
         assert!(
-            !forwarded.contains(&name),
+            !forwarded.contains(name),
             "{label}: client `{name}` forwarded to the instance: {forwarded:?}"
         );
     }
+    // The client's `Connection` is never forwarded. The proxy sends its own
+    // `Connection: close` with a streamed request, because `llama-server`
+    // closes the connection after a streamed response.
+    let expected = stream.then_some("close");
+    assert_eq!(
+        response.header("x-mock-request-connection"),
+        expected,
+        "{label}: unexpected `connection` sent to the instance"
+    );
 }
 
 #[tokio::test]
@@ -259,7 +269,7 @@ async fn hop_by_hop_headers_are_not_relayed() {
         let response = exchange(&mut client, &chat_request(stream))
             .await
             .unwrap_or_else(|| panic!("{label}: proxy closed the client connection"));
-        assert_relayed_cleanly(&response, &label);
+        assert_relayed_cleanly(&response, &label, stream);
         let marker: &[u8] = if stream { b"[DONE]" } else { b"\"choices\"" };
         assert!(
             response.body.windows(marker.len()).any(|w| w == marker),

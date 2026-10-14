@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.19] - 2026-10-13
+
+### Fixed
+
+- Stop reusing connections to local `llama-server` instances after streamed responses. `llama-server` closes its connection right after every streamed response without announcing it (the response even advertises keep-alive), so the proxy returned the connection to its pool. A request dispatched at that moment, as a queued request is when a finished stream releases its slot, could be written to the closing connection and fail with an upstream error before reaching the instance. Under bursts of concurrent streaming requests, about one request in 200 failed this way. Streamed requests now ask for `Connection: close`, so their connections are never pooled; non-streaming requests still reuse connections.
+
 ## [1.21.18] - 2026-10-13
 
 ### Fixed

@@ -415,6 +415,31 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
     }
 }
 
+/// Build the headers of a request forwarded to a local `llama-server` instance.
+///
+/// `llama-server` closes its connection after every streamed response without
+/// announcing it: its stream provider reports the finished stream as cancelled,
+/// so cpp-httplib drops the connection right after the terminal chunk although
+/// the response advertised keep-alive. A pooled connection reused at that moment
+/// (as it is by a queued request, which is dispatched as soon as the stream
+/// releases its slot) is already closing, and the request fails without a
+/// response. A streamed request therefore asks for `Connection: close`, keeping
+/// its connection out of the pool; the server would discard it anyway.
+pub(crate) fn build_local_upstream_headers(
+    source: &HeaderMap,
+    response_streaming: bool,
+) -> HeaderMap {
+    let mut headers = source.clone();
+    remove_hop_by_hop_headers(&mut headers);
+    // Set by the client for the outbound request.
+    headers.remove(HOST);
+    headers.remove(CONTENT_LENGTH);
+    if response_streaming {
+        headers.insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    headers
+}
+
 fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &str) -> HeaderMap {
     // A clone keeps every value of a repeated header (e.g. multiple Cookie
     // lines), which a per-pair `insert` would collapse to the last one.
@@ -1174,10 +1199,8 @@ pub async fn route_request(
 
                     info!("Forwarding locally to {}", url);
 
-                    let mut headers = parts.headers.clone();
-                    remove_hop_by_hop_headers(&mut headers);
-                    headers.remove(HOST);
-                    headers.remove(CONTENT_LENGTH);
+                    let mut headers =
+                        build_local_upstream_headers(&parts.headers, response_streaming);
 
                     // Inject authorization if the profile defines an API key
                     if let Some(api_key) = profile.get_api_key() {
@@ -2803,6 +2826,32 @@ mod tests {
         assert!(forwarded.get(CONTENT_LENGTH).is_none());
         assert_eq!(forwarded["x-end-to-end"], "kept");
         assert_eq!(forwarded["x-llama-mesh-hops"], "1");
+    }
+
+    #[test]
+    fn build_local_upstream_headers_close_streamed_connections_only() {
+        let mut source = headers_with_hop_by_hop_fields();
+        source.insert(HOST, HeaderValue::from_static("example.com"));
+        source.insert(CONTENT_LENGTH, HeaderValue::from_static("2"));
+        source.insert("x-end-to-end", HeaderValue::from_static("kept"));
+
+        // The client's own `Connection: close` is not forwarded.
+        let sized = build_local_upstream_headers(&source, false);
+        assert_no_hop_by_hop_fields(&sized);
+
+        // A streamed request asks the instance to close its connection.
+        let streamed = build_local_upstream_headers(&source, true);
+        let connection: Vec<_> = streamed.get_all(CONNECTION).iter().collect();
+        assert_eq!(connection, ["close"]);
+        let mut rest = streamed.clone();
+        rest.remove(CONNECTION);
+        assert_no_hop_by_hop_fields(&rest);
+
+        for headers in [sized, streamed] {
+            assert!(headers.get(HOST).is_none());
+            assert!(headers.get(CONTENT_LENGTH).is_none());
+            assert_eq!(headers["x-end-to-end"], "kept");
+        }
     }
 
     #[test]
