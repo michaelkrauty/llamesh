@@ -342,6 +342,8 @@ pub struct Instance {
     /// next one. The wedged-instance watchdog does not count such requests as
     /// waiting on the instance.
     pub streams_awaiting_downstream: Arc<AtomicUsize>,
+    /// Set by `claim_startup_failure`.
+    startup_failure_claimed: AtomicBool,
 }
 
 /// Transfer process ownership before returning: dropping a caller's wait must
@@ -446,6 +448,7 @@ impl Instance {
             llama_cpp_version: None,
             memory_reservation: None,
             streams_awaiting_downstream: Arc::new(AtomicUsize::new(0)),
+            startup_failure_claimed: AtomicBool::new(false),
         }
     }
 
@@ -576,20 +579,34 @@ impl Instance {
         self.parsed_params.lock().clone()
     }
 
+    /// Poll the instance's `/health` until it reports ready, the process
+    /// exits, or the startup timeout elapses.
+    ///
+    /// Takes the instance's lock rather than `&self`, and holds it only for
+    /// each brief state check, never across a probe or the pause between
+    /// probes. A load can take up to the startup timeout (an hour by default
+    /// for a Hugging Face download), and a read lock held for that long stops
+    /// every writer of this instance: a request joining it while it loads,
+    /// which takes the write lock while holding the instances map's lock, or
+    /// a cancelled request releasing its slot. Since tokio's lock queues
+    /// readers behind a waiting writer, either stalls every endpoint that
+    /// reads the instances map until the load finishes.
     pub async fn wait_for_ready(
-        &self,
+        instance: &tokio::sync::RwLock<Instance>,
         startup_timeout_secs: u64,
         api_key: Option<String>,
         client: &reqwest::Client,
     ) -> Result<()> {
-        let host = &self.host;
-        let check_host = if host == "0.0.0.0" || host == "::" {
-            "127.0.0.1"
-        } else {
-            host
+        let health_addr = {
+            let inst = instance.read().await;
+            let host = inst.host.as_str();
+            let check_host = if host == "0.0.0.0" || host == "::" {
+                "127.0.0.1"
+            } else {
+                host
+            };
+            format!("http://{}:{}/health", check_host, inst.port)
         };
-
-        let health_addr = format!("http://{}:{}/health", check_host, self.port);
         let start = Instant::now();
 
         // Enforce minimum timeout to prevent infinite wait
@@ -606,15 +623,14 @@ impl Instance {
                 break;
             }
 
-            if !self.is_alive() {
-                {
-                    let mut status = self.status.lock();
-                    *status = InstanceStatus::Failed;
+            {
+                let inst = instance.read().await;
+                if !inst.is_alive() {
+                    inst.mark_failed();
+                    return Err(anyhow!(
+                        "Instance process exited unexpectedly while waiting for readiness"
+                    ));
                 }
-                self.ready_signal.notify_waiters();
-                return Err(anyhow!(
-                    "Instance process exited unexpectedly while waiting for readiness"
-                ));
             }
 
             // Only use /health to determine readiness: it returns 503 while the
@@ -631,18 +647,14 @@ impl Instance {
             )
             .await
             {
-                self.mark_ready();
+                instance.read().await.mark_ready();
                 return Ok(());
             }
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        {
-            let mut status = self.status.lock();
-            *status = InstanceStatus::Failed;
-        }
-        self.ready_signal.notify_waiters();
+        instance.read().await.mark_failed();
         Err(anyhow!("Instance failed to become ready within timeout"))
     }
 
@@ -652,6 +664,11 @@ impl Instance {
         }
         let mut status = self.status.lock();
         *status = InstanceStatus::Ready;
+        self.ready_signal.notify_waiters();
+    }
+
+    fn mark_failed(&self) {
+        *self.status.lock() = InstanceStatus::Failed;
         self.ready_signal.notify_waiters();
     }
 
@@ -678,6 +695,25 @@ impl Instance {
     /// Whether the instance has finished loading and is serving requests.
     pub fn is_ready(&self) -> bool {
         matches!(*self.status.lock(), InstanceStatus::Ready)
+    }
+
+    /// Whether the instance's startup failed. Its process may still be
+    /// running briefly until the readiness task stops it.
+    pub fn has_failed(&self) -> bool {
+        matches!(*self.status.lock(), InstanceStatus::Failed)
+    }
+
+    /// Whether the instance is still loading its model.
+    pub fn is_loading(&self) -> bool {
+        matches!(*self.status.lock(), InstanceStatus::Starting)
+    }
+
+    /// Claim the handling of this instance's failed startup. Every request
+    /// waiting on the load wakes when it fails; the first to claim it counts
+    /// the failure and runs cold-start recovery, and the rest retry as if
+    /// they had arrived after the failure. Returns true for the first caller.
+    pub fn claim_startup_failure(&self) -> bool {
+        !self.startup_failure_claimed.swap(true, Ordering::AcqRel)
     }
 
     pub fn is_alive(&self) -> bool {

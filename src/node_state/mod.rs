@@ -449,6 +449,17 @@ impl Drop for SlotReleaseGuard {
         let inst = self.instance.clone();
         let state = self.state.clone();
         tokio::spawn(async move {
+            // A request that leaves while its instance loads keeps its slot
+            // until the load ends. Otherwise a load whose requests all left
+            // would be idle, and the idle sweep or a capacity eviction would
+            // kill it partway, so a client that retries after a timeout
+            // would restart the load every time instead of finding it done.
+            // Subscribe before checking, as the readiness wake is not stored.
+            let ready_signal = inst.read().await.ready_signal.clone();
+            let load_ended = ready_signal.notified();
+            if inst.read().await.is_loading() {
+                load_ended.await;
+            }
             let (model, profile, became_idle) = {
                 let mut i = inst.write().await;
                 i.in_flight_requests = i.in_flight_requests.saturating_sub(1);
@@ -1357,7 +1368,11 @@ impl NodeState {
             let instances = self.instances.read().await;
             for (id, inst_lock) in instances.iter() {
                 let inst = inst_lock.read().await;
+                // A failed startup, including the one that triggered this
+                // recovery, is retired on its own; evicting it frees nothing
+                // for the retry and must not count as progress.
                 if inst.in_flight_requests == 0
+                    && !inst.has_failed()
                     && !inst.draining.load(std::sync::atomic::Ordering::Relaxed)
                 {
                     to_remove.push((id.clone(), inst.port));
@@ -1759,13 +1774,27 @@ impl NodeState {
                             .observe_queue_wait(start.elapsed().as_millis() as u64);
                     }
 
-                    let (ready_signal, is_cold_start) = {
+                    // Register for the readiness wake before reading the
+                    // status: the readiness task wakes only waiters that
+                    // already exist (`notify_waiters` stores no permit), so
+                    // a waiter created after reading `Starting` would miss a
+                    // transition in between and wait forever.
+                    let ready_signal = inst.read().await.ready_signal.clone();
+                    let ready = ready_signal.notified();
+                    let is_cold_start = {
                         let r = inst.read().await;
                         let s = r.status.lock().clone();
                         if s == InstanceStatus::Ready {
                             return Ok(slot_guard.detach());
                         }
                         if s == InstanceStatus::Failed {
+                            // Another request waiting on this load already
+                            // handles its failure; retry as a new arrival.
+                            if !r.claim_startup_failure() {
+                                drop(r);
+                                drop(slot_guard);
+                                continue;
+                            }
                             // Instance failed immediately - check for cold-start OOM recovery
                             let is_cold = r.is_cold_start;
                             drop(r);
@@ -1818,11 +1847,11 @@ impl NodeState {
                             self.capacity_notify.notified().await;
                             continue; // Retry the loop
                         }
-                        (r.ready_signal.clone(), r.is_cold_start)
+                        r.is_cold_start
                     };
 
                     // Wait for ready signal
-                    ready_signal.notified().await;
+                    ready.await;
 
                     // Check status again
                     let r = inst.read().await;
@@ -1830,6 +1859,13 @@ impl NodeState {
                     if s == InstanceStatus::Ready {
                         return Ok(slot_guard.detach());
                     } else {
+                        // Another request waiting on this load already
+                        // handles its failure; retry as a new arrival.
+                        if !r.claim_startup_failure() {
+                            drop(r);
+                            drop(slot_guard);
+                            continue;
+                        }
                         // Instance failed after startup - check for cold-start OOM recovery
                         let is_cold = is_cold_start;
                         drop(r);
@@ -2139,7 +2175,9 @@ impl NodeState {
                 if reserve_slot {
                     let inst = inst_lock.read().await;
                     if inst.model_name == model_name && inst.profile_id == profile.id {
-                        if !inst.is_alive() {
+                        // A failed startup can still have a live process
+                        // until the readiness task stops it.
+                        if !inst.is_alive() || inst.has_failed() {
                             continue;
                         }
                         if inst.draining.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2156,6 +2194,7 @@ impl NodeState {
                     let inst = inst_lock.read().await;
                     if inst.model_name == model_name
                         && inst.profile_id == profile.id
+                        && !inst.has_failed()
                         && !inst.draining.load(std::sync::atomic::Ordering::Relaxed)
                     {
                         return Ok(inst_lock.clone());
@@ -2168,7 +2207,7 @@ impl NodeState {
                 let still_has_capacity =
                     max_concurrent == 0 || inst.in_flight_requests < max_concurrent;
                 let is_draining = inst.draining.load(std::sync::atomic::Ordering::Relaxed);
-                if still_has_capacity && inst.is_alive() && !is_draining {
+                if still_has_capacity && inst.is_alive() && !inst.has_failed() && !is_draining {
                     inst.in_flight_requests += 1;
                     inst.last_activity = std::time::Instant::now();
                     return Ok(inst_lock.clone());
@@ -2517,11 +2556,11 @@ impl NodeState {
             let ready_model = model_name.to_string();
             let ready_profile = profile.id.clone();
             tokio::spawn(async move {
+                let ready =
+                    Instance::wait_for_ready(&inst_clone, startup_timeout, api_key, &http_client)
+                        .await;
                 let inst = inst_clone.read().await;
-                if let Err(e) = inst
-                    .wait_for_ready(startup_timeout, api_key, &http_client)
-                    .await
-                {
+                if let Err(e) = ready {
                     error!("Instance {} failed to become ready: {}", inst.id, e);
                     inst.clear_startup_log();
                     let _ = inst.stop().await;
@@ -4671,6 +4710,7 @@ mod tests {
             "hash".into(),
             false,
         );
+        *inst.status.lock() = InstanceStatus::Ready;
         let inst_arc = Arc::new(RwLock::new(inst));
         // Simulate try_get_or_spawn's increment.
         inst_arc.write().await.in_flight_requests = 1;
@@ -4692,6 +4732,57 @@ mod tests {
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_release_guard_holds_slot_until_load_ends() {
+        // A request that leaves while its instance loads must keep the slot
+        // until the load ends: an instance with no slots held is idle, and
+        // the idle sweep would kill the load partway.
+        for outcome in [InstanceStatus::Ready, InstanceStatus::Failed] {
+            let mut config = minimal_node_config();
+            config.cluster.enabled = false;
+            let build_manager = BuildManager::new(config.llama_cpp.clone());
+            let state = Arc::new(
+                NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+                    .await
+                    .unwrap(),
+            );
+            let inst = Instance::new(
+                "inst-loading".into(),
+                "test".into(),
+                "default".into(),
+                "127.0.0.1".into(),
+                8000,
+                "hash".into(),
+                false,
+            );
+            assert!(inst.is_loading());
+            let inst_arc = Arc::new(RwLock::new(inst));
+            inst_arc.write().await.in_flight_requests = 1;
+
+            drop(SlotReleaseGuard::new(state.clone(), inst_arc.clone()));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert_eq!(
+                inst_arc.read().await.in_flight_requests,
+                1,
+                "the slot must be held while the instance loads"
+            );
+
+            // The load ends, as the readiness task reports it.
+            {
+                let inst = inst_arc.read().await;
+                *inst.status.lock() = outcome.clone();
+                inst.ready_signal.notify_waiters();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while inst_arc.read().await.in_flight_requests != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("slot not released after the load ended ({outcome:?})"));
         }
     }
 
@@ -5237,23 +5328,38 @@ mod tests {
         );
         inst_c.in_flight_requests = 1; // Active
 
+        // The failed load that triggered this recovery: idle, but retired on
+        // its own, so it is neither evicted nor counted.
+        let inst_d = Instance::new(
+            "inst-d".into(),
+            "model".into(),
+            "default".into(),
+            "host".into(),
+            8003,
+            test_args_hash.clone(),
+            true,
+        );
+        *inst_d.status.lock() = InstanceStatus::Failed;
+
         {
             let mut instances = state.instances.write().await;
             instances.insert("inst-a".into(), Arc::new(RwLock::new(inst_a)));
             instances.insert("inst-b".into(), Arc::new(RwLock::new(inst_b)));
             instances.insert("inst-c".into(), Arc::new(RwLock::new(inst_c)));
+            instances.insert("inst-d".into(), Arc::new(RwLock::new(inst_d)));
         }
 
-        // Should have 3 instances
-        assert_eq!(state.instances.read().await.len(), 3);
+        // Should have 4 instances
+        assert_eq!(state.instances.read().await.len(), 4);
 
         // Evict all idle instances
         let evicted = state.evict_all_idle_instances().await;
         assert_eq!(evicted, 2); // Should evict the 2 idle ones
 
-        // Should have 1 instance left (the active one)
-        assert_eq!(state.instances.read().await.len(), 1);
+        // The active instance and the failed load are left
+        assert_eq!(state.instances.read().await.len(), 2);
         assert!(state.instances.read().await.contains_key("inst-c"));
+        assert!(state.instances.read().await.contains_key("inst-d"));
     }
 
     #[tokio::test]
