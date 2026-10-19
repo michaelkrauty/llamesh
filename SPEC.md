@@ -63,19 +63,22 @@ src/
 │  ├─ mod.rs          — NodeState facade: instances, queues, resource tracking, routing scores, eviction
 │  ├─ model_index.rs  — Model/profile resolution with O(1) lookup, args hash computation
 │  ├─ peer_state.rs   — Peer state types for cluster gossip
-│  └─ port_pool.rs    — Port allocation for llama-server instances
+│  ├─ port_pool.rs    — Port allocation for llama-server instances
+│  └─ spawn_reservations.rs — Memory reservations for instances that are spawning or loading
 ├─ instance.rs        — llama-server process lifecycle, health polling, startup log parsing
 ├─ cluster.rs         — Mesh gossip loop, peer metadata exchange, mDNS integration
 ├─ build_manager.rs   — llama.cpp clone, build, smoke test, atomic symlink swap, version signaling
 ├─ circuit_breaker.rs — Per-peer circuit breaker (Closed/Open/HalfOpen with exponential backoff)
 ├─ metrics.rs         — Prometheus metrics, JSON snapshots, per-args-hash tracking
 ├─ memory_sampler.rs  — Real-time VRAM (NVML) and system memory (procfs) sampling
+├─ wedge_detector.rs  — Decision logic for the wedged-instance watchdog
+├─ connection.rs      — Client disconnect detection from the TCP socket state
 ├─ protocol_detect.rs — Single-port multiplexing: TLS vs HTTP/1.1 vs HTTP/2 (h2c) vs Noise protocol detection
 ├─ noise/
 │  ├─ mod.rs          — Noise Protocol context and error types
 │  ├─ handshake.rs    — Noise_XX handshake with HMAC token verification
 │  ├─ transport.rs    — Encrypted HTTP-over-Noise request/response transport
-│  ├─ keypair.rs      — Ed25519 keypair management
+│  ├─ keypair.rs      — X25519 static keypair management
 │  ├─ token.rs        — Cluster shared-secret token generation and storage
 │  ├─ known_peers.rs  — TOFU known-peers store with file persistence
 │  └─ permissions.rs  — File permission enforcement for secrets
@@ -86,13 +89,13 @@ src/
 ├─ logging.rs         — Structured JSON logging with daily rotation
 ├─ health.rs          — /healthz, /readyz probes
 ├─ security.rs        — TLS/mTLS setup, API key auth
-└─ util.rs            — Byte manipulation helpers
+└─ util.rs            — Retry with backoff, error-chain formatting, byte helpers
 ```
 
 Additional files:
 
 * `src/bin/mock_llama_server.rs` — Mock `llama-server` binary used by integration tests.
-* `tests/` — Integration tests (`integration_test.rs`, `integration_test_features.rs`, `integration_test_admin_auth.rs`, `loop_prevention_test.rs`, `stress_test.rs`) with shared test helpers in `tests/common/mod.rs`.
+* `tests/` — Integration tests (`integration_test*.rs`, `loop_prevention_test.rs`, `stress_test.rs`) with shared test helpers in `tests/common/mod.rs`, and `log_tools_test.py` for the scripts in `scripts/log-tools`.
 
 ---
 
@@ -192,9 +195,9 @@ cluster:
     config_dir: ~/.llama-mesh/           # Secrets directory (default)
     # private_key_path: null             # Override: config_dir/node.key
     # known_peers_path: null             # Override: config_dir/known_peers
-    # previous_key_path: null            # For key rotation
+    # previous_key_path: null            # Reserved for key rotation; currently has no effect
     allowed_keys: []                     # Enterprise: pin specific node keys
-    session_ttl_seconds: 3600            # Session cache lifetime (default: 1 hour)
+    session_ttl_seconds: 3600            # Reserved for session caching; currently has no effect
 
   # Gossip settings
   gossip_interval_seconds: 5
@@ -209,7 +212,7 @@ cluster:
     open_duration_max_ms: 60000          # Maximum backoff cap
     half_open_probe_interval_ms: 1000    # Min interval between recovery probes (0 = no gating)
 
-  # Action when peer llama.cpp version differs (default: "warn")
+  # Action when a peer runs a different llamesh version (default: "warn")
   version_mismatch_action: "warn"
 
 # HTTP server options
@@ -279,6 +282,7 @@ Environment variables take precedence over file-based configuration. This is for
 ```yaml
 cluster:
   enabled: true
+  gossip_interval_seconds: 5
 ```
 
 **Enterprise (WAN only):** Disable mDNS, explicit peers, pin allowed keys:
@@ -286,6 +290,7 @@ cluster:
 ```yaml
 cluster:
   enabled: true
+  gossip_interval_seconds: 5
   discovery:
     mdns: false
   peers: ["node-b.internal:8080", "node-c.internal:8080"]
@@ -301,6 +306,7 @@ cluster:
 ```yaml
 cluster:
   enabled: true
+  gossip_interval_seconds: 5
   discovery:
     mdns: true
   peers: ["remote-dc.example:8080"]
@@ -323,7 +329,7 @@ cluster:
 
 ### 2. Cookbook (Model & Profile Definitions)
 
-**Hot Reloading:** The cookbook file is watched for changes using filesystem events. When you modify `cookbook.yaml`, the proxy automatically reloads the configuration without requiring a restart. This allows you to add new models, modify profiles, or disable models on-the-fly. Running instances are not affected by cookbook changes until they become idle and are restarted.
+**Hot Reloading:** The cookbook file is watched for changes using filesystem events. When you modify `cookbook.yaml`, the proxy automatically reloads the configuration without requiring a restart. This allows you to add new models, modify profiles, or disable models on-the-fly. A running instance whose launch arguments changed, or whose model or profile was removed or disabled, is marked draining at once: it takes no new requests and stops when its in-flight requests finish, and new requests start an instance with the new configuration. Other running instances are unaffected. Launch arguments are compared through the profile's args hash, which leaves out `--host` and `--port` and treats the remaining arguments as an unordered set, so a change to only those two options, or one that only swaps values between options, does not drain the instance.
 
 Example `cookbook.yaml`:
 
@@ -507,9 +513,9 @@ cargo build --release
 
 All file locations are configurable, but the defaults are self-contained:
 
-* By default, the proxy looks for `config.yaml`, `cookbook.yaml`, and optional `secrets.yaml` in the same directory as the node entry binary (or current working directory when launched).
-* You can override these with CLI flags such as `--config PATH`, `--cookbook PATH`, `--secrets PATH`, and with config options like `llama_cpp.repo_path`, `metrics_path`, and `log_dir` if implemented.
-* Paths such as `llama_cpp.repo_path`, `llama_cpp.build_path`, `llama_cpp.binary_path`, TLS cert/key paths, metrics file path, and log directory are expected to be relative to the node entry directory by default, but may be set to absolute paths for more advanced deployments.
+* By default, the proxy looks for `config.yaml`, `cookbook.yaml`, and optional `secrets.yaml` in its working directory.
+* You can override these with CLI flags such as `--config PATH`, `--cookbook PATH`, `--secrets PATH`, and with config options like `llama_cpp.repo_path`, `metrics_path`, and `logging.directory`.
+* Paths such as `llama_cpp.repo_path`, `llama_cpp.build_path`, `llama_cpp.binary_path`, TLS cert/key paths, metrics file path, and log directory are resolved relative to the working directory when relative, and may be set to absolute paths for more advanced deployments.
 
 Recommended to run as a systemd service or under a supervisor.
 
@@ -570,7 +576,7 @@ Response:
       "created": 1732113600,
       "owned_by": "node-a",
       "permission": [],
-      "root": "gpt-oss-20b:fast",
+      "root": "gpt-oss-20b",
       "parent": null,
       "metadata": {
         "model": "gpt-oss-20b",
@@ -591,7 +597,7 @@ Response:
       "created": 1732113600,
       "owned_by": "node-a",
       "permission": [],
-      "root": "gpt-oss-20b:quality",
+      "root": "gpt-oss-20b",
       "parent": null,
       "metadata": {
         "model": "gpt-oss-20b",
@@ -665,7 +671,7 @@ Request (example):
 Behavior:
 
 * Resolves `model` to a reranking-capable profile in the cookbook.
-* Forwards the request to a reranking-capable `llama-server` instance using whatever reranking HTTP endpoint and JSON schema are defined by the deployed `llama-server` version (see `tools/server` docs) and maps the response into a JSON structure with scores per document.
+* Forwards the request to a reranking-capable `llama-server` instance using whatever reranking HTTP endpoint and JSON schema are defined by the deployed `llama-server` version (see `tools/server` docs), and returns its response unchanged.
 * If reranking is not configured or not supported by the underlying `llama-server` build, returns a 404 or 400 depending on implementation choice.
 
 ### Endpoints Summary
@@ -697,7 +703,7 @@ The proxy follows the same general error envelope and HTTP semantics as OpenAI's
 
 #### Error JSON Envelope
 
-All non-2xx responses use a JSON body of the form:
+Errors that the proxy's request handlers generate on the OpenAI-compatible endpoints, and its API-key authentication, body-read timeout, and draining errors on every endpoint, use a JSON body of the form below. An error response from a `llama-server` instance or a cluster peer is relayed with its own status and body, and a request the HTTP router rejects before any handler runs, such as one with the wrong method, gets the router's plain response; neither need follow this form.
 
 ```json
 {
@@ -746,9 +752,7 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
   * Conditions:
     * Request body read timed out (`body_read_timeout_ms`). This bounds body collection for inference endpoints, administrative prewarm, and HTTP gossip, including HTTPS and h2c ingress. It does not limit subsequent model loading or handler processing.
 * `409 Conflict`:
-  * `type`: `"conflict"`.
-  * Conditions:
-    * Administrative operations where a concurrent action conflicts (e.g., triggering a rebuild while one is already in progress).
+  * Returned by `POST /admin/rebuild-llama` while a rebuild is already in progress. Like the other results of the administrative endpoints (prewarm's `400`, `404`, and `503` outcomes), its body is `{"status": "error", "message": "...", ...}` rather than the error envelope. The health probes, including `/readyz` while the node is draining, likewise report `{"status": ..., "message": ...}`.
 * `413 Payload Too Large`:
   * Administrative prewarm or HTTP gossip JSON exceeds `request_body_limit_bytes`, including streamed bodies without a declared length. Inference endpoints retain their existing 400 response for body collection errors.
 * `500 Internal Server Error`:
@@ -762,14 +766,13 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
     * `upstream_error`: A request to a local `llama-server` instance failed before its response was complete (for example, the connection was refused or reset, or `upstream_read_timeout_ms` elapsed), or a peer's response body could not be read. Error responses from an instance are relayed with their own status.
   * The `message` names the step that failed followed by its underlying causes, for example `Upstream error: error sending request for url (...): operation timed out`.
 * `503 Service Unavailable`:
-  * `type`: `"no_capacity"`, `"queue_full"`, `"queue_timeout"`, `"spawn_failures_exhausted"`, `"draining"`, or `"peer_unavailable_retry"`.
+  * `type`: `"no_capacity"`, `"queue_full"`, `"queue_timeout"`, `"spawn_failures_exhausted"`, or `"draining"`.
   * Conditions:
     * `no_capacity`: No node or instance has capacity to serve the request.
     * `queue_full`: Per-model or global queue is full (always 503, not configurable).
     * `queue_timeout`: Request waited in queue longer than `max_wait_in_queue_ms`.
     * `spawn_failures_exhausted`: Local instance spawn failed repeatedly and no peer could serve the request.
     * `draining`: Node is shutting down and not accepting new requests.
-    * `peer_unavailable_retry`: Peer is temporarily unavailable, client should retry.
 
 For the `503` responses it generates, the proxy includes a `Retry-After` header hinting how long to wait before retrying: `5` seconds for transient conditions (`queue_full`, `queue_timeout`, `draining`) and `30` seconds for capacity-bound conditions (`no_capacity`, `spawn_failures_exhausted`).
 
@@ -959,7 +962,7 @@ Each instance is a `llama-server` process spawned by the proxy:
 
     * Example:
 
-      * `/path/to/llama-server -m /models/gpt-oss-20b-q4_K_M.gguf --alias gpt-oss-20b-fast -c 32768 -b 2048 --host 127.0.0.1 --port 8200 ...` (host is always `127.0.0.1`, port chosen by the proxy)
+      * `/path/to/llama-server -m /models/gpt-oss-20b-q4_K_M.gguf --alias gpt-oss-20b-fast -c 32768 -b 2048 --host 127.0.0.1 --port 8200 ...` (host `127.0.0.1` and a port chosen by the proxy, unless the profile sets `--host` or `--port`)
   * Inject `LD_LIBRARY_PATH` (prepends the binary's parent directory) to ensure shared libraries are found.
   * Record `start_time`, assigned `instance_id`, and estimated usage.
 
@@ -1218,7 +1221,7 @@ When enabled, Noise is used for cluster gossip and peer request forwarding. mTLS
 
 mTLS is still supported but deprecated in favor of Noise Protocol:
 
-* TLS 1.3 with mutual TLS.
+* Mutual TLS, over TLS 1.2 or 1.3.
 * All inbound TLS handshakes, including public HTTPS, have a fixed 30-second deadline after protocol detection, matching Noise negotiation. Expiry closes the connection; this deadline does not limit established HTTP requests.
 * Nodes trust a common CA.
 * Node identity is derived from certificate subject (e.g. `CN=node-a`) and strictly enforced against the sender's claimed node ID.
@@ -1356,7 +1359,7 @@ cluster:
 
 ### Graceful Shutdown
 
-* On first SIGTERM:
+* On the first SIGTERM or Ctrl-C:
 
   * Mark node as **draining**:
 
@@ -1366,10 +1369,13 @@ cluster:
     * Wake all requests blocked waiting for capacity so they can exit promptly.
   * Wait for in-flight requests and queues to drain up to `shutdown_grace_period_seconds`.
 
-* On second SIGTERM, or after grace period:
+* When the drain completes, or `shutdown_grace_period_seconds` runs out first:
 
-  * Call `process::exit(0)` for immediate hard exit.
-  * Child `llama-server` processes are cleaned up by the OS.
+  * Stop all local `llama-server` instances and exit.
+
+* On a second signal (SIGTERM or Ctrl-C):
+
+  * Exit immediately (`process::exit(0)`) without stopping instances. A supervisor that stops every process of the service, such as systemd with its default `KillMode=control-group`, stops the `llama-server` processes; otherwise they keep running.
 
 ---
 

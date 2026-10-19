@@ -15,7 +15,8 @@
 # Profile defaults:
 #   enabled: true                    # set false to hide/disable one profile
 #   idle_timeout_seconds: 300        # 5 minutes
-#   startup_timeout_seconds: 60      # 60s local, 3600s for HF downloads
+#   startup_timeout_seconds: 60      # load timeout for local models (model_path or -m)
+#   download_timeout_seconds: 3600   # download and load timeout for Hugging Face models (hf_repo or -hfr)
 #   max_instances: (from model_defaults)
 #   max_queue_size: (from model_defaults.max_queue_size_per_model)
 #   estimated_vram_mb: unset         # optional cold-start admission hint
@@ -38,7 +39,7 @@ models:
         description: "Lower context, higher throughput"
         model_path: "./models/gpt-oss-20b-q4_K_M.gguf"
         idle_timeout_seconds: 600    # default: 300
-        startup_timeout_seconds: 60  # default: 60 local, 3600 HF
+        startup_timeout_seconds: 60  # default: 60 (Hugging Face models use download_timeout_seconds)
         max_instances: 4             # 0=disabled, omit=use model_defaults
         max_queue_size: 128          # optional, per-profile queue limit
         max_wait_in_queue_ms: 45000  # optional, overrides model_defaults
