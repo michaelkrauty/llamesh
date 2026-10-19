@@ -2,7 +2,7 @@ use crate::config::LlamaCppConfig;
 use anyhow::{anyhow, Result};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,6 +53,9 @@ pub struct BuildManager {
     binary_swap_notify: Arc<tokio::sync::Notify>,
     last_build_error: Arc<RwLock<Option<String>>>,
     last_build_at: Arc<RwLock<Option<String>>>,
+    /// Build directories this process has prepared for a build; see
+    /// `prepare_build_dir`.
+    prepared_build_dirs: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl BuildManager {
@@ -66,6 +69,7 @@ impl BuildManager {
             binary_swap_notify: Arc::new(tokio::sync::Notify::new()),
             last_build_error: Arc::new(RwLock::new(None)),
             last_build_at: Arc::new(RwLock::new(None)),
+            prepared_build_dirs: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -332,7 +336,8 @@ impl BuildManager {
 
         // Build
         info!("Building llama.cpp in {}...", build_dir.display());
-        tokio::fs::create_dir_all(&build_dir).await?;
+        self.prepare_build_dir(&build_dir, &actual_binary_path)
+            .await?;
 
         // We need absolute path to repo for cmake -S if we are in build dir?
         // Or just relative. repo_path is likely relative.
@@ -376,6 +381,38 @@ impl BuildManager {
         }
 
         info!(event = "llama_build_success", commit = %commit_hash, binary_path = %self.config.binary_path);
+        Ok(())
+    }
+
+    /// Create `build_dir` for a build of `binary`, first removing it if an
+    /// earlier run of the proxy left it unfinished.
+    ///
+    /// A build directory that holds no binary, and that this process has not
+    /// prepared before, comes from a build that never completed. If a crash
+    /// or power loss interrupted that build, files being written at the time
+    /// can be left truncated, often to zero bytes, with timestamps newer than
+    /// their sources, so the build tool treats them as up to date and every
+    /// later build of the commit fails to link. Building from scratch is the
+    /// only reliable recovery. Retries within one run reuse the directory and
+    /// stay incremental: the crash this guards against also ends the run, and
+    /// repeating a deterministic build failure should not cost a full rebuild
+    /// each time.
+    async fn prepare_build_dir(&self, build_dir: &Path, binary: &Path) -> Result<()> {
+        let prepared_before = self.prepared_build_dirs.lock().contains(build_dir);
+        if !prepared_before
+            && !tokio::fs::try_exists(binary).await?
+            && tokio::fs::try_exists(build_dir).await?
+        {
+            warn!(
+                build_dir = %build_dir.display(),
+                "Removing an unfinished llama.cpp build left by an earlier run; building from scratch"
+            );
+            tokio::fs::remove_dir_all(build_dir).await?;
+        }
+        tokio::fs::create_dir_all(build_dir).await?;
+        self.prepared_build_dirs
+            .lock()
+            .insert(build_dir.to_path_buf());
         Ok(())
     }
 
@@ -882,6 +919,11 @@ if [ "$1" = "--build" ]; then
     # Create the dummy binary
     # Arg 2 is usually the build dir
     BUILD_DIR="$2"
+    # A truncated object from an interrupted build fails the link.
+    if [ -e "$BUILD_DIR/truncated.o" ]; then
+        echo "undefined reference" >&2
+        exit 2
+    fi
     mkdir -p "$BUILD_DIR/bin"
     echo '#!/bin/sh' > "$BUILD_DIR/bin/llama-server"
     echo 'exit 0' >> "$BUILD_DIR/bin/llama-server"
@@ -903,8 +945,25 @@ fi
 
         // 4. Prepare Config
         let repo_path = temp_dir.join("local_repo");
-        let build_path = repo_path.join("build"); // BuildManager appends hash
+        // Outside the repo, so a build directory can exist before the clone.
+        let build_path = temp_dir.join("builds").join("build"); // BuildManager appends hash
         let binary_path = temp_dir.join("llama-server-link");
+
+        // An earlier run was interrupted while building this commit, leaving
+        // a truncated object and no binary. The build must start over.
+        let commit = std::process::Command::new("git")
+            .current_dir(&remote_repo)
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .expect("Failed to read the commit");
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        let unfinished_build = temp_dir
+            .join("builds")
+            .join(format!("build-{}", commit.trim()));
+        tokio::fs::create_dir_all(&unfinished_build).await.unwrap();
+        tokio::fs::write(unfinished_build.join("truncated.o"), b"")
+            .await
+            .unwrap();
 
         let config = LlamaCppConfig {
             repo_url: remote_repo.to_string_lossy().to_string(),
@@ -1342,6 +1401,83 @@ fi
 
         buf.clear();
         assert!(!read_line_capped(&mut reader, &mut buf, cap).await.unwrap());
+    }
+
+    fn prepare_test_manager(temp_dir: &Path) -> BuildManager {
+        BuildManager::new(crate::config::LlamaCppConfig {
+            repo_url: String::new(),
+            repo_path: temp_dir.to_string_lossy().to_string(),
+            build_path: temp_dir.join("build").to_string_lossy().to_string(),
+            binary_path: temp_dir.join("llama-server").to_string_lossy().to_string(),
+            branch: String::new(),
+            build_args: vec![],
+            build_command_args: vec![],
+            auto_update_interval_seconds: 0,
+            enabled: true,
+            keep_builds: 3,
+        })
+    }
+
+    #[tokio::test]
+    async fn prepare_build_dir_discards_unfinished_build_from_earlier_run() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build-aaaaaaaaa");
+        let binary = build_dir.join("bin").join("llama-server");
+        // An earlier run was interrupted mid-build: an object file truncated
+        // to zero bytes, and no binary.
+        let truncated = build_dir.join("CMakeFiles").join("server.cpp.o");
+        tokio::fs::create_dir_all(truncated.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&truncated, b"").await.unwrap();
+
+        let bm = prepare_test_manager(temp_dir.path());
+        bm.prepare_build_dir(&build_dir, &binary).await.unwrap();
+
+        assert!(build_dir.is_dir());
+        assert!(
+            !truncated.exists(),
+            "the unfinished build must be discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_build_dir_keeps_this_runs_partial_build() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build-aaaaaaaaa");
+        let binary = build_dir.join("bin").join("llama-server");
+        let bm = prepare_test_manager(temp_dir.path());
+
+        bm.prepare_build_dir(&build_dir, &binary).await.unwrap();
+        // This run's build fails partway; its retry builds incrementally.
+        let object = build_dir.join("server.cpp.o");
+        tokio::fs::write(&object, b"object").await.unwrap();
+        bm.prepare_build_dir(&build_dir, &binary).await.unwrap();
+
+        assert!(
+            object.exists(),
+            "a retry within the run must stay incremental"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_build_dir_keeps_a_build_that_produced_its_binary() {
+        // A build that got as far as linking the binary is rebuilt in place
+        // (its binary failed verification), as before.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let build_dir = temp_dir.path().join("build-aaaaaaaaa");
+        let binary = build_dir.join("bin").join("llama-server");
+        tokio::fs::create_dir_all(binary.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&binary, b"").await.unwrap();
+        let object = build_dir.join("server.cpp.o");
+        tokio::fs::write(&object, b"object").await.unwrap();
+
+        let bm = prepare_test_manager(temp_dir.path());
+        bm.prepare_build_dir(&build_dir, &binary).await.unwrap();
+
+        assert!(binary.exists() && object.exists());
     }
 
     #[tokio::test]

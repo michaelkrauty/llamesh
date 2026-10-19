@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.27] - 2026-10-19
+
+### Fixed
+
+- Recover from a llama.cpp build that a crash or power loss interrupted. Object files being written when the machine went down can be left truncated, often to zero bytes, yet newer than their sources, so the build tool treated them as up to date and every later build of that commit failed to link, with errors such as `undefined reference`, until upstream moved to a new commit. The node kept running its previous build in the meantime. When the node first builds a commit in a run, it now deletes that commit's build directory if the directory holds no `llama-server` binary, since it is left over from a build that never finished, and builds from scratch. Retries within the same run still build incrementally.
+
 ## [1.21.26] - 2026-10-19
 
 ### Fixed
