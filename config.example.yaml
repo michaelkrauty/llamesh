@@ -43,8 +43,8 @@ max_instances_per_node: 100
 # -----------------------------------------------------------------------------
 
 # Default model to use when client doesn't specify one (required)
-# Format: "model-name" or "model-name:profile"
-default_model: "gpt-oss-20b"
+# Format: "model-name" (its "default" profile) or "model-name:profile"
+default_model: "gpt-oss-20b:fast"
 
 # Default limits applied to all models unless overridden in cookbook (required)
 model_defaults:
@@ -216,7 +216,7 @@ cluster:
     # Override paths for specific files (optional)
     # private_key_path: "/path/to/node.key"
     # known_peers_path: "/path/to/known_peers"
-    # previous_key_path: "/path/to/old-node.key"  # For key rotation
+    # previous_key_path: "/path/to/old-node.key"  # Reserved for key rotation; currently has no effect
 
     # Enterprise: only accept connections from these public keys
     # Format: "noise25519:<base64-encoded-key>"
@@ -225,7 +225,8 @@ cluster:
       # - "noise25519:xAbC123...="
       # - "noise25519:yDeF456...="
 
-    # Session cache TTL in seconds (default: 3600)
+    # Reserved for Noise session caching, which is not implemented; currently
+    # has no effect (default: 3600)
     session_ttl_seconds: 3600
 
   # Circuit breaker for peer connections

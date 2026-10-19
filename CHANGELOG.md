@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.28] - 2026-10-19
+
+### Documentation
+
+- Make the README's Quick Start configuration load. It left out fields that have no default (`default_model`, `model_defaults`, `llama_cpp.branch`, `llama_cpp.auto_update_interval_seconds`, `cluster`, and `http`), so the proxy refused to start with it. The cluster snippets in README and SPEC now include the required `gossip_interval_seconds`.
+- Set `default_model` in `config.example.yaml` to `gpt-oss-20b:fast`. A bare model name selects its `default` profile, which the example cookbook does not define for that model, so requests without a `model` failed with `404` when the two examples were used together.
+- Mark `cluster.noise.session_ttl_seconds` and `cluster.noise.previous_key_path` as having no effect; they are reserved for session caching and key rotation, which are not implemented. Clarify in `cookbook.example.yaml` that `startup_timeout_seconds` applies to local models and `download_timeout_seconds` to Hugging Face models (`hf_repo` or `-hfr`).
+- Correct SPEC where it disagreed with the code: `version_mismatch_action` compares llamesh versions, not llama.cpp versions; a cookbook reload drains instances whose launch arguments, as compared by the args hash, changed, or whose model or profile was removed or disabled; the error envelope covers errors the proxy generates, while error responses from instances and peers are relayed as they are, and the administrative endpoints' own results and the health probes use `{"status": ..., "message": ...}`, with no `conflict` error type; the proxy never returns `peer_unavailable_retry`; after the shutdown grace period the node stops its instances and exits normally, and only a second signal (SIGTERM or Ctrl-C) exits at once, without stopping them; rerank responses are passed through unchanged; `/v1/models` reports the bare model name as `root`; mutual TLS accepts TLS 1.2 and 1.3; and default file paths are relative to the working directory, with the log directory set by `logging.directory`. The module layout, the list of test files, the key type in `noise/keypair.rs` (X25519), and the note on `--host` are updated as well.
+
 ## [1.21.27] - 2026-10-19
 
 ### Fixed

@@ -39,13 +39,31 @@ node_id: "my-node"
 listen_addr: "0.0.0.0:8080"
 max_vram_mb: 24000
 max_sysmem_mb: 64000
+default_model: "my-model"  # used when a request omits `model`
+
+model_defaults:
+  max_concurrent_requests_per_instance: 8
+  max_queue_size_per_model: 64
+  max_instances_per_model: 1
 
 llama_cpp:
   repo_url: "https://github.com/ggml-org/llama.cpp.git"
+  branch: "master"
   build_args:
     - "-DGGML_CUDA=ON"
+  auto_update_interval_seconds: 86400  # check for llama.cpp updates daily; 0 disables
   enabled: true
+
+cluster:
+  enabled: false
+  gossip_interval_seconds: 5
+
+http:
+  request_body_limit_bytes: 1048576
+  idle_timeout_seconds: 120
 ```
+
+Every field shown is required except `llama_cpp.build_args` and `llama_cpp.enabled`. See [config.example.yaml](config.example.yaml) for the rest, with their defaults.
 
 When NVIDIA NVML is available, llamesh counts device-wide VRAM usage against
 `max_vram_mb`, including GPU memory used by processes it does not manage.
@@ -105,6 +123,7 @@ Enable clustering to spread load across machines. Nodes discover each other and 
 ```yaml
 cluster:
   enabled: true
+  gossip_interval_seconds: 5
 ```
 
 **Explicit WAN peers:**
@@ -112,6 +131,7 @@ cluster:
 ```yaml
 cluster:
   enabled: true
+  gossip_interval_seconds: 5
   peers: ["other-node.example.com:8080"]
 ```
 
