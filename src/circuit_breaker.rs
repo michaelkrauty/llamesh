@@ -51,6 +51,9 @@ pub struct PeerCircuit {
     pub last_failure: Option<Instant>,
     pub last_state_change: Instant,
     pub consecutive_opens: u32,
+    /// When the circuit last left the closed state. Meaningful only while it
+    /// is open or half-open; reopens do not move it.
+    opened_at: Instant,
     /// Creation instant; epoch for `last_probe_ms`.
     created: Instant,
     /// Milliseconds since `created` of the most recently admitted probe
@@ -68,6 +71,7 @@ impl Default for PeerCircuit {
             last_failure: None,
             last_state_change: Instant::now(),
             consecutive_opens: 0,
+            opened_at: Instant::now(),
             created: Instant::now(),
             last_probe_ms: AtomicU64::new(0),
         }
@@ -340,16 +344,7 @@ impl CircuitBreaker {
                 }
                 circuit.success_count += 1;
                 if circuit.success_count >= self.config.success_threshold {
-                    // Transition to closed
-                    circuit.state = CircuitState::Closed;
-                    circuit.last_state_change = Instant::now();
-                    circuit.failure_count = 0;
-                    circuit.consecutive_opens = 0;
-                    circuit.reset_probe();
-                    tracing::info!(
-                        peer_id = %peer_id,
-                        "Circuit breaker closed after successful recovery"
-                    );
+                    Self::close_after_recovery(circuit, peer_id);
                     return true;
                 }
                 false
@@ -372,14 +367,7 @@ impl CircuitBreaker {
                     circuit.last_state_change = Instant::now();
                     circuit.success_count = 1;
                     if circuit.success_count >= self.config.success_threshold {
-                        circuit.state = CircuitState::Closed;
-                        circuit.failure_count = 0;
-                        circuit.consecutive_opens = 0;
-                        circuit.reset_probe();
-                        tracing::info!(
-                            peer_id = %peer_id,
-                            "Circuit breaker closed after successful recovery"
-                        );
+                        Self::close_after_recovery(circuit, peer_id);
                     } else {
                         // Probe pacing (last_probe_ms) deliberately persists
                         // through this transition: the next half-open probe
@@ -416,6 +404,7 @@ impl CircuitBreaker {
                     // Transition to open
                     circuit.state = CircuitState::Open;
                     circuit.last_state_change = Instant::now();
+                    circuit.opened_at = circuit.last_state_change;
                     circuit.consecutive_opens += 1;
                     circuit.success_count = 0;
                     circuit.reset_probe();
@@ -448,12 +437,24 @@ impl CircuitBreaker {
                     let backoff_ms = self
                         .calculate_backoff(circuit.consecutive_opens)
                         .as_millis() as u64;
-                    tracing::warn!(
-                        peer_id = %peer_id,
-                        consecutive_opens = circuit.consecutive_opens,
-                        backoff_ms,
-                        "Circuit breaker reopened after failure in half-open state"
-                    );
+                    let open_for_secs = circuit.opened_at.elapsed().as_secs();
+                    if self.reopen_logs_at_warn(circuit.consecutive_opens) {
+                        tracing::warn!(
+                            peer_id = %peer_id,
+                            consecutive_opens = circuit.consecutive_opens,
+                            backoff_ms,
+                            open_for_secs,
+                            "Circuit breaker reopened after failure in half-open state"
+                        );
+                    } else {
+                        tracing::debug!(
+                            peer_id = %peer_id,
+                            consecutive_opens = circuit.consecutive_opens,
+                            backoff_ms,
+                            open_for_secs,
+                            "Circuit breaker reopened after failure in half-open state"
+                        );
+                    }
                 }
             }
             CircuitState::Open => {
@@ -472,12 +473,24 @@ impl CircuitBreaker {
                     let backoff_ms = self
                         .calculate_backoff(circuit.consecutive_opens)
                         .as_millis() as u64;
-                    tracing::warn!(
-                        peer_id = %peer_id,
-                        consecutive_opens = circuit.consecutive_opens,
-                        backoff_ms,
-                        "Circuit breaker reopened after failed recovery probe"
-                    );
+                    let open_for_secs = circuit.opened_at.elapsed().as_secs();
+                    if self.reopen_logs_at_warn(circuit.consecutive_opens) {
+                        tracing::warn!(
+                            peer_id = %peer_id,
+                            consecutive_opens = circuit.consecutive_opens,
+                            backoff_ms,
+                            open_for_secs,
+                            "Circuit breaker reopened after failed recovery probe"
+                        );
+                    } else {
+                        tracing::debug!(
+                            peer_id = %peer_id,
+                            consecutive_opens = circuit.consecutive_opens,
+                            backoff_ms,
+                            open_for_secs,
+                            "Circuit breaker reopened after failed recovery probe"
+                        );
+                    }
                 }
             }
         }
@@ -511,6 +524,36 @@ impl CircuitBreaker {
         let backoff_ms = base.saturating_mul(2u64.pow(exponent)).min(max);
 
         Duration::from_millis(backoff_ms)
+    }
+
+    /// Whether the reopen that brought the circuit to `consecutive_opens` is
+    /// logged at WARN rather than DEBUG. A peer that stays down fails a
+    /// recovery probe once per backoff for as long as it is down — at the
+    /// default cap, once a minute — so logging every reopen at WARN buries
+    /// other warnings under one line per minute of the outage. Reopens that
+    /// lengthen the backoff are logged at WARN; once it stops growing, only
+    /// the 2^k-th reopens are, so the reminders thin out as the outage goes
+    /// on and an outage of n reopens logs O(log n) WARN lines.
+    fn reopen_logs_at_warn(&self, consecutive_opens: u32) -> bool {
+        consecutive_opens.is_power_of_two()
+            || self.calculate_backoff(consecutive_opens)
+                != self.calculate_backoff(consecutive_opens.saturating_sub(1))
+    }
+
+    /// Close a recovering circuit, reporting how long it was open.
+    fn close_after_recovery(circuit: &mut PeerCircuit, peer_id: &str) {
+        let consecutive_opens = circuit.consecutive_opens;
+        circuit.state = CircuitState::Closed;
+        circuit.last_state_change = Instant::now();
+        circuit.failure_count = 0;
+        circuit.consecutive_opens = 0;
+        circuit.reset_probe();
+        tracing::info!(
+            peer_id = %peer_id,
+            consecutive_opens,
+            open_for_secs = circuit.opened_at.elapsed().as_secs(),
+            "Circuit breaker closed after successful recovery"
+        );
     }
 
     /// Reset a peer's circuit (e.g., manual intervention)
@@ -991,5 +1034,123 @@ mod tests {
             logged.contains("\"backoff_ms\":10000"),
             "expected escalated reopen to log backoff_ms=10000; got: {logged}"
         );
+    }
+
+    /// The captured JSON log lines whose message is `message`.
+    fn logged_events(logged: &str, message: &str) -> Vec<serde_json::Value> {
+        logged
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["fields"]["message"] == message)
+            .collect()
+    }
+
+    /// `consecutive_opens` of each event logged at `level`.
+    fn opens_at_level(events: &[serde_json::Value], level: &str) -> Vec<u64> {
+        events
+            .iter()
+            .filter(|event| event["level"] == level)
+            .map(|event| event["fields"]["consecutive_opens"].as_u64().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn failed_probe_reopens_warn_while_backoff_grows_then_at_powers_of_two() {
+        let capture = crate::test_support::capture_logs(tracing::Level::DEBUG);
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration_base_ms: 5000,
+            open_duration_max_ms: 60000,
+            ..Default::default()
+        });
+
+        cb.record_failure("p", false).await; // opens: consecutive_opens = 1
+        for _ in 2..=64 {
+            cb.record_failure("p", true).await; // failed recovery probe
+        }
+
+        let reopens = logged_events(
+            &capture.contents(),
+            "Circuit breaker reopened after failed recovery probe",
+        );
+        assert_eq!(reopens.len(), 63, "every reopen is still logged");
+        // Backoffs 10s, 20s, 40s, then the 60s cap; past the cap, only the
+        // 2^k-th reopens warn and the rest are logged at DEBUG.
+        assert_eq!(
+            opens_at_level(&reopens, "WARN"),
+            vec![2, 3, 4, 5, 8, 16, 32, 64]
+        );
+        assert_eq!(opens_at_level(&reopens, "DEBUG").len(), 55);
+    }
+
+    #[tokio::test]
+    async fn half_open_reopens_at_fixed_backoff_warn_at_powers_of_two() {
+        let capture = crate::test_support::capture_logs(tracing::Level::DEBUG);
+        // base == max: the backoff never grows, so only the 2^k-th warn.
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 2,
+            open_duration_base_ms: 60000,
+            open_duration_max_ms: 60000,
+            ..Default::default()
+        });
+
+        cb.record_failure("p", false).await; // opens: consecutive_opens = 1
+        for _ in 2..=9 {
+            assert!(cb.record_success("p", true).await); // probe succeeds: half-open
+            cb.record_failure("p", true).await; // next probe fails: reopens
+        }
+
+        let reopens = logged_events(
+            &capture.contents(),
+            "Circuit breaker reopened after failure in half-open state",
+        );
+        assert_eq!(reopens.len(), 8, "every reopen is still logged");
+        assert_eq!(opens_at_level(&reopens, "WARN"), vec![2, 4, 8]);
+    }
+
+    #[tokio::test]
+    async fn outage_start_survives_reopens_and_recovery_reports_it() {
+        // Both close paths: from open (success_threshold 1) and from
+        // half-open (success_threshold 2).
+        for success_threshold in [1, 2] {
+            let capture = crate::test_support::capture_logs(tracing::Level::INFO);
+            let cb = CircuitBreaker::new(CircuitBreakerConfig {
+                failure_threshold: 1,
+                success_threshold,
+                ..Default::default()
+            });
+            let opened_at = |cb: &CircuitBreaker| {
+                let circuits = cb.circuits.try_read().unwrap();
+                circuits.get("p").unwrap().opened_at
+            };
+
+            cb.record_failure("p", false).await; // opens
+            let first_opened = opened_at(&cb);
+            cb.record_failure("p", true).await; // reopens
+            cb.record_failure("p", true).await; // reopens
+            assert_eq!(
+                opened_at(&cb),
+                first_opened,
+                "reopens keep the outage start"
+            );
+
+            for _ in 0..success_threshold {
+                assert!(cb.record_success("p", true).await);
+            }
+            assert_eq!(cb.get_state("p").await, CircuitState::Closed);
+
+            let closed = logged_events(
+                &capture.contents(),
+                "Circuit breaker closed after successful recovery",
+            );
+            assert_eq!(closed.len(), 1);
+            assert_eq!(closed[0]["fields"]["consecutive_opens"], 3);
+            assert!(closed[0]["fields"]["open_for_secs"].is_u64());
+
+            // The next outage starts its own clock.
+            cb.record_failure("p", false).await;
+            assert!(opened_at(&cb) > first_opened);
+        }
     }
 }
