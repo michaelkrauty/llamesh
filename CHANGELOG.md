@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.25] - 2026-10-19
+
+### Fixed
+
+- Keep a node responsive while one of its instances loads. A request for a model whose instance was still loading joined that instance while holding the lock on the node's instance list, then waited for the instance's own lock, which the readiness check held for the entire load. Requests for every model, the `/readyz`, `/v1/models`, `/metrics`, and `/cluster/nodes` endpoints, and the node's gossip to its peers all waited behind it until the load finished, which can take up to the startup timeout (an hour by default for a Hugging Face download); only `/healthz` kept answering. A request cancelled while its instance was loading caused the same stall. The readiness check now holds the instance's lock only while it reads the instance's state, not while it waits for the instance to answer.
+- Fix a race in which a request waiting for its instance to finish loading could miss the ready signal and wait until its client disconnected. The request checked that the instance was still loading and only then subscribed to the signal, so a load that completed in between went unnoticed. It now subscribes first.
+
 ## [1.21.24] - 2026-10-19
 
 ### Fixed

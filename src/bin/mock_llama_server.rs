@@ -52,6 +52,11 @@ struct Args {
     /// Keep /health unready until this file exists, without delaying bind.
     #[arg(long)]
     startup_ready_file: Option<std::path::PathBuf>,
+    /// Exit with an error, as a load that runs out of memory would, once this
+    /// file exists while /health is still unready. The file is removed, so
+    /// one file fails one load.
+    #[arg(long)]
+    startup_fail_file: Option<std::path::PathBuf>,
     /// Hold chat responses until this file exists, while health stays ready.
     #[arg(long)]
     response_ready_file: Option<std::path::PathBuf>,
@@ -143,6 +148,22 @@ async fn main() {
             id: i,
             state: 0,
             prompt: String::new(),
+        });
+    }
+
+    if let Some(fail_file) = args.startup_fail_file.clone() {
+        let ready_file = args.startup_ready_file.clone();
+        tokio::spawn(async move {
+            loop {
+                if ready_file.as_ref().is_some_and(|path| path.exists()) {
+                    return;
+                }
+                if std::fs::remove_file(&fail_file).is_ok() {
+                    eprintln!("Mock load failed");
+                    std::process::exit(1);
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
         });
     }
 
