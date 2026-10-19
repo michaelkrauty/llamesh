@@ -1118,6 +1118,7 @@ Each node is responsible for its local `llama.cpp`.
 * On update:
 
   * Configure and build `llama.cpp` with configured `build_args` in per-commit build directories (`build-<hash>/`).
+  * A commit's build directory that holds no `llama-server` binary when the node first builds into it is left over from an earlier run whose build never finished, and is deleted so the build starts from scratch. A crash or power loss during a build can leave object files truncated, often to zero bytes, but newer than their sources, which the build tool treats as up to date, so reusing the directory would fail every later build of that commit. Retries within the same run reuse the directory and build incrementally.
   * `keep_builds` controls how many previous (non-active) builds are retained for rollback (default 3); the build the live binary currently resolves to is always kept in addition, regardless of this count or age.
   * Run smoke test:
 
