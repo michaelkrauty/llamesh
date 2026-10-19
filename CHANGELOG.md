@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.29] - 2026-10-19
+
+### Fixed
+
+- Report the llama.cpp commit a node is running while its startup build keeps failing. The node keeps serving the build its `binary_path` symlink already points to, but `/version`, `/metrics`, `/metrics/json`, and its gossip, and so its peers' `/cluster/nodes`, reported `llama_cpp_version` as `unknown` until a later build succeeded, which can take until the next scheduled update. Until a build records the running commit, the version is now read from the build directory the live binary resolves to, as spawned instances already were. This also replaces the brief `unknown` right after a restart. `unknown` remains for a binary that is not a managed build.
+
 ## [1.21.28] - 2026-10-19
 
 ### Documentation

@@ -152,10 +152,21 @@ impl BuildManager {
         *self.last_build_at.write() = Some(chrono::Utc::now().to_rfc3339());
     }
 
+    /// The llama.cpp commit of the live binary: the one recorded by the last
+    /// successful build or symlink check, or, until one is recorded (at
+    /// startup, or while startup builds keep failing and the previous build
+    /// keeps serving), the commit in the build directory `binary_path`
+    /// resolves to. `"unknown"` when neither is available, as for a binary
+    /// that is not a managed build.
     pub async fn get_version(&self) -> String {
-        self.current_version
-            .read()
-            .clone()
+        let recorded = self.current_version.read().clone();
+        if let Some(version) = recorded {
+            return version;
+        }
+        tokio::fs::canonicalize(&self.config.binary_path)
+            .await
+            .ok()
+            .and_then(|resolved| version_from_resolved_binary(&resolved))
             .unwrap_or_else(|| "unknown".to_string())
     }
 
@@ -1155,6 +1166,28 @@ fi
     }
 
     #[tokio::test]
+    async fn get_version_falls_back_to_the_live_build_until_one_is_recorded() {
+        // While startup builds keep failing, the previous build keeps
+        // serving; its commit is read from the path the symlink resolves to.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let live = temp_dir.path().join("build-abcdef123").join("bin");
+        tokio::fs::create_dir_all(&live).await.unwrap();
+        tokio::fs::write(live.join("llama-server"), b"")
+            .await
+            .unwrap();
+        let link = temp_dir.path().join("llama-server");
+        std::os::unix::fs::symlink(live.join("llama-server"), &link).unwrap();
+        let mut config = prepare_test_manager(temp_dir.path()).config;
+        config.binary_path = link.to_string_lossy().to_string();
+        let bm = BuildManager::new(config);
+
+        assert_eq!(bm.get_version().await, "abcdef123");
+        // A recorded version, set after a swap, takes precedence.
+        bm.record_running_version("deadbeef");
+        assert_eq!(bm.get_version().await, "deadbeef");
+    }
+
+    #[tokio::test]
     async fn test_get_version_reflects_only_recorded_running_version() {
         let config = crate::config::LlamaCppConfig {
             repo_url: "".into(),
@@ -1170,9 +1203,10 @@ fi
         };
         let bm = BuildManager::new(config);
 
-        // Until a binary is actually swapped in, no commit is reported. This is
-        // what keeps the metric/snapshot from advertising a commit that is only
-        // checked out or still building.
+        // Until a binary is actually swapped in, no recorded commit is
+        // reported. This is what keeps the metric/snapshot from advertising a
+        // commit that is only checked out or still building. (This binary path
+        // does not resolve, so there is no live build to fall back to.)
         assert_eq!(bm.get_version().await, "unknown");
 
         // `record_running_version` is the sole setter and is only called after a

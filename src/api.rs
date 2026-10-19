@@ -1303,7 +1303,7 @@ mod tests {
 
     #[test]
     fn version_payload_passes_through_unknown_llama_cpp_version() {
-        // Before the startup build records the running commit, get_version()
+        // When the live binary's commit cannot be determined, get_version()
         // returns "unknown"; the endpoint surfaces that verbatim.
         let payload = version_payload("1.2.3", Some("unknown"));
         assert_eq!(payload["llama_cpp_version"], "unknown");
