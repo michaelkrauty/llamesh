@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.24] - 2026-10-19
+
+### Fixed
+
+- Stop logging a `WARN` for every failed recovery probe while a peer stays down. Each failed probe reopens the peer's circuit, once per backoff interval, so an unreachable peer added a warning every `open_duration_max_ms` (by default, every minute) for as long as it was down: a peer powered off overnight left hundreds of identical warnings that pushed every other entry out of `scripts/log-tools/errors.sh`. The circuit opening and the reopens that lengthen the backoff are still logged at `WARN`; once the backoff stops growing, only the reopens whose `consecutive_opens` is a power of two are, and the rest are logged at `DEBUG`. Reopen entries now carry `open_for_secs`, the seconds since the circuit opened, and the entry logged when the circuit closes reports `consecutive_opens` and `open_for_secs` for the whole outage.
+
 ### Added
 
 - Tests in `tests/log_tools_test.py` for reading compressed log files (locally and through the remote command, including under a login shell that does not accept `sh` syntax), preferring the uncompressed file when both exist, printing the `error` field, and defaulting to the current UTC day.
