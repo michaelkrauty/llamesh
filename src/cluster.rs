@@ -88,7 +88,11 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
             _ = interval.tick() => {}
             _ = gossip_trigger.notified() => {}
         }
+        // Read before the state snapshot: draining never reverts, so a round
+        // that sees it also advertises the node as not ready.
+        let announces_drain = state.draining.load(std::sync::atomic::Ordering::Relaxed);
         let my_state = state.get_self_peer_state().await;
+        let mut sends = Vec::new();
 
         // Collect all targets: seeds + mDNS-discovered + known peers
         let mut targets = std::collections::HashSet::new();
@@ -145,18 +149,25 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 known_peers: known_peers_info.clone(),
             };
 
-            // Acquire semaphore permit to limit concurrent tasks (with timeout)
-            let permit = match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                semaphore.clone().acquire_owned(),
-            )
-            .await
-            {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => continue, // Semaphore closed (shouldn't happen)
-                Err(_) => {
-                    debug!("Gossip to {} skipped: semaphore timeout", peer_url);
-                    continue; // Skip this peer this round
+            // Acquire semaphore permit to limit concurrent tasks (with timeout).
+            // The round that announces the drain takes none: it is sent once,
+            // and waiting for permits held by earlier rounds could delay it
+            // past the shutdown wait.
+            let permit = if announces_drain {
+                None
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    semaphore.clone().acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => Some(permit),
+                    Ok(Err(_)) => continue, // Semaphore closed (shouldn't happen)
+                    Err(_) => {
+                        debug!("Gossip to {} skipped: semaphore timeout", peer_url);
+                        continue; // Skip this peer this round
+                    }
                 }
             };
             // Use node_id as circuit breaker key to match routing code,
@@ -182,7 +193,7 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
             );
 
             // Spawn each gossip request to avoid head-of-line blocking in the loop
-            tokio::spawn(async move {
+            let send = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
                 if let Some(noise_context) = noise_context {
                     let mut headers = HeaderMap::new();
@@ -300,6 +311,17 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                     }
                 }
             });
+            if announces_drain {
+                sends.push(send);
+            }
+        }
+
+        if announces_drain {
+            // Shutdown waits for this before the process exits; otherwise an
+            // idle node could exit before the round that tells peers it is
+            // no longer ready has been sent.
+            futures::future::join_all(sends).await;
+            state.drain_gossip_sent.notify_one();
         }
     }
 }

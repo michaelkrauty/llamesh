@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.26] - 2026-10-19
+
+### Fixed
+
+- Fail over promptly from a node that is shutting down. When a node started draining, its peers kept sending it new requests until its next periodic gossip round, up to `gossip_interval_seconds` later, and some of those requests stalled or failed instead of going elsewhere:
+  - The node now sends a gossip round as soon as it starts draining, so its peers learn at once that it is no longer ready. Before exiting, it waits up to five seconds, within the shutdown grace period, for that round to be sent, so an idle node, whose drain finishes immediately, normally does not exit before its peers are told.
+  - The node now closes its listening socket when it starts draining, so new connections are refused immediately. The socket used to stay open until the drain finished, and the kernel kept accepting connections that the node never answered, so a client or peer that connected in that window waited for its own timeout (30 seconds for a peer's encrypted connection) instead of failing over. Requests in flight, and connections already accepted, are unaffected.
+- Let a draining node finish while a forwarded request is waiting for cluster capacity. A request that waits for capacity after a peer failed or was saturated checked whether its own node was draining only after the wait, but a drain wakes such waits once, when it begins, so a wait that started later could hold the drain open until the client gave up or the grace period ran out. It now fails with `503` `draining` instead, as requests waiting for local capacity already did.
+
 ## [1.21.25] - 2026-10-19
 
 ### Fixed
