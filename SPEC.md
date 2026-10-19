@@ -1186,7 +1186,7 @@ First gossip tick fires immediately on startup (no initial delay).
 
 Every `gossip_interval_seconds`, nodes exchange metadata including:
 
-* `node_id`, `version` (proxy version), `llama_cpp_version` (llama.cpp commit of the binary currently serving, or `unknown` if none recorded yet), supported models.
+* `node_id`, `version` (proxy version), `llama_cpp_version` (llama.cpp commit of the binary currently serving, or `unknown` if it cannot be determined), supported models.
 * `loaded_models`: Which models are currently loaded and running.
 * `model_stats`: Per-model metrics including tokens per second, queue length, and learned VRAM/sysmem usage.
 * `ready` flag: Whether the node is ready to serve (false when draining or binary is unavailable).
@@ -1355,7 +1355,7 @@ cluster:
 * `/version`:
 
   * Returns the proxy version, always: `{ "version": "1.16.0" }`. This endpoint is unauthenticated (like `/healthz` and `/readyz`).
-  * When the caller is authorized — i.e. API key auth is disabled, or an accepted key is presented — the response also includes the llama.cpp commit the node is currently running: `{ "version": "1.16.0", "llama_cpp_version": "dd4623a74" }`. The commit is an operational build detail otherwise exposed only by the authenticated `/metrics` and `/cluster/nodes` endpoints, so it is omitted for unauthenticated callers rather than widening what auth was configured to hide. `llama_cpp_version` is `"unknown"` until the startup build records the running commit.
+  * When the caller is authorized — i.e. API key auth is disabled, or an accepted key is presented — the response also includes the llama.cpp commit the node is currently running: `{ "version": "1.16.0", "llama_cpp_version": "dd4623a74" }`. The commit is an operational build detail otherwise exposed only by the authenticated `/metrics` and `/cluster/nodes` endpoints, so it is omitted for unauthenticated callers rather than widening what auth was configured to hide. Until a build or startup check records the running commit, including while startup builds keep failing and the previous build keeps serving, the commit is read from the build directory that `binary_path` resolves to. `llama_cpp_version` is `"unknown"` when that is not a managed build directory, such as for an unmanaged binary.
 
 ### Graceful Shutdown
 

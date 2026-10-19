@@ -875,20 +875,14 @@ impl NodeState {
     }
 
     /// The llama.cpp version of the binary new instances would currently be
-    /// spawned from. Prefers the build manager's recorded version; before one
-    /// is recorded (the startup window, or while initial-build retries are
-    /// still failing), derives it from the resolved configured binary path —
-    /// the same attribution used when spawning instances. `None` for
-    /// unmanaged binaries.
+    /// spawned from: the build manager's version, which before one is
+    /// recorded (the startup window, or while initial-build retries are still
+    /// failing) is derived from the resolved configured binary path — the
+    /// same attribution used when spawning instances. `None` for unmanaged
+    /// binaries.
     pub async fn current_llama_cpp_version(&self) -> Option<String> {
-        let recorded = self.build_manager.get_version().await;
-        if recorded != "unknown" {
-            return Some(recorded);
-        }
-        let resolved = tokio::fs::canonicalize(&self.config.llama_cpp.binary_path)
-            .await
-            .ok()?;
-        crate::build_manager::version_from_resolved_binary(&resolved)
+        let version = self.build_manager.get_version().await;
+        (version != "unknown").then_some(version)
     }
 
     /// Get parsed model params for a model:profile key from a ready instance
@@ -4854,6 +4848,8 @@ mod tests {
     #[tokio::test]
     async fn self_peer_state_excludes_disabled_profiles_from_supported_models() {
         let mut config = minimal_node_config();
+        // No live build to read a version from, wherever the tests run.
+        config.llama_cpp.binary_path = "/nonexistent/llama-server".into();
         config.cluster.enabled = false;
 
         let default_profile = sample_profile();
@@ -4901,8 +4897,9 @@ mod tests {
             .contains(&"local-model:zero-capacity".into()));
 
         // The self peer reports its llama.cpp version from the build manager.
-        // With no build recorded, get_version() yields the "unknown" sentinel,
-        // which is what gossip and /cluster/nodes will carry for this node.
+        // With no build recorded and no managed live binary, get_version()
+        // yields the "unknown" sentinel, which is what gossip and
+        // /cluster/nodes will carry for this node.
         assert_eq!(self_peer.llama_cpp_version, "unknown");
     }
 
