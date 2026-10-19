@@ -207,6 +207,10 @@ pub struct NodeState {
     /// an instance stops, starts, or is drained). Complements the periodic
     /// gossip interval for latency-sensitive state changes.
     pub gossip_trigger: Arc<Notify>,
+    /// Signalled (with a stored permit) once the gossip round that announces
+    /// this node is draining has been sent to every peer, so shutdown can
+    /// wait for it before the process exits.
+    pub drain_gossip_sent: Arc<Notify>,
     /// Per-peer count of requests this node has forwarded and that haven't
     /// completed yet. Updated instantly on route decisions and completions so
     /// routing does not have to wait for the next gossip tick to see that a
@@ -606,6 +610,7 @@ impl NodeState {
             test_hooks: Arc::new(guardrail_tests::TestHooks::default()),
             needs_eviction: Arc::new(RwLock::new(HashSet::new())),
             gossip_trigger: Arc::new(Notify::new()),
+            drain_gossip_sent: Arc::new(Notify::new()),
             peer_pending_forwards: Arc::new(RwLock::new(HashMap::new())),
             logged_peer_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             wedge_state: Arc::new(std::sync::Mutex::new(WedgeDetectorState::default())),

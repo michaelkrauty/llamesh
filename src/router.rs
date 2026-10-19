@@ -35,14 +35,18 @@ const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Wait for a capacity notification, but bail early if the client has
 /// disconnected. Returns `Err` if the client is gone.
+///
+/// The caller creates `capacity` from `capacity_notify.notified()` before it
+/// checks the state the wait depends on, such as the draining flag:
+/// `notify_waiters` wakes only the waiters that already exist.
 async fn wait_for_capacity_or_disconnect(
-    notify: &tokio::sync::Notify,
+    capacity: tokio::sync::futures::Notified<'_>,
     conn: &Option<ConnectionHandle>,
 ) -> Result<(), AppError> {
     match conn {
         Some(handle) => {
             tokio::select! {
-                _ = notify.notified() => Ok(()),
+                _ = capacity => Ok(()),
                 _ = crate::connection::poll_client_disconnect(handle, DISCONNECT_POLL_INTERVAL) => {
                     info!(event = "client_disconnected", "Client disconnected during capacity wait");
                     Err(AppError::client_disconnected())
@@ -50,7 +54,7 @@ async fn wait_for_capacity_or_disconnect(
             }
         }
         None => {
-            notify.notified().await;
+            capacity.await;
             Ok(())
         }
     }
@@ -891,6 +895,12 @@ pub async fn route_request(
             let mut last_probe_denied: Option<String> = None;
 
             loop {
+                // Every pass after the first follows a wait for capacity, and
+                // the drain may have begun meanwhile; do not forward again.
+                if state.draining.load(Ordering::Relaxed) {
+                    state.metrics.inc_errors();
+                    return Err(AppError::node_draining());
+                }
                 let selection_exclude = exclude_peer.take();
                 let Some(peer) = state
                     .find_peer_for_model(&model_to_use, selection_exclude.as_deref())
@@ -901,6 +911,7 @@ pub async fn route_request(
                     // it is currently filtered (open circuit, draining,
                     // stale). For the latter, wait for cluster state to
                     // change before giving up.
+                    let capacity = state.capacity_notify.notified();
                     if state.draining.load(Ordering::Relaxed) {
                         state.metrics.inc_errors();
                         return Err(AppError::node_draining());
@@ -936,15 +947,14 @@ pub async fn route_request(
                         );
                         if let Ok(res) = tokio::time::timeout(
                             probe_deadline,
-                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
+                            wait_for_capacity_or_disconnect(capacity, &conn_handle),
                         )
                         .await
                         {
                             res?;
                         }
                     } else {
-                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle)
-                            .await?;
+                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
                     }
                     continue;
                 };
@@ -1037,7 +1047,12 @@ pub async fn route_request(
                             "Peer reported saturation, waiting for cluster capacity"
                         );
                         drop(peer_forward_guard);
-                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+                        let capacity = state.capacity_notify.notified();
+                        if state.draining.load(Ordering::Relaxed) {
+                            state.metrics.inc_errors();
+                            return Err(AppError::node_draining());
+                        }
+                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
                         continue;
                     }
                     ForwardOutcome::ProbeDenied => {
@@ -1064,12 +1079,14 @@ pub async fn route_request(
                                     .half_open_probe_interval_ms
                                     .max(250),
                             );
+                            let capacity = state.capacity_notify.notified();
+                            if state.draining.load(Ordering::Relaxed) {
+                                state.metrics.inc_errors();
+                                return Err(AppError::node_draining());
+                            }
                             if let Ok(res) = tokio::time::timeout(
                                 probe_deadline,
-                                wait_for_capacity_or_disconnect(
-                                    &state.capacity_notify,
-                                    &conn_handle,
-                                ),
+                                wait_for_capacity_or_disconnect(capacity, &conn_handle),
                             )
                             .await
                             {
@@ -1093,7 +1110,12 @@ pub async fn route_request(
                             "Peer transport failure, waiting for cluster capacity to retry"
                         );
                         drop(peer_forward_guard);
-                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+                        let capacity = state.capacity_notify.notified();
+                        if state.draining.load(Ordering::Relaxed) {
+                            state.metrics.inc_errors();
+                            return Err(AppError::node_draining());
+                        }
+                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
                         continue;
                     }
                 }
@@ -1151,6 +1173,7 @@ pub async fn route_request(
             }
 
             // If node is draining (shutdown in progress), don't wait — bail out
+            let capacity = state.capacity_notify.notified();
             if state.draining.load(Ordering::Relaxed) {
                 state.metrics.inc_errors();
                 hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -1165,7 +1188,7 @@ pub async fn route_request(
                 profile = %profile.id,
                 "No node available, waiting for cluster capacity"
             );
-            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle).await?;
+            wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
             // Loop back to retry select_best_node
         };
 
@@ -1777,6 +1800,18 @@ pub async fn route_request(
                     }
                 }
 
+                // A drain wakes capacity waiters once, when it begins, so a
+                // wait registered after that could hold the drain open until
+                // the client gave up. Subscribe first, then fail if the drain
+                // has begun; the check after the wait covers a drain that
+                // begins during it.
+                let capacity = state.capacity_notify.notified();
+                if state.draining.load(Ordering::Relaxed) {
+                    state.metrics.inc_errors();
+                    hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    return Err(AppError::node_draining());
+                }
+
                 // Wait for cluster state to change (capacity freed, peer
                 // recovered, gossip update, drain finished) before retrying.
                 // Probe-denied attempts additionally wake at the next probe
@@ -1790,7 +1825,7 @@ pub async fn route_request(
                     Some(deadline) => {
                         if let Ok(res) = tokio::time::timeout(
                             deadline,
-                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
+                            wait_for_capacity_or_disconnect(capacity, &conn_handle),
                         )
                         .await
                         {
@@ -1798,8 +1833,7 @@ pub async fn route_request(
                         }
                     }
                     None => {
-                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle)
-                            .await?;
+                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
                     }
                     }
                 }
@@ -1836,6 +1870,12 @@ pub async fn route_request(
                         model = %model_name,
                         "No node available during retry, waiting for cluster capacity"
                     );
+                    let capacity = state.capacity_notify.notified();
+                    if state.draining.load(Ordering::Relaxed) {
+                        state.metrics.inc_errors();
+                        hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                        return Err(AppError::node_draining());
+                    }
                     // During a probe-denial episode the excluded recovering
                     // peer may be the only candidate; its probe slot frees by
                     // time passing, so bound the wait by the probe deadline.
@@ -1850,15 +1890,14 @@ pub async fn route_request(
                         );
                         if let Ok(res) = tokio::time::timeout(
                             probe_deadline,
-                            wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle),
+                            wait_for_capacity_or_disconnect(capacity, &conn_handle),
                         )
                         .await
                         {
                             res?;
                         }
                     } else {
-                        wait_for_capacity_or_disconnect(&state.capacity_notify, &conn_handle)
-                            .await?;
+                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
                     }
                 };
             }

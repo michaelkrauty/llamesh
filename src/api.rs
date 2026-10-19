@@ -173,6 +173,9 @@ async fn wait_for_shutdown_signal(state: Arc<NodeState>) {
     // Wake any requests blocked on capacity_notify so they can check
     // the draining flag and exit instead of blocking shutdown.
     state.capacity_notify.notify_waiters();
+    // Gossip now, so peers learn this node is no longer ready and stop
+    // routing to it, rather than at the next periodic round.
+    state.gossip_trigger.notify_one();
 }
 
 /// Spawns a background task that force-exits on second signal.
@@ -562,7 +565,15 @@ pub async fn start_server(config: NodeConfig, node_state: NodeState) -> anyhow::
     }
 
     tracing::info!("Shutdown signal received, stopping accept loop");
+    // Close the listening socket before draining. Left open, the kernel keeps
+    // completing handshakes into the accept backlog that no one accepts, so
+    // clients and peers wait out their own timeouts instead of being refused
+    // and failing over. Accepted connections are unaffected.
+    drop(listener);
+    let shutdown_deadline =
+        std::time::Instant::now() + Duration::from_secs(state.config.shutdown_grace_period_seconds);
     wait_for_drain(&state).await;
+    wait_for_drain_gossip(&state, shutdown_deadline).await;
     Ok(())
 }
 
@@ -1160,6 +1171,30 @@ async fn wait_for_drain(state: &NodeState) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// How long shutdown waits for the gossip round that tells peers this node
+/// is draining. A peer that cannot be reached in that time learns of the
+/// shutdown from its failed requests instead.
+const DRAIN_GOSSIP_WAIT: Duration = Duration::from_secs(5);
+
+/// Wait for the gossip round sent when draining began. An idle node finishes
+/// draining at once and could otherwise exit before that round runs. The
+/// wait ends by the shutdown grace period's deadline, so it never extends
+/// shutdown past it.
+async fn wait_for_drain_gossip(state: &NodeState, deadline: std::time::Instant) {
+    if !state.config.cluster.enabled {
+        return;
+    }
+    let wait = DRAIN_GOSSIP_WAIT.min(deadline.saturating_duration_since(std::time::Instant::now()));
+    if tokio::time::timeout(wait, state.drain_gossip_sent.notified())
+        .await
+        .is_err()
+    {
+        tracing::info!(
+            "Gossip round announcing the drain did not finish in time; finishing shutdown"
+        );
     }
 }
 
