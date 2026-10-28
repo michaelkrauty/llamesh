@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.40] - 2026-10-28
+
+### Fixed
+
+- Apply `max_request_duration_ms` to the response body of a request forwarded to a peer over Noise. The limit covered the connection and the response head but not the body, which was bounded only by the per-read inactivity timeout, so a peer that kept sending, such as a long streamed completion, held the request open past its configured duration. Forwarding over HTTP or TLS, and local requests, already applied it to the whole request.
+
 ## [1.21.39] - 2026-10-28
 
 ### Fixed

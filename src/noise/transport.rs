@@ -54,10 +54,14 @@ pub struct NoiseBodyStream {
     first_body: Option<Bytes>,
     pending: Option<NoiseBodyReadFuture>,
     done: bool,
-    /// Per-chunk inactivity bound on body reads. `None` leaves reads unbounded.
+    /// Per-chunk inactivity bound on body reads. `None` disables this bound.
     /// When set, each `recv_data` is wrapped in this timeout (reset per chunk),
     /// so a peer that goes silent mid-body cannot hold this node's slot forever.
     inactivity: Option<Duration>,
+    /// The request's `max_request_duration_ms` deadline, armed once for the
+    /// whole body: a read still pending when it passes fails. `None` when the
+    /// request has no duration limit.
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 /// Client-side response over Noise.
@@ -65,6 +69,8 @@ pub struct NoiseHttpResponse {
     pub head: NoiseResponseHead,
     session: NoiseSession,
     stream: TcpStream,
+    /// The deadline the request started with, carried into the body stream.
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl NoiseHttpResponse {
@@ -80,6 +86,9 @@ impl NoiseHttpResponse {
             pending: None,
             done: false,
             inactivity,
+            deadline: self
+                .deadline
+                .map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
         }
     }
 }
@@ -142,6 +151,9 @@ async fn request_with_connect_timeout(
     request: OutboundNoiseRequest<'_>,
     connect_timeout: Duration,
 ) -> Result<NoiseHttpResponse> {
+    let deadline = request
+        .timeout_duration
+        .map(|duration| tokio::time::Instant::now() + duration);
     let fut = async {
         let (mut session, mut stream) = tokio::time::timeout(
             connect_timeout,
@@ -175,11 +187,12 @@ async fn request_with_connect_timeout(
             head,
             session,
             stream,
+            deadline,
         })
     };
 
-    match request.timeout_duration {
-        Some(duration) => tokio::time::timeout(duration, fut)
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, fut)
             .await
             .map_err(|_| NoiseError::Transport("Noise request timed out".into()))?,
         None => fut.await,
@@ -488,6 +501,21 @@ impl Stream for NoiseBodyStream {
             return Poll::Ready(None);
         }
 
+        if self
+            .deadline
+            .as_mut()
+            .is_some_and(|deadline| deadline.as_mut().poll(cx).is_ready())
+        {
+            self.done = true;
+            self.pending = None;
+            self.session = None;
+            self.stream = None;
+            self.first_body = None;
+            return Poll::Ready(Some(Err(NoiseError::Transport(
+                "Noise request timed out".into(),
+            ))));
+        }
+
         if let Some(bytes) = self.first_body.take() {
             return Poll::Ready(Some(Ok(bytes)));
         }
@@ -531,6 +559,63 @@ impl Stream for NoiseBodyStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_body(deadline: Option<tokio::time::Instant>) -> NoiseBodyStream {
+        NoiseBodyStream {
+            session: None,
+            stream: None,
+            first_body: Some(Bytes::from_static(b"chunk")),
+            pending: Some(Box::pin(std::future::pending())),
+            done: false,
+            inactivity: None,
+            deadline: deadline.map(|deadline| Box::pin(tokio::time::sleep_until(deadline))),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_body_stream_deadline_interrupts_pending_read() {
+        use futures::StreamExt;
+
+        let mut body = pending_body(Some(tokio::time::Instant::now() + Duration::from_secs(1)));
+        assert_eq!(body.next().await.unwrap().unwrap(), b"chunk"[..]);
+        assert!(futures::poll!(body.next()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = futures::poll!(body.next());
+        assert!(matches!(result, Poll::Ready(Some(Err(_)))), "{result:?}");
+        assert!(body.next().await.is_none());
+        assert!(body.pending.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_body_stream_deadline_interrupts_buffering() {
+        use futures::TryStreamExt;
+
+        let body = pending_body(Some(tokio::time::Instant::now() + Duration::from_secs(1)));
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), body.try_collect::<Vec<_>>()).await;
+        assert!(matches!(result, Ok(Err(_))), "{result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_body_stream_deadline_precedes_first_byte() {
+        use futures::StreamExt;
+
+        let mut body = pending_body(Some(tokio::time::Instant::now() + Duration::from_secs(1)));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let result = body.next().await;
+        assert!(matches!(result, Some(Err(_))), "{result:?}");
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_body_stream_without_deadline_stays_pending() {
+        use futures::StreamExt;
+
+        let mut body = pending_body(None);
+        tokio::time::advance(Duration::from_secs(86400)).await;
+        assert_eq!(body.next().await.unwrap().unwrap(), b"chunk"[..]);
+        assert!(futures::poll!(body.next()).is_pending());
+    }
 
     #[test]
     fn test_connect_addr_from_url_preserves_host_and_port() {
@@ -643,6 +728,136 @@ mod tests {
             config: crate::config::ClusterNoiseConfig::default(),
             node_id: node_id.into(),
         }
+    }
+
+    async fn test_body_response(
+        timeout: Option<Duration>,
+        chunks: Option<usize>,
+    ) -> (NoiseHttpResponse, tokio::task::JoinHandle<()>) {
+        let dir = tempfile::tempdir().unwrap();
+        let token = crate::noise::token::generate();
+        let server = test_context(dir.path(), "server-node", &token);
+        let client = test_context(dir.path(), "client-node", &token);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let responder = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut session = crate::noise::handshake::respond(
+                &mut stream,
+                &server.keypair,
+                &server.cluster_token,
+                &server.node_id,
+            )
+            .await
+            .unwrap();
+            recv_request(&mut session, &mut stream).await.unwrap();
+            send_response_head(&mut session, &mut stream, 200, "OK", &HeaderMap::new())
+                .await
+                .unwrap();
+            let mut sent = 0;
+            while chunks.is_none_or(|chunks| sent < chunks) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if send_body_chunk(&mut session, &mut stream, b"chunk")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                sent += 1;
+            }
+            let _ = send_body_end(&mut session, &mut stream).await;
+        });
+        let response = request(
+            &client,
+            OutboundNoiseRequest {
+                peer_base_url: &url,
+                expected_peer_node_id: Some("server-node"),
+                method: "POST",
+                path: "/v1/chat/completions",
+                headers: &HeaderMap::new(),
+                body: b"{}",
+                timeout_duration: timeout,
+            },
+        )
+        .await
+        .unwrap();
+        (response, responder)
+    }
+
+    async fn assert_request_body_deadline(streaming: bool) {
+        use futures::{StreamExt, TryStreamExt};
+
+        let duration = Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+        let (response, responder) = test_body_response(Some(duration), None).await;
+        let inactivity = streaming.then(|| Duration::from_secs(1));
+        let mut body = response.into_body_stream(inactivity);
+        let mut chunks = 0;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            if streaming {
+                loop {
+                    match body.next().await {
+                        Some(Ok(_)) => chunks += 1,
+                        Some(Err(error)) => break Err(error),
+                        None => break Ok(()),
+                    }
+                }
+            } else {
+                body.by_ref()
+                    .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                        bytes.extend_from_slice(&chunk);
+                        Ok(bytes)
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        })
+        .await;
+        responder.abort();
+        let _ = responder.await;
+        let error = result
+            .expect("an active peer body must not outlive the request deadline")
+            .expect_err("an endless peer body must fail");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() >= duration);
+        // `started` precedes key setup and the handshake, which the deadline
+        // does not; leave room for them on a slow machine.
+        assert!(started.elapsed() < duration + Duration::from_secs(2));
+        if streaming {
+            assert!(chunks > 1, "active chunks must precede the timeout");
+            assert!(body.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_duration_bounds_streaming_body() {
+        assert_request_body_deadline(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_request_duration_bounds_buffered_body() {
+        assert_request_body_deadline(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_request_body_completes_before_deadline() {
+        use futures::TryStreamExt;
+
+        let (response, responder) = test_body_response(Some(Duration::from_secs(5)), Some(3)).await;
+        let chunks: Vec<_> = response.into_body_stream(None).try_collect().await.unwrap();
+        assert_eq!(chunks.concat(), b"chunkchunkchunk");
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_request_body_without_deadline() {
+        use futures::TryStreamExt;
+
+        let (response, responder) = test_body_response(None, Some(3)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let chunks: Vec<_> = response.into_body_stream(None).try_collect().await.unwrap();
+        assert_eq!(chunks.concat(), b"chunkchunkchunk");
+        responder.await.unwrap();
     }
 
     #[tokio::test]
