@@ -101,21 +101,41 @@ async fn served_hash_metrics(
 async fn wait_for_capacity_or_disconnect(
     capacity: tokio::sync::futures::Notified<'_>,
     conn: &Option<ConnectionHandle>,
+    queue_deadline: Option<tokio::time::Instant>,
+    state: &NodeState,
+    model_name: &str,
+    hash_metrics: Option<&HashMetrics>,
 ) -> Result<(), AppError> {
-    match conn {
-        Some(handle) => {
-            tokio::select! {
-                _ = capacity => Ok(()),
-                _ = crate::connection::poll_client_disconnect(handle, DISCONNECT_POLL_INTERVAL) => {
-                    info!(event = "client_disconnected", "Client disconnected during capacity wait");
-                    Err(AppError::client_disconnected())
+    let wait = async {
+        match conn {
+            Some(handle) => {
+                tokio::select! {
+                    _ = capacity => Ok(()),
+                    _ = crate::connection::poll_client_disconnect(handle, DISCONNECT_POLL_INTERVAL) => {
+                        info!(event = "client_disconnected", "Client disconnected during capacity wait");
+                        Err(AppError::client_disconnected())
+                    }
                 }
             }
+            None => {
+                capacity.await;
+                Ok(())
+            }
         }
-        None => {
-            capacity.await;
-            Ok(())
+    };
+    let Some(deadline) = queue_deadline else {
+        return wait.await;
+    };
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(deadline) => {
+            state.metrics.inc_errors();
+            if let Some(metrics) = hash_metrics {
+                metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(node_error_to_app_error(state.record_queue_timeout(model_name)))
         }
+        result = wait => result,
     }
 }
 
@@ -932,6 +952,13 @@ pub async fn route_request(
         // re-resolve the profile (see `get_instance_for_model`).
         let resolved_cookbook_version = state.cookbook_version.load(Ordering::SeqCst);
         let local_resolution = state.resolve_model(&model_to_use).await;
+        let queue_timeout_ms = local_resolution
+            .as_ref()
+            .and_then(|(_, profile)| profile.max_wait_in_queue_ms)
+            .unwrap_or(state.config.model_defaults.max_wait_in_queue_ms);
+        let queue_deadline = (queue_timeout_ms != 0).then(|| {
+            tokio::time::Instant::now() + Duration::from_millis(queue_timeout_ms)
+        });
 
         // If local resolution fails, check if any peer supports this model.
         // The forwarder is patient: a peer that responds with a healable 503
@@ -940,6 +967,9 @@ pub async fn route_request(
         // change before retrying instead of surfacing the failure to the
         // client.
         if local_resolution.is_none() {
+            let wait_for_capacity = |capacity| wait_for_capacity_or_disconnect(
+                capacity, &conn_handle, queue_deadline, &state, &model_to_use, None,
+            );
             // Counted once for the whole forwarding effort; cleanup_fut /
             // guard Drop decrements exactly once when we either commit the
             // response stream or bail out.
@@ -971,7 +1001,7 @@ pub async fn route_request(
                     // No peer currently supports this model. Either it really
                     // does not exist anywhere, or every peer that advertises
                     // it is currently filtered (open circuit, draining,
-                    // stale). For the latter, wait for cluster state to
+                    // not ready). For the latter, wait for cluster state to
                     // change before giving up.
                     let capacity = state.capacity_notify.notified();
                     if state.draining.load(Ordering::Relaxed) {
@@ -980,9 +1010,8 @@ pub async fn route_request(
                     }
                     // We can only distinguish "no one will ever serve this"
                     // from "no one can serve it right now" by checking
-                    // whether any peer ever advertised the model. If the
-                    // model has never been seen on any peer, fail fast with
-                    // model_not_found. Otherwise wait.
+                    // whether any non-stale peer advertises the model. If
+                    // none does, fail fast with model_not_found. Otherwise wait.
                     if !state.any_peer_advertises_model(&model_to_use).await {
                         state.metrics.inc_errors();
                         return Err(AppError::model_not_found(format!(
@@ -1009,14 +1038,14 @@ pub async fn route_request(
                         );
                         if let Ok(res) = tokio::time::timeout(
                             probe_deadline,
-                            wait_for_capacity_or_disconnect(capacity, &conn_handle),
+                            wait_for_capacity(capacity),
                         )
                         .await
                         {
                             res?;
                         }
                     } else {
-                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
+                        wait_for_capacity(capacity).await?;
                     }
                     continue;
                 };
@@ -1114,7 +1143,7 @@ pub async fn route_request(
                             state.metrics.inc_errors();
                             return Err(AppError::node_draining());
                         }
-                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
+                        wait_for_capacity(capacity).await?;
                         continue;
                     }
                     ForwardOutcome::ProbeDenied => {
@@ -1148,7 +1177,7 @@ pub async fn route_request(
                             }
                             if let Ok(res) = tokio::time::timeout(
                                 probe_deadline,
-                                wait_for_capacity_or_disconnect(capacity, &conn_handle),
+                                wait_for_capacity(capacity),
                             )
                             .await
                             {
@@ -1177,7 +1206,7 @@ pub async fn route_request(
                             state.metrics.inc_errors();
                             return Err(AppError::node_draining());
                         }
-                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
+                        wait_for_capacity(capacity).await?;
                         continue;
                     }
                 }
@@ -1215,6 +1244,10 @@ pub async fn route_request(
         // to avoid ping-pong routing loops between nodes
         let prefer_local = current_hops > 0;
 
+        let wait_for_capacity = |capacity| wait_for_capacity_or_disconnect(
+            capacity, &conn_handle, queue_deadline, &state, &model_name, Some(&hash_metrics),
+        );
+
         // Cluster-aware routing: wait for capacity if model exists but no node available
         let best_node = loop {
             if let Some(node) = state
@@ -1250,7 +1283,7 @@ pub async fn route_request(
                 profile = %profile.id,
                 "No node available, waiting for cluster capacity"
             );
-            wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
+            wait_for_capacity(capacity).await?;
             // Loop back to retry select_best_node
         };
 
@@ -1261,7 +1294,7 @@ pub async fn route_request(
             let instance_result = match &conn_handle {
                 Some(handle) => {
                     tokio::select! {
-                        res = state.get_instance_for_model(&model_name, &profile, true, resolved_cookbook_version) => res,
+                        res = state.get_instance_for_model(&model_name, &profile, true, resolved_cookbook_version, queue_deadline) => res,
                         _ = crate::connection::poll_client_disconnect(handle, DISCONNECT_POLL_INTERVAL) => {
                             info!(event = "client_disconnected", "Client disconnected during instance acquisition");
                             return Err(AppError::client_disconnected());
@@ -1275,6 +1308,7 @@ pub async fn route_request(
                             &profile,
                             true,
                             resolved_cookbook_version,
+                            queue_deadline,
                         )
                         .await
                 }
@@ -1875,7 +1909,7 @@ pub async fn route_request(
                     Some(deadline) => {
                         if let Ok(res) = tokio::time::timeout(
                             deadline,
-                            wait_for_capacity_or_disconnect(capacity, &conn_handle),
+                            wait_for_capacity(capacity),
                         )
                         .await
                         {
@@ -1883,7 +1917,7 @@ pub async fn route_request(
                         }
                     }
                     None => {
-                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
+                        wait_for_capacity(capacity).await?;
                     }
                     }
                 }
@@ -1940,14 +1974,14 @@ pub async fn route_request(
                         );
                         if let Ok(res) = tokio::time::timeout(
                             probe_deadline,
-                            wait_for_capacity_or_disconnect(capacity, &conn_handle),
+                            wait_for_capacity(capacity),
                         )
                         .await
                         {
                             res?;
                         }
                     } else {
-                        wait_for_capacity_or_disconnect(capacity, &conn_handle).await?;
+                        wait_for_capacity(capacity).await?;
                     }
                 };
             }

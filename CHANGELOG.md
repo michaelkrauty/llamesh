@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.43] - 2026-10-28
+
+### Fixed
+
+- Bound waits for cluster capacity by `max_wait_in_queue_ms`. When no node could take a request, the router waited for a capacity change with no deadline, and the local queue's timeout started only once the request reached it, so a connected client could wait past the configured limit, indefinitely for a model whose only peer had left the cluster. One deadline, taken from the profile or the node default when the model is not in the local cookbook, now covers the router's waits, the local queue, and the waits inside local instance acquisition, and the request fails with `503` `queue_timeout` when it passes. A timeout of `0` still waits indefinitely.
+- Return `404` `model_not_found` for a model that is not in the local cookbook when only peers that are no longer heard from advertise it, instead of waiting for them. Peers that are briefly unavailable, draining, or behind an open circuit still count, so requests wait (now bounded) through a peer's restart.
+
 ## [1.21.42] - 2026-10-28
 
 ### Fixed

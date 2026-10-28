@@ -899,7 +899,7 @@ async fn abandoned_reservation_before_enqueue_self_wakes_waiter_and_evicts_idle_
     let waiter = tokio::spawn(async move {
         let version = waiter_state.cookbook_version.load(Ordering::SeqCst);
         waiter_state
-            .get_instance_for_model("next", &requested, true, version)
+            .get_instance_for_model("next", &requested, true, version, None)
             .await
     });
     wait_for_hook(entered, "waiter pre-enqueue pause").await;

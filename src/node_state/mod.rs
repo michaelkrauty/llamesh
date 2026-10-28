@@ -5,6 +5,8 @@ mod guardrail_tests;
 mod model_index;
 mod peer_state;
 mod port_pool;
+#[cfg(test)]
+mod queue_wait_tests;
 mod spawn_reservations;
 #[cfg(test)]
 mod upstream_client_tests;
@@ -865,8 +867,8 @@ impl NodeState {
         self.model_index.resolve(model_name).await
     }
 
-    /// Check whether any currently-known peer (regardless of readiness, circuit
-    /// breaker state, or staleness) advertises support for a model. The
+    /// Check whether any non-stale peer (regardless of readiness or circuit
+    /// breaker state) advertises support for a model. The
     /// patient-mesh forwarder uses this to distinguish "no peer advertises
     /// this model" (404) from "every peer that advertises it is currently
     /// unavailable" (wait for capacity).
@@ -875,9 +877,20 @@ impl NodeState {
         let parts: Vec<&str> = model_name.split(':').collect();
         let base_model = parts[0];
         let profile_id = if parts.len() > 1 { parts[1] } else { "default" };
-        peers
-            .values()
-            .any(|p| peer_supports_profile(p, base_model, profile_id))
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let timeout = self
+            .config
+            .cluster
+            .gossip_interval_seconds
+            .saturating_mul(3)
+            .max(15);
+        peers.values().any(|p| {
+            now.saturating_sub(p.last_seen) <= timeout
+                && peer_supports_profile(p, base_model, profile_id)
+        })
     }
 
     /// Find a peer that supports a model (case-insensitive).
@@ -1655,6 +1668,7 @@ impl NodeState {
         profile: &Profile,
         reserve_slot: bool,
         resolved_cookbook_version: u64,
+        queue_deadline: Option<tokio::time::Instant>,
     ) -> Result<Arc<RwLock<Instance>>, NodeError> {
         // Borrowed until a reload replaces it, so the common path does not
         // copy the profile.
@@ -1675,10 +1689,13 @@ impl NodeState {
                 .await;
         }
 
-        let loop_start = std::time::Instant::now();
-        // Deadline stays on the profile this request resolved before queueing,
-        // even if a reload replaces the definition while it waits.
-        let queue_timeout = self.queue_timeout_duration(&profile); // None = infinite wait
+        let has_request_deadline = queue_deadline.is_some();
+        // Preserve the router's deadline across local queueing and reloads.
+        // Direct callers start their wait budget here; None = infinite wait.
+        let queue_deadline = queue_deadline.or_else(|| {
+            self.queue_timeout_duration(&profile)
+                .map(|timeout| tokio::time::Instant::now() + timeout)
+        });
 
         // Track cold-start OOM retry stage:
         // 0 = no failure yet
@@ -1740,24 +1757,19 @@ impl NodeState {
                 return Err(NodeError::Draining);
             }
             // Check timeout only if configured (None = infinite wait)
-            if let Some(timeout) = queue_timeout {
-                if loop_start.elapsed() > timeout {
+            if let Some(deadline) = queue_deadline {
+                if tokio::time::Instant::now() >= deadline {
                     // Clean up pending token if we have one
                     if let Some(mut token) = my_token.take() {
                         token.release().await;
                     }
                     // A waiter can be woken just before its deadline and hit
                     // this check on the next iteration, before re-queueing.
-                    // If this request waited in a queue at any point, that is
-                    // a queue timeout exactly like the in-queue expiries
-                    // below — log and count it the same way. (Requests that
-                    // never queued and exhaust the deadline in retry loops
-                    // keep returning QueueTimeout without a queue_drop
-                    // event, as before.)
-                    if queue_start.is_some() {
-                        info!(event = "queue_drop", reason = "timeout", model = %model_name);
-                        self.metrics
-                            .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
+                    // Count it like an in-queue expiry, including time spent
+                    // waiting in the router. Direct callers that never queued
+                    // keep their existing retry-loop timeout accounting.
+                    if queue_start.is_some() || has_request_deadline {
+                        self.record_queue_timeout(model_name);
                     }
                     return Err(NodeError::QueueTimeout);
                 }
@@ -1863,26 +1875,22 @@ impl NodeState {
                 }
 
                 // Wait for queue notification with optional timeout
-                let wait_result = match queue_timeout {
-                    Some(timeout) => {
-                        let elapsed = loop_start.elapsed();
-                        if elapsed >= timeout {
-                            info!(event = "queue_drop", reason = "timeout", model = %model_name);
-                            self.metrics
-                                .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
+                let wait_result = match queue_deadline {
+                    Some(deadline) => {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining.is_zero() {
+                            self.record_queue_timeout(model_name);
                             self.remove_queue_entry(&key, queue_token).await;
                             queue_guard.disarm();
                             self.remove_pending_token(model_name, &profile.id, queue_token)
                                 .await;
                             return Err(NodeError::QueueTimeout);
                         }
-                        let remaining = timeout - elapsed;
                         match tokio::time::timeout(remaining, rx).await {
                             Ok(result) => result,
                             Err(_) => {
-                                info!(event = "queue_drop", reason = "timeout", model = %model_name);
-                                self.metrics
-                                    .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
+                                self.record_queue_timeout(model_name);
                                 self.remove_queue_entry(&key, queue_token).await;
                                 queue_guard.disarm();
                                 self.remove_pending_token(model_name, &profile.id, queue_token)
@@ -2016,7 +2024,7 @@ impl NodeState {
                                 }
                             }
 
-                            // Stage 3: Wait indefinitely for capacity (never reject)
+                            // Stage 3: wait for capacity, up to the queue deadline
                             // This can happen if eviction freed resources but another request claimed them,
                             // or if the model truly requires more resources than the node has (config error).
                             warn!(
@@ -2030,7 +2038,14 @@ impl NodeState {
                             // already exist. The loop top returns `Draining`.
                             let capacity = self.capacity_notify.notified();
                             if !self.draining.load(Ordering::Relaxed) {
-                                capacity.await;
+                                // Bounded by the request's queue deadline; the
+                                // loop top returns QueueTimeout once it passes.
+                                match queue_deadline {
+                                    Some(deadline) => {
+                                        let _ = tokio::time::timeout_at(deadline, capacity).await;
+                                    }
+                                    None => capacity.await,
+                                }
                             }
                             continue; // Retry the loop
                         }
@@ -2093,7 +2108,7 @@ impl NodeState {
                             }
                         }
 
-                        // Stage 3: Wait indefinitely for capacity (never reject)
+                        // Stage 3: wait for capacity, up to the queue deadline
                         warn!(
                             event = "waiting_for_resources",
                             model = %model_name,
@@ -2103,7 +2118,13 @@ impl NodeState {
                         // Subscribe before checking `draining`, as above.
                         let capacity = self.capacity_notify.notified();
                         if !self.draining.load(Ordering::Relaxed) {
-                            capacity.await;
+                            // Bounded by the queue deadline, as above.
+                            match queue_deadline {
+                                Some(deadline) => {
+                                    let _ = tokio::time::timeout_at(deadline, capacity).await;
+                                }
+                                None => capacity.await,
+                            }
                         }
                         continue; // Retry the loop
                     }
@@ -2242,28 +2263,22 @@ impl NodeState {
                         }
 
                         // Wait for queue notification with optional timeout
-                        let wait_result = match queue_timeout {
-                            Some(timeout) => {
-                                let elapsed = loop_start.elapsed();
-                                if elapsed >= timeout {
-                                    info!(event = "queue_drop", reason = "timeout", model = %model_name);
-                                    self.metrics.record_queue_drop(
-                                        crate::metrics::QueueDropReason::Timeout,
-                                    );
+                        let wait_result = match queue_deadline {
+                            Some(deadline) => {
+                                let remaining =
+                                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                                if remaining.is_zero() {
+                                    self.record_queue_timeout(model_name);
                                     self.remove_queue_entry(&key, queue_token).await;
                                     queue_guard.disarm();
                                     self.remove_pending_token(model_name, &profile.id, queue_token)
                                         .await;
                                     return Err(NodeError::QueueTimeout);
                                 }
-                                let remaining = timeout - elapsed;
                                 match tokio::time::timeout(remaining, rx).await {
                                     Ok(result) => result,
                                     Err(_) => {
-                                        info!(event = "queue_drop", reason = "timeout", model = %model_name);
-                                        self.metrics.record_queue_drop(
-                                            crate::metrics::QueueDropReason::Timeout,
-                                        );
+                                        self.record_queue_timeout(model_name);
                                         self.remove_queue_entry(&key, queue_token).await;
                                         queue_guard.disarm();
                                         self.remove_pending_token(
@@ -2303,6 +2318,13 @@ impl NodeState {
                 }
             }
         }
+    }
+
+    pub(crate) fn record_queue_timeout(&self, model_name: &str) -> NodeError {
+        info!(event = "queue_drop", reason = "timeout", model = %model_name);
+        self.metrics
+            .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
+        NodeError::QueueTimeout
     }
 
     /// Get queue timeout duration. Returns None for infinite wait.
@@ -5021,6 +5043,7 @@ mod tests {
                 &profile,
                 true,
                 state.cookbook_version.load(Ordering::SeqCst),
+                None,
             )
             .await
             .expect("closed queue entry should be pruned before queue capacity is enforced");

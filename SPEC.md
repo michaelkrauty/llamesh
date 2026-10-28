@@ -895,7 +895,7 @@ performance_bonus = min(tps, 200) * 5 + min(remaining_slots, 4) * 50
 Lowest score wins.
 
 * Peers with the model already loaded are preferred (reflected in cold_start_cost of 0).
-* If no candidate is available, the router waits on a capacity notification rather than returning an immediate 503. This wait is bounded by `max_wait_in_queue_ms`.
+* If no candidate is available, the router waits on a capacity notification rather than returning an immediate 503. Router capacity waits and local queueing share one `max_wait_in_queue_ms` deadline, taken from the resolved profile or the node default for a model absent from the local cookbook; `0` means no limit. A model absent locally returns `404` if only stale peers advertise it (using the peer-selection staleness window above); non-stale peers still count while not ready, draining, or circuit-open.
 
 * If chosen node == self:
 
@@ -945,7 +945,7 @@ On chosen node (or standalone):
 * After enqueueing, recheck admission, including capacity obtainable by evicting idle instances, to close notification races. Periodic maintenance also rechecks queued profiles against current memory usage so an external GPU consumer freeing memory can unblock them without an instance lifecycle event.
 * An abandoned spawn wakes queues after its retained memory commitment is released, including when child reaping outlives the cancelled request.
 * Removed instances are cleaned up independently of the requesting future. Cancellation cannot strand later victims in an eviction batch or suppress the wake after memory is released. Capacity-driven eviction defers that wake until the contender finishes admission or abandons it, preserving its opportunity to claim the freed capacity.
-* If the request stays in queue longer than that (and the timeout is non-zero):
+* The timeout runs from when the router starts looking for capacity, so time spent waiting in the router before the request was queued locally counts toward it. If it passes while the request is waiting (and the timeout is non-zero):
 
   * Remove it from the queue and return 503 `queue_timeout`.
 * A request that is cancelled while queued, for example because its client disconnected, is removed from the queue, so it no longer counts toward the queue length or the queue limits.
