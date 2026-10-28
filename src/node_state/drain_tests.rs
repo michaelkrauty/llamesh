@@ -575,10 +575,11 @@ async fn queued_request_across_cookbook_reload_spawns_new_args() {
         .await
         .unwrap()
         .unwrap();
-    re_release.send(()).unwrap();
-
+    // Free the slot before the waiter's admission re-check runs, so that
+    // check, rather than an unrelated wake, starts the spawn.
     let (entered, release) = guardrail_tests::install_pause(&state.test_hooks.after_port);
     drop(blocker);
+    re_release.send(()).unwrap();
     timeout(Duration::from_secs(1), entered)
         .await
         .unwrap()
@@ -732,4 +733,42 @@ async fn request_resolved_before_a_reload_uses_the_reloaded_cookbook() {
     assert!(matches!(error, NodeError::ModelNotFound(_)), "{error:?}");
     assert!(state.instances.read().await.is_empty());
     assert_queue_drained(&state).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reload_between_the_spawn_check_and_insertion_drains_the_instance() {
+    let (state, dir) = guardrail_tests::spawnable_state().await;
+    let path = dir.path().join("cookbook.yaml");
+    reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+    let (_, profile) = state.resolve_model("queued:default").await.unwrap();
+    let (entered, release) = guardrail_tests::install_pause(&state.test_hooks.before_insert);
+    let caller = state.clone();
+    let spawn = tokio::spawn(async move {
+        caller
+            .try_get_or_spawn("queued", &profile, true, "test", false)
+            .await
+    });
+    timeout(Duration::from_secs(1), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    // The spawn has already compared its profile with the cookbook; only the
+    // version re-read under the instance map lock can see this reload.
+    let capture = crate::test_support::capture_logs(tracing::Level::INFO);
+    reload_queued_profile(&state, &path, RELOADED_PROFILE).await;
+    release.send(()).unwrap();
+    let instance = timeout(Duration::from_secs(1), spawn)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let inst = instance.read().await;
+    let draining = inst.draining.load(Ordering::Relaxed);
+    inst.stop().await.unwrap();
+    assert!(
+        draining,
+        "a reload before insertion must drain the instance"
+    );
+    let logged = capture.contents();
+    assert!(logged.contains("cookbook_changed"), "{logged}");
 }

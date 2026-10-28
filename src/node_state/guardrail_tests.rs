@@ -16,6 +16,7 @@ use tokio::time::{timeout, Duration};
 #[derive(Default)]
 pub(super) struct TestHooks {
     pub(super) after_port: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    pub(super) before_insert: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) after_reserve: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) before_enqueue: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) after_enqueue: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,

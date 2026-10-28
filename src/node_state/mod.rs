@@ -1651,7 +1651,9 @@ impl NodeState {
         reserve_slot: bool,
         resolved_cookbook_version: u64,
     ) -> Result<Arc<RwLock<Instance>>, NodeError> {
-        let mut profile = profile.clone();
+        // Borrowed until a reload replaces it, so the common path does not
+        // copy the profile.
+        let mut profile = std::borrow::Cow::Borrowed(profile);
         // The caller sampled the version before it resolved `profile`, so a
         // reload at any point after that resolution is seen below.
         let mut resolved_version = resolved_cookbook_version;
@@ -2313,9 +2315,9 @@ impl NodeState {
     /// should retry. `Err` is a profile that no longer resolves; the queue
     /// permit is released the same way as the other error exits.
     async fn adopt_reloaded_profile(
-        &self,
+        self: &Arc<Self>,
         model_name: &str,
-        profile: &mut Profile,
+        profile: &mut std::borrow::Cow<'_, Profile>,
         resolved_version: &mut u64,
         token: &mut Option<PendingQueuePermit>,
     ) -> Result<bool, NodeError> {
@@ -2331,8 +2333,12 @@ impl NodeState {
                 // A reload wakes one waiter per queue. This request leaves
                 // without taking capacity, so pass the wake on: the next
                 // request queued for the removed profile then fails the same
-                // way instead of waiting for an unrelated event.
-                self.notify_queue(model_name, &profile.id).await;
+                // way instead of waiting for an unrelated event. Spawned, so
+                // the wake survives this request being cancelled.
+                let state = Arc::clone(self);
+                let model = model_name.to_string();
+                let profile_id = profile.id.clone();
+                tokio::spawn(async move { state.notify_queue(&model, &profile_id).await });
                 Err(error)
             }
         }
@@ -2343,7 +2349,7 @@ impl NodeState {
     async fn refresh_profile_after_reload(
         &self,
         model_name: &str,
-        profile: &mut Profile,
+        profile: &mut std::borrow::Cow<'_, Profile>,
         resolved_version: &mut u64,
     ) -> Result<bool, NodeError> {
         let observed = self.cookbook_version.load(Ordering::SeqCst);
@@ -2361,7 +2367,7 @@ impl NodeState {
         }
         match resolved {
             Some((_, current)) => {
-                *profile = current;
+                *profile = std::borrow::Cow::Owned(current);
                 *resolved_version = observed;
                 Ok(false)
             }
@@ -2773,6 +2779,8 @@ impl NodeState {
                             replaced_reason = Some("cookbook_changed");
                         }
 
+                        #[cfg(test)]
+                        guardrail_tests::pause_at(&self.test_hooks.before_insert).await;
                         let mut instances_map = self.instances.write().await;
 
                         // Re-check capacity constraints to close the race window between
