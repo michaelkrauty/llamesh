@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.44] - 2026-10-28
+
+### Fixed
+
+- Route a request to another node when the peer it was forwarded to answers that it is shutting down. A peer that had started draining rejected requests that reached it over a connection opened before the drain with `503` `draining`, and the forwarding node returned that error to its client instead of serving the request elsewhere. A node's own draining error now names it in a new optional `origin_node_id` field, and when the peer a request was sent to returns one naming itself, the forwarding node excludes that peer for this request and selects again at once, including when it falls back to a peer after its own spawn attempts failed. A draining error relayed from another node, or from a node on an earlier version without the field, is still returned unchanged, and draining errors no longer count against the peer's circuit breaker.
+
+### Added
+
+- `origin_node_id` in the error body of `503` `draining` responses, naming the node that is shutting down.
+
 ## [1.21.43] - 2026-10-28
 
 ### Fixed
