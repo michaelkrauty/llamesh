@@ -286,3 +286,41 @@ async fn shutdown_drain_rejects_admission_enqueue_after_wake() {
 async fn shutdown_drain_rejects_fairness_enqueue_after_wake() {
     shutdown_after_wake_before_enqueue(true).await;
 }
+
+#[tokio::test]
+async fn shutdown_drain_leaves_no_queue_entry_for_a_request_cancelled_after_enqueuing() {
+    // Shutdown finishes while a request is about to queue. Whether or not the
+    // request then queues, cancelling it at the first await after the queue
+    // push must not leave an entry behind, which would hold shutdown open.
+    let state = state().await;
+    let _blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let (before_entered_tx, before_entered_rx) = oneshot::channel();
+    let (before_release_tx, before_release_rx) = oneshot::channel();
+    *state.test_hooks.before_enqueue.lock() = Some((before_entered_tx, before_release_rx));
+    let (after_entered_tx, after_entered_rx) = oneshot::channel();
+    let (_after_release_tx, after_release_rx) = oneshot::channel();
+    *state.test_hooks.after_enqueue.lock() = Some((after_entered_tx, after_release_rx));
+
+    let mut waiter = queue_waiter(&state, 0).await;
+    timeout(Duration::from_secs(1), before_entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    state.begin_shutdown_drain().await;
+    before_release_tx.send(()).unwrap();
+
+    tokio::select! {
+        result = &mut waiter => {
+            let result = result.unwrap();
+            assert!(matches!(result, Err(NodeError::Draining)), "{result:?}");
+        }
+        _ = after_entered_rx => {
+            // Queued after the shutdown wake; the client goes away here.
+            waiter.abort();
+            let _ = waiter.await;
+        }
+    }
+    assert_queue_drained(&state).await;
+}

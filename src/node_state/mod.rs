@@ -1663,6 +1663,17 @@ impl NodeState {
                     // LOCK_ORDER: queues (2)
                     let mut queues = self.queues.write().await;
 
+                    // Shutdown sets `draining` and then wakes every queued
+                    // request, taking this lock to find them. Checking here, with
+                    // no await before the push below, means a request is either
+                    // queued before that wake and woken by it, or not queued at
+                    // all; checking after an await would leave a request that is
+                    // cancelled in between queued, with nothing to remove it,
+                    // holding shutdown open.
+                    if self.draining.load(Ordering::Relaxed) {
+                        return Err(NodeError::Draining);
+                    }
+
                     // Check global queue limit first (if configured)
                     if self.config.max_total_queue_entries > 0 {
                         let total: usize = queues.values().map(|q| q.len()).sum();
@@ -1707,15 +1718,6 @@ impl NodeState {
                             "Queue growing large - consider increasing capacity");
                     }
                     info!(event = "queue_enqueue", model = %model_name, queue_length = queue_len, reason = "fairness");
-                }
-
-                // Check after enqueue: the queues lock orders insertion against the
-                // shutdown wake, including requests that missed the wake entirely.
-                if self.draining.load(Ordering::Relaxed) {
-                    self.remove_queue_entry(&key, queue_token).await;
-                    self.remove_pending_token(model_name, &profile.id, queue_token)
-                        .await;
-                    return Err(NodeError::Draining);
                 }
 
                 // Wait for queue notification with optional timeout
@@ -1856,7 +1858,13 @@ impl NodeState {
                                 profile = %profile.id,
                                 "All retry stages exhausted, waiting for cluster capacity"
                             );
-                            self.capacity_notify.notified().await;
+                            // Subscribe before checking `draining`: shutdown wakes
+                            // capacity waiters once, reaching only futures that
+                            // already exist. The loop top returns `Draining`.
+                            let capacity = self.capacity_notify.notified();
+                            if !self.draining.load(Ordering::Relaxed) {
+                                capacity.await;
+                            }
                             continue; // Retry the loop
                         }
                         r.is_cold_start
@@ -1925,7 +1933,11 @@ impl NodeState {
                             profile = %profile.id,
                             "All retry stages exhausted after startup failure, waiting for cluster capacity"
                         );
-                        self.capacity_notify.notified().await;
+                        // Subscribe before checking `draining`, as above.
+                        let capacity = self.capacity_notify.notified();
+                        if !self.draining.load(Ordering::Relaxed) {
+                            capacity.await;
+                        }
                         continue; // Retry the loop
                     }
                 }
@@ -1970,6 +1982,13 @@ impl NodeState {
                         {
                             // LOCK_ORDER: queues (2)
                             let mut queues = self.queues.write().await;
+
+                            // As above: checked under the queues lock, with no
+                            // await before the push, so shutdown's wake either
+                            // finds this request or it is never queued.
+                            if self.draining.load(Ordering::Relaxed) {
+                                return Err(NodeError::Draining);
+                            }
 
                             // Check global queue limit first (if configured)
                             if self.config.max_total_queue_entries > 0 {
@@ -2019,6 +2038,9 @@ impl NodeState {
                             info!(event = "queue_enqueue", model = %model_name, queue_length = queue_len, spawn_error = spawn_error_reason);
                         }
 
+                        #[cfg(test)]
+                        guardrail_tests::pause_at(&self.test_hooks.after_enqueue).await;
+
                         // Track that this model needs eviction to spawn (outside queues lock)
                         if matches!(
                             e,
@@ -2041,15 +2063,6 @@ impl NodeState {
                                 | NodeError::InsufficientResources
                         ) {
                             self.wake_queue_if_admissible(model_name, profile).await;
-                        }
-
-                        // Check after enqueue: the queues lock orders insertion against the
-                        // shutdown wake, including requests that missed the wake entirely.
-                        if self.draining.load(Ordering::Relaxed) {
-                            self.remove_queue_entry(&key, queue_token).await;
-                            self.remove_pending_token(model_name, &profile.id, queue_token)
-                                .await;
-                            return Err(NodeError::Draining);
                         }
 
                         // Wait for queue notification with optional timeout
