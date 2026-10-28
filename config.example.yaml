@@ -23,15 +23,15 @@ public_url: "https://node-a.example.com"
 # Resource Limits
 # -----------------------------------------------------------------------------
 
-# Maximum VRAM (GPU memory) in MB this node can use (required).
+# Maximum VRAM (GPU memory) in MiB this node can use (required).
 # Set to your intended llamesh budget. When NVIDIA NVML is available,
 # device-wide VRAM used by other processes is counted against this budget
 # automatically, so external GPU workloads reduce spawn capacity.
-max_vram_mb: 16000  # 16GB
+max_vram_mb: 16000  # ~15.6 GiB
 
-# Maximum system memory in MB this node can use (required)
+# Maximum system memory in MiB this node can use (required)
 # Set to available RAM minus OS/other app needs
-max_sysmem_mb: 64000  # 64GB
+max_sysmem_mb: 64000  # ~62.5 GiB
 
 # Maximum number of llama-server instances this node can run (default: 100)
 # Must be at least 1: a zero cap means the node can never spawn an instance. A
@@ -53,6 +53,7 @@ model_defaults:
   # Max requests waiting in queue per model
   max_queue_size_per_model: 64
   # Max instances of same model that can run simultaneously
+  # 0 is treated as 1; disable a profile with max_instances: 0 or enabled: false
   max_instances_per_model: 4
   # Max time (ms) request waits in queue before timeout (default: 60000)
   max_wait_in_queue_ms: 60000
@@ -179,7 +180,8 @@ cluster:
   # Gossip interval - how often nodes exchange state (required)
   gossip_interval_seconds: 5
 
-  # Max concurrent outbound gossip connections (default: 16)
+  # Max concurrent outbound gossip connections in ordinary rounds (default: 16)
+  # Drain announcements bypass this limit
   max_concurrent_gossip: 16
 
   # What to do when a peer reports a different llamesh version (default: "warn")

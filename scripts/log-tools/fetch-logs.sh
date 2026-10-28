@@ -1,12 +1,13 @@
 #!/bin/bash
 # Fetch logs from local or remote node
 # Usage: fetch-logs.sh [node] [date]
-#   node: "local", "node-a", "node-b" (default: local)
+#   node: "local", "node-a", "node-b", "remote", "both" (default: local)
 #   date: YYYY-MM-DD, a UTC day (default: today in UTC)
 #
 # Configure via environment variables:
-#   LLAMESH_LOCAL_LOG_DIR  - local log directory (default: ./logs)
-#   LLAMESH_REMOTE_LOG_DIR - remote log directory (default: same as local)
+#   LLAMESH_LOCAL_LOG_DIR  - local log directory (default: logs under the repo root)
+#   LLAMESH_REMOTE_LOG_DIR - remote log directory (default: ./logs relative to the
+#                           SSH working directory, independent of the local override)
 #   LLAMESH_REMOTE_HOST    - SSH host for remote node (e.g., user@host)
 
 set -euo pipefail

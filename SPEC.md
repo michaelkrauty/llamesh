@@ -11,7 +11,7 @@ This document describes the actual behavior of llamesh as implemented. It serves
 * Listens on a single public HTTP(S) port.
 * Accepts the same OpenAI-compatible HTTP endpoints that `llama-server` exposes (e.g. `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`) so a client can talk to the proxy exactly as it would talk to `llama-server`, plus the additional proxy/cluster/admin endpoints documented below ([reference](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)).
 * Resolves the requested `model` into a configured model/profile via a YAML "cookbook".
-* Starts, stops, and routes to local `llama-server` instances, one per `(model, profile)` configuration.
+* Starts, stops, and routes to local `llama-server` instances, with multiple instances allowed per `(model, profile)` configuration up to its configured limit.
 * Optionally participates in a **mesh** of peers (multi-node). Any node can receive traffic and forward requests to a peer node based on capacity and performance.
 
 The system is a drop-in replacement for a direct `llama-server` endpoint, but adds:
@@ -116,9 +116,9 @@ node_id: "node-a"
 listen_addr: "0.0.0.0:8080"
 public_url: "https://node-a.example.com"  # optional, used in cluster metadata
 
-# Resource guardrails (memory in MB)
-max_vram_mb: 71680       # 71680 MB (~70 GiB)
-max_sysmem_mb: 153600    # 153600 MB (~150 GiB)
+# Resource guardrails (memory in MiB)
+max_vram_mb: 71680       # 71680 MiB (70 GiB)
+max_sysmem_mb: 153600    # 153600 MiB (150 GiB)
 
 # Global instance limit (optional, default: 100)
 max_instances_per_node: 100
@@ -268,7 +268,7 @@ the node's spawn capacity.
 
 #### Environment Variable Overrides
 
-All config fields can be overridden via environment variables using the `LLAMESH_` prefix:
+Scalar config fields can be overridden via environment variables using the `LLAMESH_` prefix; sequence fields such as `cluster.peers` cannot be overridden with comma-delimited or JSON strings:
 
 * Top-level fields use `_` as separator: `LLAMESH_NODE_ID`, `LLAMESH_MAX_VRAM_MB`, `LLAMESH_LISTEN_ADDR`
 * Nested fields use `__` (double underscore): `LLAMESH_CLUSTER__ENABLED`, `LLAMESH_HTTP__IDLE_TIMEOUT_SECONDS`
@@ -399,8 +399,8 @@ You can also specify model source directly in `llama_server_args` using `-m`/`--
 
 **Startup Timeouts:**
 
-* **`startup_timeout_seconds`**: Maximum time to wait for a local model to load and become ready. Default: 60 seconds. Only used when `model_path` is specified.
-* **`download_timeout_seconds`**: Maximum time to wait for a Hugging Face model to download and become ready. Default: 3600 seconds (1 hour). Only used when `hf_repo` is specified. This timeout covers both the download time and the model loading time.
+* **`startup_timeout_seconds`**: Maximum time to wait for a local model to load and become ready. Default: 60 seconds. Used for local sources, including `model_path` and `-m`/`--model` launch args, when no Hugging Face source is specified.
+* **`download_timeout_seconds`**: Maximum time to wait for a Hugging Face model to download and become ready. Default: 3600 seconds (1 hour). Used when `hf_repo` or `-hfr`/`--hf-repo` launch args specify a Hugging Face source. This timeout covers both the download time and the model loading time.
 
 **Default Arguments:**
 
@@ -523,7 +523,7 @@ Recommended to run as a systemd service or under a supervisor.
 
 ## OpenAI-Compatible API
 
-The proxy treats `llama-server` as the source of truth for OpenAI-style request/response behavior. For any supported `/v1/*` endpoint, it forwards the HTTP method, path, and JSON body to the selected `llama-server` instance and streams the response back verbatim, with no schema translation beyond model/profile resolution and optional auth handling.
+The proxy treats `llama-server` as the source of truth for OpenAI-style request/response behavior. For any supported `/v1/*` endpoint, it forwards the HTTP method, path, and JSON body to the selected `llama-server` instance and streams the response back verbatim, with no schema translation beyond model/profile resolution, optional auth handling, and removal of `stream` when it is `true` on embedding or rerank requests.
 
 ### Completions
 
@@ -558,8 +558,8 @@ Behavior:
 
 * If `model` is omitted, substitute `default_model` from config. Only an absent field takes this default path.
 * If `model` is present but is not a non-empty string (e.g. `null`, a number, boolean, object, or empty string), reject with a 400 `invalid_request_error` (see **Error Model & HTTP Semantics**). A present-but-invalid `model` is treated as a client error rather than an implicit request for the default.
-* If `model` cannot be resolved to `(model_name, profile)` defined in the cookbook -> 404 JSON error (see **Error Model & HTTP Semantics**).
-* Otherwise, route according to routing algorithm (see below), and stream the `llama-server` response converted to the OpenAI SSE format.
+* If `model` cannot be resolved to `(model_name, profile)` defined in the local cookbook, try a cluster peer; return a 404 JSON error only if no peer advertises it (see **Error Model & HTTP Semantics**).
+* Otherwise, route according to routing algorithm (see below), and pass the `llama-server` response bytes through unchanged, including SSE bytes for streaming responses. SSE parsing only feeds metrics.
 
 ### Models Listing
 
@@ -703,7 +703,7 @@ The proxy follows the same general error envelope and HTTP semantics as OpenAI's
 
 #### Error JSON Envelope
 
-Errors that the proxy's request handlers generate on the OpenAI-compatible endpoints, and its API-key authentication, body-read timeout, and draining errors on every endpoint, use a JSON body of the form below. An error response from a `llama-server` instance or a cluster peer is relayed with its own status and body, and a request the HTTP router rejects before any handler runs, such as one with the wrong method, gets the router's plain response; neither need follow this form.
+Errors that the proxy's request handlers generate on the OpenAI-compatible endpoints, and its API-key authentication, body-read timeout, and draining errors on every endpoint, use a JSON body of the form below. An error response from a `llama-server` instance or a cluster peer is relayed with its own status and body, except recognized peer saturation 5xx errors, which are consumed and retried or waited on. A request the HTTP router rejects before any handler runs, such as one with the wrong method, gets the router's plain response; relayed errors and router rejections need not follow this form.
 
 ```json
 {
@@ -733,7 +733,7 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
   * `type`: `"invalid_request_error"`.
   * Conditions:
     * Malformed JSON.
-    * Unsupported or out-of-range parameter values (e.g. negative `max_tokens`).
+    * Invalid `model` values; other parameter validation is delegated to the backend.
     * Missing required fields.
     * `X-Llama-Mesh-Hops` exceeds `max_hops`.
 * `401 Unauthorized`:
@@ -774,7 +774,7 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
     * `spawn_failures_exhausted`: Local instance spawn failed repeatedly and no peer could serve the request.
     * `draining`: Node is shutting down and not accepting new requests.
 
-For the `503` responses it generates, the proxy includes a `Retry-After` header hinting how long to wait before retrying: `5` seconds for transient conditions (`queue_full`, `queue_timeout`, `draining`) and `30` seconds for capacity-bound conditions (`no_capacity`, `spawn_failures_exhausted`).
+For inference `503` responses it generates and draining rejections, the proxy includes a `Retry-After` header hinting how long to wait before retrying: `5` seconds for transient conditions (`queue_full`, `queue_timeout`, `draining`) and `30` seconds for capacity-bound conditions (`no_capacity`, `spawn_failures_exhausted`). Prewarm spawn/admission failures and health/readiness `503` responses do not include this header.
 
 ### Health and Readiness
 
@@ -807,19 +807,19 @@ For full semantics (including drain/shutdown behavior), see **Health, Readiness,
 
 Key `proxy_*` series exposed. Gauges reflect the current moment; most counters are cumulative and persist across restarts via the metrics snapshot. Several are per-process and reset on restart instead: the **Streaming** group, `proxy_instances_crashed_total`, and the `proxy_queue_wait_*` counters.
 
-* **Request handling** — `proxy_requests_total` (requests received), `proxy_errors_total` (request errors), `proxy_current_requests` (in flight now).
+* **Request handling** — `proxy_requests_total`, `proxy_errors_total`, and `proxy_current_requests` count inference requests admitted into routing, their errors, and those still in flight, respectively. They exclude failures before routing admission, such as authentication, body/JSON parsing, invalid model values, and local endpoint incompatibility.
 * **Queueing** — `proxy_queue_length` (waiting now), `proxy_queue_drops_total{reason}` (`full` / `timeout` / `global_limit`), `proxy_queue_wait_total_ms` and `proxy_queue_wait_count` (cumulative wait time and count), `proxy_queue_pending_tokens`.
-* **Node resources** — `proxy_node_active_instances`; `proxy_node_effective_vram_mb` / `proxy_node_max_vram_mb` (VRAM used for admission vs the configured guardrail) and the `_sysmem_` equivalents; `proxy_node_llamesh_vram_mb`, `proxy_node_external_vram_mb`, `proxy_node_device_vram_used_mb`, `proxy_node_device_vram_total_mb`; `proxy_node_gpu_telemetry_available` (1/0).
+* **Node resources** — `proxy_node_active_instances`; `proxy_node_effective_vram_mb` / `proxy_node_max_vram_mb` (VRAM used for admission vs the configured guardrail) and the `_sysmem_` equivalents; `proxy_node_llamesh_vram_mb`, `proxy_node_llamesh_sysmem_mb` (VRAM and system memory attributed to llamesh-managed instances), `proxy_node_external_vram_mb`, `proxy_node_device_vram_used_mb`, `proxy_node_device_vram_total_mb`; `proxy_node_gpu_telemetry_available` (1/0).
 * **Cluster health & recovery** — `proxy_circuit_breaker_state{peer}` (0=closed, 1=open, 2=half-open), `proxy_wedged_instances_killed_total` (local instances stopped by the wedged-instance watchdog), `proxy_instances_crashed_total` (local instances that exited abnormally — a fault signal or non-zero exit, excluding a graceful `SIGTERM` — observed by the liveness check; per-process, resets on restart).
 * **Streaming** (per-process, reset on restart) — `proxy_peer_stream_body_aborts_total` (forwarded peer streams whose body aborted mid-stream), `proxy_skipped_stream_cleanups_total` (cleanups skipped during shutdown), `proxy_token_counting_disabled_total`.
-* **Per model:profile** — the `proxy_hash_*` family (`requests_total`, `errors_total`, `tokens_generated_total`, `total_latency_ms`, latency percentiles, `peak_vram_mb`, `peak_sysmem_mb`), labeled by the profile's args hash and comma-separated display names. Names are sorted lexically so an unchanged name set retains the same label value across restarts.
+* **Per model:profile** — the `proxy_hash_*` family (`requests_total`, `errors_total`, `tokens_generated_total`, `total_latency_ms`, `p95_latency_ms`, `peak_vram_mb`, `peak_sysmem_mb`), labeled by `hash` (the profile's args hash) and `names` (comma-separated display names). `proxy_hash_p95_latency_ms` is a gauge over the last 100 locally served request latency samples. Names are sorted lexically so an unchanged name set retains the same label value across restarts.
 * **Build** — `proxy_build_info{version=...,llama_cpp_version=...}` (info series, value `1`; aggregate with `count by (version) (proxy_build_info)`).
 
 ### Cluster / Admin
 
 * `GET /cluster/nodes` -> current view of nodes and their capacities.
 * `POST /cluster/gossip` -> internal peer gossip endpoint (used by nodes to exchange state). When Noise is enabled without cluster mTLS, plain HTTP gossip is rejected.
-* `POST /admin/prewarm` -> request pre-warming of a model/profile.
+* `POST /admin/prewarm` -> request pre-warming with JSON `{"model":"name:profile"}`, resolved only against the local cookbook. Success returns 200 `{"status":"ok","message":"Model prewarmed"}`; a missing or non-string `model` returns 400 `{"status":"error","message":"Missing model field"}`, an unresolved model returns 404 `{"status":"error","message":"Model not found"}`, and a spawn/admission failure returns 503 `{"status":"error","message":"..."}`. A cold prewarm starts loading without waiting for readiness.
 * `POST /admin/rebuild-llama` -> trigger on-demand `llama.cpp` rebuild.
 
 While draining, both administrative POST handlers reject new authorized requests with 503, error type `draining`, and `Retry-After: 5`, including over existing connections. Authentication and drain admission are checked before reading a prewarm body; its configured body deadline and byte limit still apply to admitted requests. Prewarm rechecks draining after body extraction before starting work.
@@ -868,9 +868,9 @@ If `cluster.enabled == true`:
   * Node supports requested `(model, profile)`.
   * Node not in drain/shutdown state (`ready` flag is true).
   * Node's circuit breaker is not open.
-  * Node has been seen within 3x `gossip_interval_seconds` (staleness check).
-* `prefer_local`: Forwarded requests (hops > 0) are always served locally to prevent ping-pong routing loops.
-* Score each candidate using the following formula:
+  * Node has been seen within `max(3 × gossip_interval_seconds, 15)` seconds (staleness check).
+* `prefer_local`: Forwarded requests (hops > 0) prefer local service when the node can serve the profile; otherwise onward forwarding remains possible, subject to the hop limit.
+* For models absent from the local cookbook, select only among eligible peers, preferring a peer with the model loaded, then the lowest total queue length. For locally resolved models, score each candidate using the following formula:
 
 ```
 score = load_score + cold_start_cost - performance_bonus
@@ -901,7 +901,7 @@ Lowest score wins.
   * If local spawning fails repeatedly (3 consecutive failures), fall back to forwarding to a peer that supports the model before returning an error.
 * Else:
 
-  * Forward request to chosen node (with Noise encryption if enabled, falling back to HTTPS with mTLS), fully streaming response back to client.
+  * Forward request to chosen node using Noise encryption when enabled, or HTTP/TLS/mTLS when Noise is disabled, fully streaming response back to client. A failed Noise attempt does not downgrade transport.
 
 ### 4. Local Node Routing
 
@@ -970,11 +970,12 @@ Each instance is a `llama-server` process spawned by the proxy:
 
   * Uses the `/health` endpoint on the `llama-server` instance exclusively.
   * The proxy polls `/health` until it returns `200` (ready) or the overall `startup_timeout_seconds` budget elapses. Each individual probe is bounded by its own short request timeout, so a server that accepts the connection but never responds cannot stall the readiness loop past that budget.
-  * If spawn/health check fails:
+  * If startup/readiness fails after a process has spawned:
 
     * Mark instance as failed, emit error logs.
     * Track consecutive spawn failures per request. After 3 consecutive failures (which covers the cold-start OOM recovery stages plus one additional attempt), the node gives up on local spawning.
     * If the node is part of a cluster, the router attempts to forward the request to a peer that supports the model before returning an error to the client.
+  * If the process itself cannot be started (for example, the binary cannot be executed), the spawn is retried on another port unless the profile fixes the port, and the final failure is returned as a `500` error without peer fallback.
 
 * Startup log parsing:
 
@@ -1018,7 +1019,7 @@ Each instance is a `llama-server` process spawned by the proxy:
 
 Once an instance is selected and ready:
 
-* Proxy takes the OpenAI-style request, resolves `model` to a backend profile, and forwards it to the corresponding `llama-server` OpenAI endpoint (`/v1/chat/completions`, `/v1/embeddings`, etc.) without changing field names or semantics beyond model/profile mapping.
+* Proxy takes the OpenAI-style request, resolves `model` to a backend profile, and forwards it to the corresponding `llama-server` OpenAI endpoint (`/v1/chat/completions`, `/v1/embeddings`, etc.) without changing field names or semantics beyond model/profile mapping and removing `stream` when it is `true` on embedding or rerank requests.
 * Hop-by-hop header fields (RFC 9110 §7.6.1) are never relayed, in either direction, on any path (local instance or cluster peer, streaming or not): `Connection` and every field it names, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, and `Upgrade`. The client's connection to the proxy and the proxy's connections to instances and peers each manage their own persistence and framing, so, for example, the `Connection: close` that `llama-server` sends when it retires a pooled connection does not close the client's connection. `Host` and `Content-Length` are set for each outbound request.
 * For streaming:
 
@@ -1070,7 +1071,7 @@ Before admitting a new instance, the node verifies resources using fresh telemet
    * Recompute usage.
    * If still cannot start:
 
-     * Either queue request and wait for capacity (bounded by timeout), or immediately return `no_capacity` error depending on configuration.
+     * Queue the request and wait for capacity, subject to queue-length limits (`queue_full`) and the configured queue-wait timeout (`queue_timeout`); there is no configuration switch for immediate `no_capacity` rejection.
 
 External VRAM is never counted as evictable capacity. Eviction simulation subtracts each idle instance's exact contribution from the same accounting snapshot; unmapped stopping processes are not eviction candidates. Admission re-plans if reservations changed before committing an eviction. Peer headroom uses the same commitment-aware accounting.
 
@@ -1097,7 +1098,7 @@ Learned values are persisted in the metrics JSON file (at `metrics_path`) and ke
 
 On cold start (unknown args hash), the system cannot predict memory requirements. The trigger is any spawn failure on cold-start instances (not specifically OOM detection). The following multi-stage recovery process handles this:
 
-1. **Attempt spawn**: The instance is attempted with no pre-eviction (since memory estimate is unknown).
+1. **Attempt spawn**: The instance uses any cookbook memory estimates for admission and may pre-evict idle instances; without estimates, unknown memory cannot be reserved in advance.
 2. **Stage 1 (idle eviction)**: If spawn fails, evict all idle instances and retry.
 3. **Stage 2 (graceful eviction)**: If spawn still fails, drain all remaining instances (bounded by `shutdown_grace_period_seconds`), wait for in-flight requests to complete, evict all, and retry.
 4. **Stage 3 (wait for capacity)**: If spawn still fails after evicting everything, wait on a capacity notification for resources to become available.
@@ -1117,7 +1118,7 @@ Each node is responsible for its local `llama.cpp`.
 * Maintain a git clone at `repo_path`.
 * Periodically check for updates:
 
-  * `git fetch` + `git status` to detect new commits on `branch`.
+  * Fetch branches and tags, check out the configured ref, attempt `git reset --hard origin/<ref>` for non-tags, and resolve `HEAD` to detect the commit. Tracked local edits in an existing branch checkout can be discarded.
 * On update:
 
   * Configure and build `llama.cpp` with configured `build_args` in per-commit build directories (`build-<hash>/`).
@@ -1152,8 +1153,8 @@ On build failure:
   twenty minutes (10s, 30s, 1m, 2m, 5m, 10m) to ride out boot-time network/DNS
   bring-up; the rebuild lock is released between attempts, and the retry loop
   stops early if a concurrent (e.g. manually triggered) rebuild succeeds.
-  Scheduled and manual rebuild failures are not retried — the next scheduled
-  check covers them.
+  Scheduled updates retry after 30, 120, and 300 seconds following the initial
+  failure. Manual rebuild failures are not retried.
 
 Manual control:
 
@@ -1188,7 +1189,7 @@ Every `gossip_interval_seconds`, nodes exchange metadata including:
 
 * `node_id`, `version` (proxy version), `llama_cpp_version` (llama.cpp commit of the binary currently serving, or `unknown` if it cannot be determined), supported models.
 * `loaded_models`: Which models are currently loaded and running.
-* `model_stats`: Per-model metrics including tokens per second, queue length, and learned VRAM/sysmem usage.
+* `model_stats`: Per-model metrics including tokens per second, queue length, and VRAM/sysmem estimates: positive learned values, otherwise cookbook estimates, otherwise 0, independently for each memory dimension.
 * `ready` flag: Whether the node is ready to serve (false when draining or binary is unavailable).
 * `known_peers`: List of known peers for transitive discovery (peers learn about peers-of-peers).
 * Current capacity and resource usage.
@@ -1381,17 +1382,17 @@ cluster:
 
 ## Logging & Tracing
 
-All logs are structured (JSON), one event per line, with UTC timestamps.
+All logs are structured (JSON), one event per line, with UTC timestamps. `RUST_LOG` controls the log filter and defaults to `info` when unset.
 
 With `logging.enabled`, events are also written to `<directory>/<filename>.YYYY-MM-DD`, one file per UTC day, rotated at UTC midnight. With `compression` (the default), a rotated file is gzip-compressed to `<filename>.YYYY-MM-DD.gz`. `max_keep_files` limits how many rotated files are kept. If the current day's file was already rotated when the node starts (for example, because the clock was set back), its compressed file is restored and appended to instead of being overwritten at the next rotation.
 
-Minimum fields for each log event:
+Log event fields (only `timestamp` and `level` are guaranteed):
 
 * `timestamp`
 * `level`
 * `node_id`
 * `session_id` (if available)
-* `request_id` (generated per request)
+* `request_id` (reused from the incoming header, or generated when absent)
 * `event` (short string)
 
 Examples of log events:
@@ -1406,7 +1407,7 @@ Examples of log events:
 
 * Routing:
 
-  * `event="route_decision"`, `chosen_node`, `candidate_nodes`, `scores`.
+  * `event="route_decision"`, `chosen_node`, and either `candidate_nodes` (prefer-local routing) or `scores` (scored routing).
 
 * Build manager:
 
@@ -1417,7 +1418,7 @@ Examples of log events:
 * Queueing:
 
   * `event="queue_enqueue"`, `model`, `queue_length`.
-  * `event="queue_dequeue"`, `token_id`.
+  * `event="queue_dequeue"`, `model_key`, `token`.
   * `event="queue_drop"`, `reason="full"` or `"timeout"`.
 
 ### Querying Error Logs
@@ -1441,7 +1442,7 @@ See **Cluster / Mesh Design > Security** above for Noise Protocol and mTLS detai
 
 ### Configuration Safety
 
-* No API keys or secrets stored in cookbook.
+* Backend API keys may be stored in cookbook `llama_server_args` via `--api-key` or `--api-key=...`; the proxy injects the key as Bearer authorization for the backend.
 * Sensitive values provided via:
 
   * Separate `secrets.yaml` with restricted permissions.

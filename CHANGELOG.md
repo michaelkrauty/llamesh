@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.33] - 2026-10-28
+
+### Documentation
+
+- Correct SPEC on how requests are handled: a model missing from the local cookbook is offered to cluster peers before a `404` is returned; responses, including streamed ones, are passed through unchanged; `stream: true` is removed from embedding and rerank requests; peer errors that report a temporary capacity shortage are retried rather than relayed; the proxy itself validates only the body and `model`; `Retry-After` is sent on inference and draining `503` responses, not on prewarm failures or the health probes; requests that lack resources always queue; forwarded requests can be forwarded on within the hop limit; the peer staleness window is at least 15 seconds; peers for a model not in the local cookbook are chosen by whether they have it loaded and then by queue length; a failed Noise attempt is never retried over plain HTTP or TLS; a process that cannot be executed ends in a `500` without peer fallback; and a cold start can evict idle instances when the cookbook gives memory estimates. `POST /admin/prewarm` now has its request and responses documented.
+- Correct SPEC on configuration, builds, metrics, and logs: list fields such as `cluster.peers` cannot be set from environment variables; `-m`/`--model` and `-hfr`/`--hf-repo` in `llama_server_args` select the startup or download timeout like `model_path` and `hf_repo`; update checks check out the configured ref and reset a branch to its remote; scheduled updates retry after 30, 120, and 300 seconds; memory values are MiB; the request counters cover requests admitted to routing; the per-hash latency series is `proxy_hash_p95_latency_ms`, labeled `hash` and `names`; `proxy_node_llamesh_sysmem_mb` is listed; gossiped memory values fall back to cookbook estimates; an `--api-key` in the cookbook is used as the instance's key; `RUST_LOG` sets the log filter; and the log event fields are described as they are emitted.
+- Note in the README that every node needs the same cluster token, also with mDNS discovery; in SECURITY that API keys are required when `auth.enabled` is true and that the health probes and `/version` stay public; in `config.example.yaml` that `max_instances_per_model: 0` is treated as 1 and that drain announcements bypass `max_concurrent_gossip`; and fix the usage text of `fetch-logs.sh` and `trace-request.sh`. Doc comments in `src/config.rs` are corrected to match.
+
 ## [1.21.32] - 2026-10-28
 
 ### Fixed

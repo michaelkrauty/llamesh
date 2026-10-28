@@ -8,9 +8,9 @@ Point any OpenAI-compatible client at llamesh and it handles the rest: spinning 
 
 - **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, over HTTP/1.1 or cleartext HTTP/2 (h2c)
 - **Automatic instance management** — on-demand spawn, idle eviction, health monitoring
-- **Multi-node mesh** — zero-config LAN discovery (mDNS) or explicit WAN peers, encrypted with Noise Protocol
+- **Multi-node mesh** — automatic LAN discovery (mDNS) or explicit WAN peers, encrypted with Noise Protocol
 - **Model profiles** — configure multiple profiles per model (e.g. `fast` vs `quality`) with different llama-server args
-- **Resource guardrails** — device-wide VRAM telemetry and system memory tracking prevent OOM
+- **Resource guardrails** — device-wide VRAM telemetry and system memory tracking guard against OOM
 - **Hot-reload cookbook** — add/modify models without restarting
 - **Auto-build llama.cpp** — clones, builds, smoke tests, and atomically swaps binaries
 - **Hugging Face integration** — download models automatically via `hf_repo`/`hf_file`
@@ -118,7 +118,7 @@ for chunk in response:
 
 Enable clustering to spread load across machines. Nodes discover each other and route requests to wherever capacity is available.
 
-**Zero-config LAN** — just enable it:
+**LAN discovery** — enable clustering to discover peers automatically via mDNS:
 
 ```yaml
 cluster:
@@ -135,7 +135,7 @@ cluster:
   peers: ["other-node.example.com:8080"]
 ```
 
-Inter-node traffic is encrypted with Noise Protocol (keys auto-generated, Trust-On-First-Use by default).
+Inter-node traffic is encrypted with Noise Protocol (keys auto-generated, Trust-On-First-Use by default). All nodes must share the same cluster token: copy the `cluster_token` file a node generates on first start to the other nodes, or set the same `CLUSTER_TOKEN` environment variable on each. mDNS only removes the need for a peer list.
 
 ## Model Profiles
 

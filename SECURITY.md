@@ -3,7 +3,7 @@
 ## Supported Versions
 
 Only the latest release receives security fixes. llamesh moves quickly and
-upgrades are designed to be drop-in: counters and learned state persist
+upgrades are designed to be drop-in: learned state and most counters persist
 across in-place upgrades, and configuration is backwards compatible within a
 major version.
 
@@ -22,10 +22,11 @@ of why the report is out of scope will follow as quickly as practical.
 llamesh's threat model and security posture are described in detail in
 [SPEC.md](SPEC.md) (see *Security Model*). The short version:
 
-- **Client authentication is optional.** When `auth` is configured, API keys
-  are required on client-facing endpoints and compared in constant time.
-  Without it, anyone who can reach the listen address can use the API and
-  the admin endpoints — deploy on a trusted network or behind your own
+- **Client authentication is optional.** When `auth.enabled` is true, API keys
+  are required on protected endpoints and compared in constant time.
+  Health/readiness endpoints and the basic `/version` response remain public.
+  With auth disabled, anyone who can reach the listen address can use the API
+  and the admin endpoints — deploy on a trusted network or behind your own
   authenticating proxy if you leave auth off.
 - **Inter-node traffic** is encrypted with the Noise Protocol by default
   (Trust-On-First-Use key exchange; key files are created with mode 600),
