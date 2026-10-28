@@ -33,6 +33,40 @@ use tracing::{error, info, warn, Instrument};
 
 const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+fn node_error_to_app_error(error: NodeError) -> AppError {
+    match error {
+        NodeError::Draining => AppError::node_draining(),
+        NodeError::SpawnFailuresExhausted => AppError::service_unavailable(
+            "All nodes failed to spawn instance for this model",
+            "spawn_failures_exhausted",
+        )
+        .with_header(RETRY_AFTER, HeaderValue::from_static("30")),
+        NodeError::QueueFull => {
+            AppError::new(StatusCode::SERVICE_UNAVAILABLE, "Queue full", "queue_full")
+                .with_header(RETRY_AFTER, HeaderValue::from_static("5"))
+        }
+        NodeError::QueueTimeout => AppError::service_unavailable("Queue timeout", "queue_timeout")
+            .with_header(RETRY_AFTER, HeaderValue::from_static("5")),
+        NodeError::InsufficientResources => {
+            AppError::service_unavailable("Insufficient resources", "no_capacity")
+                .with_header(RETRY_AFTER, HeaderValue::from_static("30"))
+        }
+        NodeError::Other(inner) => {
+            let msg = inner.to_string();
+            if msg.contains("timed out") {
+                AppError::new(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "Request timed out",
+                    "request_timeout",
+                )
+            } else {
+                AppError::internal_server_error(msg)
+            }
+        }
+        _ => AppError::internal_server_error(error.to_string()),
+    }
+}
+
 /// Wait for a capacity notification, but bail early if the client has
 /// disconnected. Returns `Err` if the client is gone.
 ///
@@ -1596,42 +1630,7 @@ pub async fn route_request(
                     state.metrics.inc_errors();
                     hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
 
-                    match e {
-                        NodeError::SpawnFailuresExhausted => Err(AppError::service_unavailable(
-                            "All nodes failed to spawn instance for this model",
-                            "spawn_failures_exhausted",
-                        )
-                        .with_header(RETRY_AFTER, HeaderValue::from_static("30"))),
-                        NodeError::QueueFull => Err(AppError::new(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Queue full",
-                            "queue_full",
-                        )
-                        .with_header(RETRY_AFTER, HeaderValue::from_static("5"))),
-                        NodeError::QueueTimeout => Err(AppError::service_unavailable(
-                            "Queue timeout",
-                            "queue_timeout",
-                        )
-                        .with_header(RETRY_AFTER, HeaderValue::from_static("5"))),
-                        NodeError::InsufficientResources => Err(AppError::service_unavailable(
-                            "Insufficient resources",
-                            "no_capacity",
-                        )
-                        .with_header(RETRY_AFTER, HeaderValue::from_static("30"))),
-                        NodeError::Other(inner) => {
-                            let msg = inner.to_string();
-                            if msg.contains("timed out") {
-                                Err(AppError::new(
-                                    StatusCode::REQUEST_TIMEOUT,
-                                    "Request timed out",
-                                    "request_timeout",
-                                ))
-                            } else {
-                                Err(AppError::internal_server_error(msg))
-                            }
-                        }
-                        _ => Err(AppError::internal_server_error(e.to_string())),
-                    }
+                    Err(node_error_to_app_error(e))
                 }
             }
         } else {
@@ -2604,6 +2603,18 @@ fn ensure_profile_supports_endpoint(
 mod tests {
     use super::*;
     use std::os::unix::io::AsRawFd;
+
+    #[tokio::test]
+    async fn node_draining_error_returns_retryable_503() {
+        let response = node_error_to_app_error(NodeError::Draining).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "5");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "draining");
+    }
 
     // A live, connected server-side socket whose peer is still attached.
     async fn connected_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {

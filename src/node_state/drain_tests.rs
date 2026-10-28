@@ -160,3 +160,129 @@ async fn forced_drains_promote_scheduler_drains_and_cannot_be_cancelled() {
         );
     }
 }
+
+async fn queue_waiter(
+    state: &Arc<NodeState>,
+    wait_ms: u64,
+) -> tokio::task::JoinHandle<Result<Arc<RwLock<Instance>>, NodeError>> {
+    let mut profile = sample_profile();
+    profile.max_wait_in_queue_ms = Some(wait_ms);
+    profile.max_queue_size = Some(0);
+    let state = state.clone();
+    tokio::spawn(async move { state.get_instance_for_model("queued", &profile, true).await })
+}
+
+async fn assert_queue_drained(state: &NodeState) {
+    assert!(state.queues.read().await.is_empty());
+    assert!(state.pending_tokens.read().await.is_empty());
+    assert_eq!(
+        state.metrics.queue_pending_tokens.load(Ordering::Relaxed),
+        0
+    );
+    assert!(state.is_idle().await);
+}
+
+async fn shutdown_wakes_local_queue(wait_ms: u64) {
+    let state = state().await;
+    // A pre-map reservation fills the profile limit without starting a process.
+    let _blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let mut waiters = Vec::new();
+    for count in 1..=3 {
+        waiters.push(queue_waiter(&state, wait_ms).await);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if state
+                    .queues
+                    .read()
+                    .await
+                    .get("queued:default")
+                    .map_or(0, VecDeque::len)
+                    == count
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request did not join the local queue");
+    }
+    assert!(!state.is_idle().await);
+    let capacity = state.capacity_notify.notified();
+    let shutdown = state.shutdown_notify.notified();
+    tokio::pin!(capacity, shutdown);
+    capacity.as_mut().enable();
+    shutdown.as_mut().enable();
+    state.begin_shutdown_drain().await;
+    timeout(Duration::from_secs(1), capacity).await.unwrap();
+    timeout(Duration::from_secs(1), shutdown).await.unwrap();
+    for waiter in waiters {
+        let result = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("shutdown left a local queue waiter asleep")
+            .unwrap();
+        assert!(matches!(result, Err(NodeError::Draining)), "{result:?}");
+    }
+    assert_queue_drained(&state).await;
+}
+
+#[tokio::test]
+async fn shutdown_drain_wakes_infinite_local_queue_waiters() {
+    shutdown_wakes_local_queue(0).await;
+}
+
+#[tokio::test]
+async fn shutdown_drain_wakes_finite_local_queue_waiters() {
+    shutdown_wakes_local_queue(60_000).await;
+}
+
+async fn shutdown_after_wake_before_enqueue(fairness: bool) {
+    for wait_ms in [0, 60_000] {
+        let state = state().await;
+        let _blocker = state
+            .spawn_reservations
+            .reserve("queued:default".into(), (0, 0), None);
+        // A promoted waiter forces the fairness enqueue site rather than admission.
+        let mut prior = if fairness {
+            Some(
+                state
+                    .promote_pending_token("queued:default".into(), 100)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *state.test_hooks.before_enqueue.lock() = Some((entered_tx, release_rx));
+        let waiter = queue_waiter(&state, wait_ms).await;
+        timeout(Duration::from_secs(1), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.queues.read().await.is_empty());
+        state.begin_shutdown_drain().await;
+        release_tx.send(()).unwrap();
+        let result = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("enqueue after shutdown wake must not sleep")
+            .unwrap();
+        assert!(matches!(result, Err(NodeError::Draining)), "{result:?}");
+        if let Some(ref mut token) = prior {
+            token.release().await;
+        }
+        assert_queue_drained(&state).await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_drain_rejects_admission_enqueue_after_wake() {
+    shutdown_after_wake_before_enqueue(false).await;
+}
+
+#[tokio::test]
+async fn shutdown_drain_rejects_fairness_enqueue_after_wake() {
+    shutdown_after_wake_before_enqueue(true).await;
+}

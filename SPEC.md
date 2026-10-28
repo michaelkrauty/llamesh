@@ -1367,7 +1367,7 @@ cluster:
     * `/readyz` returns non-200.
     * Stop accepting new requests (client and peer). The listening socket is closed, so new connections are refused at once; connections already accepted stay open, and a new request on one of them gets `503` `draining`. A cluster peer whose connection is refused treats it as a transport failure and routes the request to another node.
     * Send a gossip round immediately, so peers learn that the node is no longer ready without waiting for the next `gossip_interval_seconds`. Before exiting, the node waits up to 5 seconds, within `shutdown_grace_period_seconds`, for that round to be sent, so that an idle node, whose drain finishes at once, normally does not exit first. The announcement is best effort: if it is not sent in time, peers learn of the shutdown as before, from refused connections and the node's absence.
-    * Wake all requests blocked waiting for capacity so they can exit promptly.
+    * Wake all requests blocked waiting for capacity, including local model queues, so they exit promptly with `503` `draining`, like new requests on a draining node.
   * Wait for in-flight requests and queues to drain up to `shutdown_grace_period_seconds`.
 
 * When the drain completes, or `shutdown_grace_period_seconds` runs out first:

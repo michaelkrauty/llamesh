@@ -36,6 +36,8 @@ use tracing::{error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
+    #[error("Node is shutting down")]
+    Draining,
     #[error("Max instances for this profile reached")]
     MaxInstancesProfile,
     #[error("Max instances per node reached")]
@@ -1603,7 +1605,7 @@ impl NodeState {
                 if let Some(mut token) = my_token.take() {
                     token.release().await;
                 }
-                return Err(NodeError::Other(anyhow::anyhow!("Node is shutting down")));
+                return Err(NodeError::Draining);
             }
             // Check timeout only if configured (None = infinite wait)
             if let Some(timeout) = queue_timeout {
@@ -1652,6 +1654,8 @@ impl NodeState {
 
                 // There are waiters ahead of us - join the queue instead of trying to grab slot
                 let key = format!("{}:{}", model_name, profile.id);
+                #[cfg(test)]
+                guardrail_tests::pause_at(&self.test_hooks.before_enqueue).await;
                 let (tx, rx) = oneshot::channel();
                 let queue_token;
 
@@ -1703,6 +1707,15 @@ impl NodeState {
                             "Queue growing large - consider increasing capacity");
                     }
                     info!(event = "queue_enqueue", model = %model_name, queue_length = queue_len, reason = "fairness");
+                }
+
+                // Check after enqueue: the queues lock orders insertion against the
+                // shutdown wake, including requests that missed the wake entirely.
+                if self.draining.load(Ordering::Relaxed) {
+                    self.remove_queue_entry(&key, queue_token).await;
+                    self.remove_pending_token(model_name, &profile.id, queue_token)
+                        .await;
+                    return Err(NodeError::Draining);
                 }
 
                 // Wait for queue notification with optional timeout
@@ -2028,6 +2041,15 @@ impl NodeState {
                                 | NodeError::InsufficientResources
                         ) {
                             self.wake_queue_if_admissible(model_name, profile).await;
+                        }
+
+                        // Check after enqueue: the queues lock orders insertion against the
+                        // shutdown wake, including requests that missed the wake entirely.
+                        if self.draining.load(Ordering::Relaxed) {
+                            self.remove_queue_entry(&key, queue_token).await;
+                            self.remove_pending_token(model_name, &profile.id, queue_token)
+                                .await;
+                            return Err(NodeError::Draining);
                         }
 
                         // Wait for queue notification with optional timeout
@@ -3262,7 +3284,14 @@ impl NodeState {
         self.notify_queue_by_key(&key).await
     }
 
-    /// Notify one waiter per model that capacity is available.
+    /// Mark the node draining before waking shutdown, local queue, and capacity waiters.
+    pub async fn begin_shutdown_drain(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+        self.shutdown_notify.notify_waiters();
+        self.notify_all_queues().await;
+    }
+
+    /// Notify one waiter per model, or every waiter when the node is draining.
     /// Called when overall node capacity frees up (e.g., instance crash, eviction).
     pub async fn notify_all_queues(&self) {
         let keys: Vec<String> = {
@@ -3271,7 +3300,11 @@ impl NodeState {
         };
 
         for key in keys {
-            self.notify_queue_by_key(&key).await;
+            while self.notify_queue_by_key(&key).await {
+                if !self.draining.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
         }
 
         // Wake any cluster-aware waiters (route_or_wait callers)
