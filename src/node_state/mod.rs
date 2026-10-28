@@ -617,7 +617,7 @@ impl NodeState {
         let cluster_client = security::build_cluster_client(&config.cluster_tls)?;
         let http_client = build_local_upstream_client(config.upstream_read_timeout_ms)?;
 
-        let metrics = Metrics::load(std::path::Path::new(&config.metrics_path)).await;
+        let metrics = Metrics::load(std::path::Path::new(&config.metrics_path), &cookbook).await;
         let model_index = Arc::new(ModelIndex::new(&cookbook));
 
         // Initialize circuit breaker (before moving config into Arc)
@@ -724,6 +724,7 @@ impl NodeState {
 
         // Update model index
         self.model_index.rebuild(&new_cookbook).await;
+        self.metrics.migrate_args_hashes(&new_cookbook).await;
 
         // Update cookbook
         let mut cookbook = self.cookbook.write().await;
@@ -5284,6 +5285,125 @@ mod tests {
         // yields the "unknown" sentinel, which is what gossip and
         // /cluster/nodes will carry for this node.
         assert_eq!(self_peer.llama_cpp_version, "unknown");
+    }
+
+    #[tokio::test]
+    async fn cookbook_reload_migrates_legacy_hashes_without_resetting_live_metrics() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        config.metrics_path = dir.path().join("metrics.json").to_str().unwrap().into();
+        let seed = Metrics::new();
+        // Old sorted-token hash of both profiles below, including implicit args.
+        let legacy = "fcee904ff6c41ab3";
+        seed.get_hash_metrics(legacy).await.observe_memory(100, 200);
+        seed.inc_requests();
+        let snapshot = seed
+            .snapshot("test".into(), "test-build".into(), None, 0)
+            .await;
+        tokio::fs::write(&config.metrics_path, serde_json::to_vec(&snapshot).unwrap())
+            .await
+            .unwrap();
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, Cookbook { models: vec![] }, build_manager)
+            .await
+            .unwrap();
+        let source = state.metrics.get_hash_metrics(legacy).await;
+        source.observe_latency(17);
+        source.observe_memory(110, 210);
+        let source_updated = source.last_memory_update.lock().clone();
+        let cookbook_yaml = r#"
+models:
+  - name: model
+    profiles:
+      - id: first
+        model_path: /models/test.gguf
+        llama_server_args: "-c 4096 -b 2048"
+      - id: second
+        model_path: /models/test.gguf
+        llama_server_args: "-c 2048 -b 4096"
+"#;
+        let cookbook: Cookbook = serde_yaml::from_str(cookbook_yaml).unwrap();
+        let existing_hash = args_hash_for_profile(&cookbook.models[0].profiles[0]);
+        let added_hash = args_hash_for_profile(&cookbook.models[0].profiles[1]);
+        let existing = state.metrics.get_hash_metrics(&existing_hash).await;
+        existing.observe_memory(999, 2000);
+        existing.observe_latency(23);
+        let unrelated = state.metrics.get_hash_metrics("live-unrelated").await;
+        unrelated.observe_latency(29);
+        state.metrics.inc_requests();
+        state.metrics.inc_errors();
+        // Reload must use live state, even if the disk snapshot is now invalid.
+        tokio::fs::write(&state.config.metrics_path, b"invalid snapshot")
+            .await
+            .unwrap();
+        let cookbook_path = dir.path().join("cookbook.yaml");
+        tokio::fs::write(&cookbook_path, cookbook_yaml)
+            .await
+            .unwrap();
+        state.reload_cookbook(&cookbook_path).await.unwrap();
+        assert_eq!(
+            state.get_args_hash_for_key("model:second").await,
+            Some(added_hash.clone())
+        );
+        let added = state.metrics.get_hash_metrics(&added_hash).await;
+        assert_eq!(added.peak_vram_mb.load(Ordering::Relaxed), 110);
+        assert_eq!(added.peak_sysmem_mb.load(Ordering::Relaxed), 210);
+        assert_eq!(
+            added
+                .latency_samples
+                .lock()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![17]
+        );
+        assert_eq!(*added.last_memory_update.lock(), source_updated);
+        assert!(!Arc::ptr_eq(&source, &added));
+        added.observe_latency(31);
+        assert_eq!(source.latency_samples.lock().len(), 1);
+        assert_eq!(state.metrics.requests_total.load(Ordering::Relaxed), 2);
+        assert_eq!(state.metrics.errors_total.load(Ordering::Relaxed), 1);
+        assert_eq!(state.metrics.current_requests.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(
+            &existing,
+            &state.metrics.get_hash_metrics(&existing_hash).await
+        ));
+        assert_eq!(existing.peak_vram_mb.load(Ordering::Relaxed), 999);
+        assert_eq!(
+            existing
+                .latency_samples
+                .lock()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![23]
+        );
+        assert!(Arc::ptr_eq(
+            &unrelated,
+            &state.metrics.get_hash_metrics("live-unrelated").await
+        ));
+        assert_eq!(
+            unrelated
+                .latency_samples
+                .lock()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![29]
+        );
+        let hashes = state
+            .metrics
+            .snapshot("test".into(), "test-build".into(), None, 0)
+            .await
+            .hashes;
+        assert!(!hashes.contains_key(legacy));
+        state.reload_cookbook(&cookbook_path).await.unwrap();
+        assert!(Arc::ptr_eq(
+            &added,
+            &state.metrics.get_hash_metrics(&added_hash).await
+        ));
+        assert_eq!(added.latency_samples.lock().len(), 2);
     }
 
     #[tokio::test]

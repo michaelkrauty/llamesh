@@ -64,6 +64,24 @@ impl Default for HashMetrics {
 }
 
 impl HashMetrics {
+    fn clone_for_migration(&self) -> Self {
+        Self {
+            requests_total: AtomicU64::new(self.requests_total.load(Ordering::Relaxed)),
+            errors_total: AtomicU64::new(self.errors_total.load(Ordering::Relaxed)),
+            tokens_generated_total: AtomicU64::new(
+                self.tokens_generated_total.load(Ordering::Relaxed),
+            ),
+            total_latency_ms: AtomicU64::new(self.total_latency_ms.load(Ordering::Relaxed)),
+            latency_samples: Mutex::new(self.latency_samples.lock().clone()),
+            peak_vram_mb: AtomicU64::new(self.peak_vram_mb.load(Ordering::Relaxed)),
+            peak_sysmem_mb: AtomicU64::new(self.peak_sysmem_mb.load(Ordering::Relaxed)),
+            sample_count: AtomicU64::new(self.sample_count.load(Ordering::Relaxed)),
+            last_memory_update: Mutex::new(self.last_memory_update.lock().clone()),
+            display_names: Mutex::new(self.display_names.lock().clone()),
+            parsed_params: Mutex::new(self.parsed_params.lock().clone()),
+        }
+    }
+
     /// Record one locally-served request's latency. This is the single
     /// accumulation point for `total_latency_ms`, so callers must not also add
     /// to that counter themselves — doing both double-counts the latency and
@@ -314,6 +332,39 @@ pub struct MetricsSnapshot {
     pub node_resources: NodeResourceMetricsSnapshot,
 }
 
+/// Previous sorted-token hash, used only to recover persisted profile metrics.
+fn legacy_args_hash(args: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut filtered = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--host" || arg == "--port" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--host=") || arg.starts_with("--port=") {
+            continue;
+        }
+        filtered.push(arg);
+    }
+    filtered.sort();
+    let mut hash = Sha256::new();
+    for arg in filtered {
+        hash.update(arg.as_bytes());
+        hash.update(b"\0");
+    }
+    let result = hash.finalize();
+    format!(
+        "{:016x}",
+        u64::from_be_bytes(result[..8].try_into().unwrap())
+    )
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct NodeResourceMetricsSnapshot {
     pub llamesh_vram_mb: u64,
@@ -390,14 +441,18 @@ impl Metrics {
         Self::default()
     }
 
-    pub async fn load(path: &std::path::Path) -> Self {
+    pub async fn load(path: &std::path::Path, cookbook: &crate::config::Cookbook) -> Self {
         if !path.exists() {
             return Self::new();
         }
 
         match tokio::fs::read(path).await {
             Ok(bytes) => match serde_json::from_slice::<MetricsSnapshot>(&bytes) {
-                Ok(snapshot) => Self::from_snapshot(snapshot),
+                Ok(snapshot) => {
+                    let metrics = Self::from_snapshot(snapshot);
+                    metrics.migrate_args_hashes(cookbook).await;
+                    metrics
+                }
                 Err(e) => {
                     tracing::warn!("Failed to parse metrics snapshot: {}", e);
                     Self::new()
@@ -408,6 +463,42 @@ impl Metrics {
                 Self::new()
             }
         }
+    }
+
+    pub async fn migrate_args_hashes(&self, cookbook: &crate::config::Cookbook) -> usize {
+        let mut hashes = self.hash_metrics.write().await;
+        let mut migrated = HashMap::new();
+        let mut legacy_hashes = HashSet::new();
+        for model in &cookbook.models {
+            for profile in &model.profiles {
+                let (args, _, _) = crate::node_state::build_pre_args(profile);
+                let legacy = legacy_args_hash(&args);
+                let new = crate::instance::compute_args_hash(&args);
+                if legacy != new {
+                    if let Some(metrics) = hashes.get(&legacy) {
+                        if !hashes.contains_key(&new) {
+                            migrated
+                                .entry(new)
+                                .or_insert_with(|| Arc::new(metrics.clone_for_migration()));
+                        }
+                        legacy_hashes.insert(legacy);
+                    }
+                }
+            }
+        }
+        // Keep sources until all profiles, including disabled ones, have copies.
+        for legacy in legacy_hashes {
+            hashes.remove(&legacy);
+        }
+        let count = migrated.len();
+        hashes.extend(migrated);
+        if count > 0 {
+            tracing::info!(
+                migrated = count,
+                "Migrated legacy args-hash metrics entries"
+            );
+        }
+        count
     }
 
     fn from_snapshot(snapshot: MetricsSnapshot) -> Self {
@@ -1078,6 +1169,138 @@ fn escape_label_value(s: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_legacy_args_hash_migration() {
+        let cookbook: crate::config::Cookbook = serde_yaml::from_str(
+            r#"
+models:
+  - name: model
+    profiles:
+      - id: first
+        model_path: /models/test.gguf
+        llama_server_args: "-c 4096 -b 2048"
+      - id: second
+        enabled: false
+        model_path: /models/test.gguf
+        llama_server_args: "-c 2048 -b 4096"
+      - id: disabled
+        enabled: false
+        model_path: /models/test.gguf
+        llama_server_args: "-c 1024 -b 512"
+  - name: disabled-model
+    enabled: false
+    profiles:
+      - id: default
+        model_path: /models/disabled.gguf
+        llama_server_args: ""
+"#,
+        )
+        .unwrap();
+        // Independently computed using the old sorted-token SHA-256 algorithm,
+        // including build_pre_args' implicit model source and --fit off.
+        let legacy = "fcee904ff6c41ab3";
+        let disabled_profile_legacy = "28a1695b99893b9f";
+        let disabled_model_legacy = "cb1c8e2233a2530f";
+        let hashes: Vec<_> = cookbook.models[0]
+            .profiles
+            .iter()
+            .map(crate::node_state::args_hash_for_profile)
+            .collect();
+        assert_ne!(hashes[0], hashes[1]);
+        let payload = serde_json::json!({
+            "display_names": ["model:first"],
+            "requests_total": 2, "errors_total": 1,
+            "tokens_generated_total": 123, "avg_latency_ms": 17.0,
+            "total_latency_ms": 34, "p95_latency_ms": 0,
+            "peak_vram_mb": 100, "peak_sysmem_mb": 200, "sample_count": 3,
+            "parsed_model_params": {
+                "params": {"n_ctx": 4096}, "llama_cpp_version": "test-build"
+            }
+        });
+        let expected = serde_json::to_value(
+            serde_json::from_value::<HashMetricsSnapshot>(payload.clone()).unwrap(),
+        )
+        .unwrap();
+        for existing_new in 0..=2 {
+            let dir = tempfile::tempdir_in(".").unwrap();
+            let path = dir.path().join("metrics.json");
+            let mut snapshot = serde_json::json!({
+                "node_id": "test", "llama_cpp_version": "test-build",
+                "requests_total": 2, "errors_total": 1, "current_requests": 0,
+                "hashes": {
+                    legacy: payload.clone(), "unrelated": payload.clone(),
+                    disabled_profile_legacy: payload.clone(), disabled_model_legacy: payload.clone()
+                },
+                "updated_at": "2026-10-28T00:00:00Z"
+            });
+            for hash in &hashes[..existing_new] {
+                snapshot["hashes"][hash] = payload.clone();
+                snapshot["hashes"][hash]["peak_vram_mb"] = 999.into();
+            }
+            tokio::fs::write(&path, serde_json::to_vec(&snapshot).unwrap())
+                .await
+                .unwrap();
+            let metrics = Metrics::load(&path, &cookbook).await;
+            let migrated = metrics
+                .snapshot("test".into(), "test-build".into(), None, 0)
+                .await;
+            assert!(migrated.hashes.contains_key(&hashes[1]));
+            assert!(!migrated.hashes.contains_key(legacy));
+            assert!(!migrated.hashes.contains_key(disabled_profile_legacy));
+            assert!(!migrated.hashes.contains_key(disabled_model_legacy));
+            assert_eq!(migrated.hashes.len(), 5);
+            for (index, hash) in hashes.iter().enumerate() {
+                let mut expected = expected.clone();
+                if index < existing_new {
+                    expected["peak_vram_mb"] = 999.into();
+                }
+                assert_eq!(
+                    serde_json::to_value(&migrated.hashes[hash]).unwrap(),
+                    expected
+                );
+                let hm = metrics.get_hash_metrics(hash).await;
+                assert_eq!(
+                    hm.get_parsed_params(Some("test-build")).unwrap().n_ctx,
+                    Some(4096)
+                );
+            }
+            for untouched in [
+                "unrelated".to_string(),
+                crate::node_state::args_hash_for_profile(&cookbook.models[1].profiles[0]),
+            ] {
+                assert_eq!(
+                    serde_json::to_value(&migrated.hashes[&untouched]).unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(migrated.requests_total, 2);
+            assert_eq!(migrated.errors_total, 1);
+            // Corrected entries must remain independent after a legacy collision.
+            metrics
+                .get_hash_metrics(&hashes[0])
+                .await
+                .observe_memory(1000, 2000);
+            assert_eq!(
+                metrics.get_learned_memory(&hashes[1]).await,
+                Some((if existing_new == 2 { 999 } else { 100 }, 200))
+            );
+            tokio::fs::write(&path, serde_json::to_vec(&migrated).unwrap())
+                .await
+                .unwrap();
+            let reloaded = Metrics::load(&path, &cookbook).await;
+            assert_eq!(
+                serde_json::to_value(
+                    reloaded
+                        .snapshot("test".into(), "test-build".into(), None, 0)
+                        .await
+                        .hashes
+                )
+                .unwrap(),
+                serde_json::to_value(migrated.hashes).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn test_escape_label_value() {
         assert_eq!(escape_label_value("normal"), "normal");
@@ -1436,7 +1659,7 @@ mod tests {
             tokio::fs::write(&path, serde_json::to_vec(&snapshot).unwrap())
                 .await
                 .unwrap();
-            metrics = Metrics::load(&path).await;
+            metrics = Metrics::load(&path, &crate::config::Cookbook { models: vec![] }).await;
             outputs.push(render_prometheus_with_circuit_breaker(&metrics, None, "test", 0).await);
         }
 
