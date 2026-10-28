@@ -15,6 +15,72 @@ pub enum PortError {
     PortInUse(u16),
 }
 
+/// A port taken from the pool for an instance that is not yet in the instance
+/// map. Dropping the lease, as happens when the spawn is cancelled, returns
+/// the port; once the instance is in the map, `handoff` leaves the port to the
+/// instance's cleanup instead.
+pub struct PortLease {
+    used_ports: Arc<RwLock<HashSet<u16>>>,
+    port: u16,
+    armed: bool,
+}
+
+impl PortLease {
+    fn new(used_ports: Arc<RwLock<HashSet<u16>>>, port: u16) -> Self {
+        Self {
+            used_ports,
+            port,
+            armed: true,
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Return the port to the pool now, rather than possibly later from a task
+    /// spawned by `Drop`, so the next allocation sees it free.
+    pub async fn release(mut self) {
+        self.used_ports.write().await.remove(&self.port);
+        self.armed = false;
+    }
+
+    /// Hand the port to the instance now in the instance map, whose cleanup
+    /// releases it.
+    pub fn handoff(mut self) -> u16 {
+        self.armed = false;
+        self.port
+    }
+}
+
+impl Drop for PortLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut used) = self.used_ports.try_write() {
+            used.remove(&self.port);
+            return;
+        }
+
+        let used_ports = self.used_ports.clone();
+        let port = self.port;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    used_ports.write().await.remove(&port);
+                });
+            }
+            Err(_) => {
+                warn!(
+                    port = port,
+                    "Port cleanup skipped: tokio runtime unavailable during drop"
+                );
+            }
+        }
+    }
+}
+
 /// Manages port allocation for llama-server instances.
 pub struct PortPool {
     used_ports: Arc<RwLock<HashSet<u16>>>,
@@ -35,7 +101,7 @@ impl PortPool {
     }
 
     #[cfg(test)]
-    fn new_without_os_port_check(ports_config: Option<LlamaCppPorts>) -> Self {
+    pub(super) fn new_without_os_port_check(ports_config: Option<LlamaCppPorts>) -> Self {
         Self {
             used_ports: Arc::new(RwLock::new(HashSet::new())),
             ports_config,
@@ -44,7 +110,7 @@ impl PortPool {
     }
 
     /// Get an available port from the pool.
-    pub async fn get_available_port(&self) -> Result<u16, PortError> {
+    pub async fn get_available_port(&self) -> Result<PortLease, PortError> {
         let mut used = self.used_ports.write().await;
 
         if let Some(ports_config) = &self.ports_config {
@@ -53,7 +119,7 @@ impl PortPool {
                 for port in explicit_ports {
                     if !used.contains(port) && self.is_port_available(*port).await {
                         used.insert(*port);
-                        return Ok(*port);
+                        return Ok(PortLease::new(self.used_ports.clone(), *port));
                     }
                 }
             }
@@ -63,7 +129,7 @@ impl PortPool {
                     for port in range.start..=range.end {
                         if !used.contains(&port) && self.is_port_available(port).await {
                             used.insert(port);
-                            return Ok(port);
+                            return Ok(PortLease::new(self.used_ports.clone(), port));
                         }
                     }
                 }
@@ -80,7 +146,7 @@ impl PortPool {
             for port in (start..20000).chain(10000..start) {
                 if !used.contains(&port) && self.is_port_available(port).await {
                     used.insert(port);
-                    return Ok(port);
+                    return Ok(PortLease::new(self.used_ports.clone(), port));
                 }
             }
             warn!("No available ephemeral ports found");
@@ -114,13 +180,13 @@ impl PortPool {
     }
 
     /// Reserve a specific port.
-    pub async fn reserve_specific_port(&self, port: u16) -> Result<(), PortError> {
+    pub async fn reserve_specific_port(&self, port: u16) -> Result<PortLease, PortError> {
         let mut used = self.used_ports.write().await;
         if used.contains(&port) {
             return Err(PortError::PortInUse(port));
         }
         used.insert(port);
-        Ok(())
+        Ok(PortLease::new(self.used_ports.clone(), port))
     }
 
     /// Check if a port is currently reserved (for testing).
@@ -170,10 +236,78 @@ mod tests {
         }
     }
 
+    async fn test_lease(specific: bool) -> (PortPool, PortLease) {
+        let port = 24_237;
+        let pool = PortPool::new_without_os_port_check(Some(LlamaCppPorts {
+            ports: Some(vec![port]),
+            ranges: None,
+        }));
+        let lease = if specific {
+            pool.reserve_specific_port(port).await.unwrap()
+        } else {
+            pool.get_available_port().await.unwrap()
+        };
+        assert_eq!(lease.port(), port);
+        assert!(pool.is_reserved(port).await);
+        (pool, lease)
+    }
+
+    #[tokio::test]
+    async fn test_dropped_port_lease_releases_port() {
+        for specific in [false, true] {
+            let (pool, lease) = test_lease(specific).await;
+            let port = lease.port();
+            drop(lease);
+            assert!(!pool.is_reserved(port).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropped_port_lease_releases_port_after_contention() {
+        for specific in [false, true] {
+            let (pool, lease) = test_lease(specific).await;
+            let port = lease.port();
+            let used = pool.used_ports.read().await;
+            drop(lease);
+            assert!(used.contains(&port));
+            drop(used);
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while pool.is_reserved(port).await {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("dropped lease must release the port after lock contention");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_explicitly_released_port_lease_releases_port() {
+        for specific in [false, true] {
+            let (pool, lease) = test_lease(specific).await;
+            let port = lease.port();
+            lease.release().await;
+            assert!(!pool.is_reserved(port).await);
+            let replacement = pool.get_available_port().await.unwrap();
+            assert_eq!(replacement.port(), port);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handed_off_port_lease_keeps_port_reserved() {
+        for specific in [false, true] {
+            let (pool, lease) = test_lease(specific).await;
+            let port = lease.handoff();
+            assert!(pool.is_reserved(port).await);
+            pool.release_port(port).await;
+            assert!(!pool.is_reserved(port).await);
+        }
+    }
+
     #[tokio::test]
     async fn test_get_available_port_ephemeral() {
         let pool = PortPool::new(None);
-        let port = pool.get_available_port().await.unwrap();
+        let port = pool.get_available_port().await.unwrap().handoff();
         assert!((10000..20000).contains(&port));
         assert!(pool.is_reserved(port).await);
     }
@@ -181,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn test_release_port() {
         let pool = PortPool::new(None);
-        let port = pool.get_available_port().await.unwrap();
+        let port = pool.get_available_port().await.unwrap().handoff();
         assert!(pool.is_reserved(port).await);
         pool.release_port(port).await;
         assert!(!pool.is_reserved(port).await);
@@ -191,7 +325,7 @@ mod tests {
     async fn test_reserve_specific_port() {
         let pool = PortPool::new(None);
         let port = free_test_port().await;
-        pool.reserve_specific_port(port).await.unwrap();
+        pool.reserve_specific_port(port).await.unwrap().handoff();
         assert!(pool.is_reserved(port).await);
 
         // Second reservation should fail
@@ -211,7 +345,7 @@ mod tests {
         };
         let pool = PortPool::new_without_os_port_check(Some(config));
 
-        assert_eq!(pool.get_available_port().await.unwrap(), port);
+        assert_eq!(pool.get_available_port().await.unwrap().handoff(), port);
     }
 
     #[tokio::test]
@@ -224,7 +358,7 @@ mod tests {
         let pool = PortPool::new_without_os_port_check(Some(config));
 
         for port in &ports {
-            pool.reserve_specific_port(*port).await.unwrap();
+            pool.reserve_specific_port(*port).await.unwrap().handoff();
         }
 
         let result = pool.get_available_port().await;
@@ -253,7 +387,7 @@ mod tests {
         };
         let pool = PortPool::new_without_os_port_check(Some(config));
 
-        assert_eq!(pool.get_available_port().await.unwrap(), port);
+        assert_eq!(pool.get_available_port().await.unwrap().handoff(), port);
 
         // Second allocation should fail
         let result = pool.get_available_port().await;
@@ -272,9 +406,9 @@ mod tests {
         };
         let pool = PortPool::new_without_os_port_check(Some(config));
 
-        let port1 = pool.get_available_port().await.unwrap();
+        let port1 = pool.get_available_port().await.unwrap().handoff();
         pool.release_port(port1).await;
-        let port2 = pool.get_available_port().await.unwrap();
+        let port2 = pool.get_available_port().await.unwrap().handoff();
 
         // Should get the same port back
         assert_eq!(port1, port2);

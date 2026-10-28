@@ -15,6 +15,7 @@ use tokio::time::{timeout, Duration};
 /// and are consumed once, so an individual test controls exactly one race.
 #[derive(Default)]
 pub(super) struct TestHooks {
+    pub(super) after_port: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) after_reserve: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) before_enqueue: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) after_enqueue: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
@@ -184,6 +185,35 @@ fn attach_live_child(instance: &Instance) -> u32 {
     let pid = child.id().expect("sleep child pid");
     *instance.child.lock() = Some(child);
     pid
+}
+
+#[tokio::test]
+async fn cancelled_spawn_before_mapping_releases_port() {
+    let port = 24_237;
+    let mut config = test_config();
+    config.llama_cpp_ports = Some(crate::config::LlamaCppPorts {
+        ports: Some(vec![port]),
+        ranges: None,
+    });
+    let ports_config = config.llama_cpp_ports.clone();
+    let mut state = test_state(config).await;
+    Arc::get_mut(&mut state).unwrap().port_pool =
+        Arc::new(PortPool::new_without_os_port_check(ports_config));
+    let (entered, _release) = install_pause(&state.test_hooks.after_port);
+
+    let spawn_state = state.clone();
+    let spawn = tokio::spawn(async move {
+        spawn_state
+            .try_get_or_spawn("a", &profile("a", 400, 100), false, "test", false)
+            .await
+    });
+    wait_for_hook(entered, "port allocation pause").await;
+    assert!(state.port_pool.is_reserved(port).await);
+    assert!(state.instances.read().await.is_empty());
+
+    spawn.abort();
+    assert!(spawn.await.unwrap_err().is_cancelled());
+    assert!(!state.port_pool.is_reserved(port).await);
 }
 
 #[tokio::test]
