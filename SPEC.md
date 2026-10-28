@@ -705,7 +705,7 @@ The proxy follows the same general error envelope and HTTP semantics as OpenAI's
 
 #### Error JSON Envelope
 
-Errors that the proxy's request handlers generate on the OpenAI-compatible endpoints, and its API-key authentication, body-read timeout, and draining errors on every endpoint, use a JSON body of the form below. An error response from a `llama-server` instance or a cluster peer is relayed with its own status and body, except recognized peer saturation 5xx errors, which are consumed and retried or waited on. A request the HTTP router rejects before any handler runs, such as one with the wrong method, gets the router's plain response; relayed errors and router rejections need not follow this form.
+Errors that the proxy's request handlers generate on the OpenAI-compatible endpoints, and its API-key authentication, body-read timeout, and draining errors on every endpoint, use a JSON body of the form below. An error response from a `llama-server` instance or a cluster peer is relayed with its own status and body, except recognized peer saturation 5xx errors and attributed peer drain rejections, which are consumed and retried or waited on. A request the HTTP router rejects before any handler runs, such as one with the wrong method, gets the router's plain response; relayed errors and router rejections need not follow this form.
 
 ```json
 {
@@ -724,6 +724,7 @@ The fields are:
 * `type`: Short, machine-readable identifier (e.g. `"invalid_request_error"`, `"model_not_found"`, `"no_capacity"`, `"queue_full"`, `"queue_timeout"`, `"authentication_error"`).
 * `param`: Optional name of the offending parameter (e.g. `"model"`, `"max_tokens"`), or `null` when not applicable.
 * `code`: Optional, implementation-defined code (string or `null`), which operators can use for finer-grained diagnostics.
+* `origin_node_id`: Optional string, present only on locally generated `draining` errors and identifying the generating node. Other local errors omit it; relays preserve the original body and never add or rewrite it.
 
 This is intentionally compatible with the error envelope used by OpenAI and the upstream `llama.cpp` server, so existing client libraries can parse it without modification.
 
@@ -895,7 +896,10 @@ performance_bonus = min(tps, 200) * 5 + min(remaining_slots, 4) * 50
 Lowest score wins.
 
 * Peers with the model already loaded are preferred (reflected in cold_start_cost of 0).
-* If no candidate is available, the router waits on a capacity notification rather than returning an immediate 503. Router capacity waits and local queueing share one `max_wait_in_queue_ms` deadline, taken from the resolved profile or the node default for a model absent from the local cookbook; `0` means no limit. A model absent locally returns `404` if only stale peers advertise it (using the peer-selection staleness window above); non-stale peers still count while not ready, draining, or circuit-open.
+* If no candidate is available, the router waits on a capacity notification rather than returning an immediate 503. Router capacity waits and local queueing share one `max_wait_in_queue_ms` deadline, taken from the resolved profile or the node default for a model absent from the local cookbook; `0` means no limit. A model absent locally returns `404` if only stale peers advertise it (using the peer-selection staleness window above); non-stale peers still count while not ready, draining, or circuit-open. A model already selected for this request waits out that deadline instead of returning `404`.
+
+* A complete peer response with exactly `503`, `error.type == "draining"`, and `error.origin_node_id` equal to the dispatched peer's node ID triggers immediate reselection, without waiting for capacity. That peer stays excluded for this request, even if later gossip advertises it as ready. A newly selected self enters local acquisition in the same request. If no candidate remains, ordinary routing waits within the same queue deadline; spawn-failure fallback instead returns its original local error after exhausting peers.
+* Legacy drain responses without an origin, malformed origins, and drains attributed to another node pass through unchanged. All complete `503 draining` responses are neutral for the immediate peer's circuit breaker and do not alter shared peer readiness. Exclusions are request-local and apply to every peer dispatch path, including spawn-failure fallback.
 
 * If chosen node == self:
 
@@ -1372,7 +1376,7 @@ cluster:
   * Mark node as **draining**:
 
     * `/readyz` returns non-200.
-    * Stop accepting new requests (client and peer). The listening socket is closed, so new connections are refused at once; connections already accepted stay open, and a new request on one of them gets `503` `draining`. A cluster peer whose connection is refused treats it as a transport failure and routes the request to another node.
+    * Stop accepting new requests (client and peer). The listening socket is closed, so new connections are refused at once; connections already accepted stay open, and a new request on one of them gets `503` `draining` with the local `error.origin_node_id`. An upgraded forwarding peer immediately reroutes a rejection attributed to this node, excluding it for that request; older or unattributed drain errors keep their pass-through behavior. A cluster peer whose connection is refused treats it as a transport failure and routes the request to another node.
     * Send a gossip round immediately, so peers learn that the node is no longer ready without waiting for the next `gossip_interval_seconds`. Before exiting, the node waits up to 5 seconds, within `shutdown_grace_period_seconds`, for that round to be sent, so that an idle node, whose drain finishes at once, normally does not exit first. The announcement is best effort: if it is not sent in time, peers learn of the shutdown as before, from refused connections and the node's absence.
     * Wake all requests blocked waiting for capacity, including local model queues, so they exit promptly with `503` `draining`, like new requests on a draining node.
   * Wait for in-flight requests and queues to drain up to `shutdown_grace_period_seconds`.

@@ -13,6 +13,8 @@ pub struct ApiError {
     pub type_: String,
     pub param: Option<String>,
     pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -31,6 +33,7 @@ impl AppError {
                 type_: type_.into(),
                 param: None,
                 code: None,
+                origin_node_id: None,
             },
             headers: None,
         }
@@ -57,12 +60,7 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let body = Json(json!({
-            "error": {
-                "message": self.error.message,
-                "type": self.error.type_,
-                "param": self.error.param,
-                "code": self.error.code,
-            }
+            "error": self.error
         }));
 
         let mut response = (self.status, body).into_response();
@@ -127,15 +125,58 @@ impl AppError {
     /// short `Retry-After` hint, matching the other retryable 503s the router
     /// returns (queue full/timeout). Centralizing it here keeps every draining
     /// rejection identical in message, type, and retry hint.
-    pub fn node_draining() -> Self {
-        Self::service_unavailable("Node is draining for shutdown", "draining")
-            .with_header(RETRY_AFTER, HeaderValue::from_static("5"))
+    pub fn node_draining(origin_node_id: &str) -> Self {
+        let mut error = Self::service_unavailable("Node is draining for shutdown", "draining")
+            .with_header(RETRY_AFTER, HeaderValue::from_static("5"));
+        error.error.origin_node_id = Some(origin_node_id.to_owned());
+        error
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_drain_response_includes_origin() {
+        let response = AppError::node_draining("local-node").into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[RETRY_AFTER], "5");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["origin_node_id"], "local-node");
+        assert_eq!(body["error"]["message"], "Node is draining for shutdown");
+        assert_eq!(body["error"]["type"], "draining");
+        assert!(body["error"]["param"].is_null());
+        assert!(body["error"]["code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn ordinary_error_response_omits_origin() {
+        let response = AppError::invalid_request("bad input").into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"].get("origin_node_id").is_none());
+        assert!(body["error"].get("param").unwrap().is_null());
+        assert!(body["error"].get("code").unwrap().is_null());
+    }
+
+    #[test]
+    fn legacy_drain_error_deserializes_without_origin() {
+        let legacy = r#"{"message":"Node is draining for shutdown","type":"draining","param":null,"code":null}"#;
+        let error: ApiError = serde_json::from_str(legacy).unwrap();
+        assert_eq!(error.type_, "draining");
+        assert!(error.origin_node_id.is_none());
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::from_str::<serde_json::Value>(legacy).unwrap()
+        );
+    }
 
     #[test]
     fn test_app_error_new() {
@@ -221,7 +262,7 @@ mod tests {
 
     #[test]
     fn test_node_draining_sets_retry_after() {
-        let err = AppError::node_draining();
+        let err = AppError::node_draining("local-node");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.error.type_, "draining");
         // Draining is retryable, so the response must hint when to retry.
@@ -257,6 +298,7 @@ mod tests {
             type_: "error_type".to_string(),
             param: Some("param".to_string()),
             code: Some("code".to_string()),
+            origin_node_id: None,
         };
         let json = serde_json::to_string(&api_error).unwrap();
         assert!(json.contains("\"message\":\"test\""));
@@ -270,6 +312,7 @@ mod tests {
         assert_eq!(api_error.message, "err");
         assert_eq!(api_error.type_, "t");
         assert!(api_error.param.is_none());
+        assert!(api_error.origin_node_id.is_none());
     }
 
     #[test]

@@ -899,7 +899,7 @@ impl NodeState {
     pub async fn find_peer_for_model(
         &self,
         model_name: &str,
-        exclude_peer: Option<&str>,
+        excluded_peers: &HashSet<String>,
     ) -> Option<PeerState> {
         let peers = self.peers.read().await;
         let now = std::time::SystemTime::now()
@@ -934,9 +934,8 @@ impl NodeState {
             if !self.circuit_breaker.should_allow_sync(&peer.node_id) {
                 continue;
             }
-            // Skip a peer the caller just failed to claim a recovery probe
-            // for, so the retry can reach a different healthy peer.
-            if exclude_peer == Some(peer.node_id.as_str()) {
+            // Skip peers rejected earlier in this request or denied a recovery probe.
+            if excluded_peers.contains(&peer.node_id) {
                 continue;
             }
             // Check if peer supports this model (case-insensitive)
@@ -3355,7 +3354,7 @@ impl NodeState {
         model_name: &str,
         profile: &Profile,
         prefer_local: bool,
-        exclude_peer: Option<&str>,
+        excluded_peers: &HashSet<String>,
     ) -> Option<PeerState> {
         let mut candidates = Vec::new();
         let requested_profile = profile.id.clone();
@@ -3416,9 +3415,8 @@ impl NodeState {
                 );
                 continue;
             }
-            // Skip a peer the caller just failed to claim a recovery probe
-            // for, so the retry can reach a different healthy peer.
-            if exclude_peer == Some(peer.node_id.as_str()) {
+            // Skip peers rejected earlier in this request or denied a recovery probe.
+            if excluded_peers.contains(&peer.node_id) {
                 continue;
             }
 
@@ -4668,6 +4666,176 @@ mod tests {
         }
     }
 
+    async fn exclusion_test_state(cookbook: Cookbook) -> NodeState {
+        let mut config = minimal_node_config();
+        // Existing executable establishes local eligibility without spawning it.
+        config.llama_cpp.binary_path = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        config.cluster.circuit_breaker.failure_threshold = 1;
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap()
+    }
+
+    fn fresh_selection_peer(id: &str) -> PeerState {
+        let mut peer = sample_peer(vec!["remote-model:default"]);
+        peer.node_id = id.to_owned();
+        peer.last_seen = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        peer
+    }
+
+    #[tokio::test]
+    async fn peer_selectors_exclude_multiple_peers_before_ranking() {
+        let state = exclusion_test_state(Cookbook { models: vec![] }).await;
+        let mut first = fresh_selection_peer("drained-a");
+        first.loaded_models = vec!["remote-model:default".into()];
+        let mut second = fresh_selection_peer("drained-b");
+        second.loaded_models = first.loaded_models.clone();
+        let mut remaining = fresh_selection_peer("remaining");
+        remaining.total_queue_length = 100;
+        remaining.current_requests = 100;
+        {
+            let mut peers = state.peers.write().await;
+            for peer in [first, second, remaining] {
+                peers.insert(peer.node_id.clone(), peer);
+            }
+        }
+        let mut excluded = HashSet::from(["drained-a".into(), "drained-b".into()]);
+        let profile = sample_profile();
+        for prefer_local in [false, true] {
+            assert_eq!(
+                state
+                    .find_peer_for_model("remote-model", &excluded)
+                    .await
+                    .unwrap()
+                    .node_id,
+                "remaining"
+            );
+            assert_eq!(
+                state
+                    .select_best_node("remote-model", &profile, prefer_local, &excluded)
+                    .await
+                    .unwrap()
+                    .node_id,
+                "remaining"
+            );
+        }
+        excluded.insert("remaining".into());
+        assert!(state
+            .find_peer_for_model("remote-model", &excluded)
+            .await
+            .is_none());
+        assert!(state
+            .select_best_node("remote-model", &profile, false, &excluded)
+            .await
+            .is_none());
+        // Fresh readiness information cannot override this request's exclusions.
+        state
+            .peers
+            .write()
+            .await
+            .insert("drained-a".into(), fresh_selection_peer("drained-a"));
+        assert!(state
+            .find_peer_for_model("remote-model", &excluded)
+            .await
+            .is_none());
+        assert!(state
+            .select_best_node("remote-model", &profile, false, &excluded)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_selectors_keep_readiness_staleness_model_and_circuit_filters() {
+        let state = exclusion_test_state(Cookbook { models: vec![] }).await;
+        let mut stale = fresh_selection_peer("stale");
+        stale.last_seen = 0;
+        let mut unready = fresh_selection_peer("unready");
+        unready.ready = false;
+        let mut wrong_model = fresh_selection_peer("wrong-model");
+        wrong_model.supported_models = vec!["other-model".into()];
+        let open = fresh_selection_peer("open-circuit");
+        state
+            .circuit_breaker
+            .record_failure("open-circuit", false)
+            .await;
+        assert!(!state.circuit_breaker.should_allow_sync("open-circuit"));
+        {
+            let mut peers = state.peers.write().await;
+            for peer in [
+                stale,
+                unready,
+                wrong_model,
+                open,
+                fresh_selection_peer("eligible"),
+            ] {
+                peers.insert(peer.node_id.clone(), peer);
+            }
+        }
+        let excluded = HashSet::new();
+        assert_eq!(
+            state
+                .find_peer_for_model("remote-model", &excluded)
+                .await
+                .unwrap()
+                .node_id,
+            "eligible"
+        );
+        assert_eq!(
+            state
+                .select_best_node("remote-model", &sample_profile(), false, &excluded)
+                .await
+                .unwrap()
+                .node_id,
+            "eligible"
+        );
+        // Removing the valid candidate exposes all filters; no invalid peer can win.
+        state.peers.write().await.remove("eligible");
+        assert!(state
+            .find_peer_for_model("remote-model", &excluded)
+            .await
+            .is_none());
+        assert!(state
+            .select_best_node("remote-model", &sample_profile(), false, &excluded)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn peer_exclusions_do_not_suppress_eligible_local_self() {
+        let state = exclusion_test_state(Cookbook {
+            models: vec![Model {
+                name: "remote-model".into(),
+                description: None,
+                enabled: true,
+                profiles: vec![sample_profile()],
+            }],
+        })
+        .await;
+        assert!(state.can_serve_locally());
+        let excluded = HashSet::from([
+            "drained-a".into(),
+            "drained-b".into(),
+            state.config.node_id.clone(),
+        ]);
+        for prefer_local in [false, true] {
+            assert_eq!(
+                state
+                    .select_best_node("remote-model", &sample_profile(), prefer_local, &excluded)
+                    .await
+                    .unwrap()
+                    .node_id,
+                state.config.node_id
+            );
+        }
+    }
+
     #[tokio::test]
     async fn select_best_node_picks_dynamic_peer() {
         let config = minimal_node_config();
@@ -4681,7 +4849,7 @@ mod tests {
         // 1. Initially no peers, and local cookbook is empty.
         let profile = sample_profile();
         let result = state
-            .select_best_node("remote-model", &profile, false, None)
+            .select_best_node("remote-model", &profile, false, &HashSet::new())
             .await;
         // Should be None because we don't support it and we have no peers.
         assert!(result.is_none());
@@ -4729,7 +4897,7 @@ mod tests {
 
         // 3. Now select_best_node should find the peer
         let result = state
-            .select_best_node("remote-model", &profile, false, None)
+            .select_best_node("remote-model", &profile, false, &HashSet::new())
             .await;
         assert!(result.is_some());
         let picked = result.unwrap();

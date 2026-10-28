@@ -323,6 +323,7 @@ async fn admin_drain(h2: bool) {
     for (_, headers, body) in [prewarm, rebuild] {
         assert_eq!(headers["retry-after"], "5");
         assert_eq!(body["error"]["type"], "draining");
+        assert_eq!(body["error"]["origin_node_id"], "admin-drain-test");
     }
     let mut failures = Vec::new();
     for (key, kind, mut connection) in body_cases {
@@ -358,7 +359,8 @@ async fn admin_drain(h2: bool) {
                 if status == expected
                     && (key != "secret"
                         || (headers.get("retry-after").is_some_and(|v| v == "5")
-                            && body["error"]["type"] == "draining")) => {}
+                            && body["error"]["type"] == "draining"
+                            && body["error"]["origin_node_id"] == "admin-drain-test")) => {}
             result => failures.push(format!("{key}/{kind}: expected {expected}, got {result:?}")),
         }
     }

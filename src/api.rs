@@ -257,7 +257,7 @@ async fn rebuild_llama_handler(
         return e.into_response();
     }
     if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
-        return crate::errors::AppError::node_draining().into_response();
+        return crate::errors::AppError::node_draining(&state.config.node_id).into_response();
     }
 
     let build_status = state.build_manager.build_status();
@@ -304,7 +304,7 @@ async fn prewarm_handler(
         return e.into_response();
     }
     if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
-        return crate::errors::AppError::node_draining().into_response();
+        return crate::errors::AppError::node_draining(&state.config.node_id).into_response();
     }
     let TimedJson(body) = match TimedJson::<serde_json::Value>::from_request(request, &state).await
     {
@@ -313,7 +313,7 @@ async fn prewarm_handler(
     };
     // Shutdown may begin while an admitted request is still sending its body.
     if state.draining.load(std::sync::atomic::Ordering::Relaxed) {
-        return crate::errors::AppError::node_draining().into_response();
+        return crate::errors::AppError::node_draining(&state.config.node_id).into_response();
     }
 
     let model_req = body.get("model").and_then(|v| v.as_str());
@@ -1259,8 +1259,27 @@ mod tests {
             .await
             .into_response();
         assert!(state.draining.load(std::sync::atomic::Ordering::Relaxed));
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(response.headers()["retry-after"], "5");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", "secret".parse().unwrap());
+        let rebuild = rebuild_llama_handler(State(state.clone()), headers)
+            .await
+            .into_response();
+        let request = Request::builder()
+            .header("x-api-key", "secret")
+            .body(Body::empty())
+            .unwrap();
+        let prewarm = prewarm_handler(State(state), request).await.into_response();
+        // Cover all three admin drain emitters, including the post-body check.
+        for response in [response, rebuild, prewarm] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "5");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "draining");
+            assert_eq!(body["error"]["origin_node_id"], "body-drain-test");
+        }
     }
 
     #[test]
