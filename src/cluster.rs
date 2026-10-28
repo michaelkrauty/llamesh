@@ -1,4 +1,5 @@
 use crate::api::TimedJson;
+use crate::circuit_breaker::CircuitBreaker;
 use crate::node_state::NodeState;
 use crate::node_state::PeerState;
 use crate::security::PeerIdentity;
@@ -9,6 +10,7 @@ use axum::{
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{debug, info};
@@ -61,6 +63,53 @@ pub struct GossipMessage {
     pub known_peers: Vec<PeerInfo>,
 }
 
+/// Split gossip's URL-keyed circuits into those this round uses and those
+/// to drop. A target uses its URL as the circuit key only while no stored
+/// peer has that address; once one does, gossip keys it by that peer's node
+/// id instead. Returns `(current, stale)`: the targets keyed by URL this
+/// round, and the previously tracked URL keys that no longer are and are not
+/// a known node id.
+fn gossip_url_circuit_keys(
+    tracked: &HashSet<String>,
+    targets: &HashSet<String>,
+    url_to_node_id: &HashMap<String, String>,
+    known_node_ids: &HashSet<String>,
+    own_address: &str,
+) -> (HashSet<String>, HashSet<String>) {
+    let current: HashSet<String> = targets
+        .iter()
+        .filter(|url| url.as_str() != own_address && !url_to_node_id.contains_key(*url))
+        .cloned()
+        .collect();
+    let stale = tracked
+        .difference(&current)
+        .filter(|key| !known_node_ids.contains(*key))
+        .cloned()
+        .collect();
+    (current, stale)
+}
+
+/// Remove the circuits of URL keys gossip no longer uses (see
+/// [`gossip_url_circuit_keys`]) and add this round's URL keys to `tracked`.
+async fn reconcile_gossip_url_circuits(
+    circuit_breaker: &CircuitBreaker,
+    tracked: &mut HashSet<String>,
+    targets: &HashSet<String>,
+    url_to_node_id: &HashMap<String, String>,
+    known_node_ids: &HashSet<String>,
+    own_address: &str,
+) {
+    let (current, stale) = gossip_url_circuit_keys(
+        tracked,
+        targets,
+        url_to_node_id,
+        known_node_ids,
+        own_address,
+    );
+    circuit_breaker.forget(&stale).await;
+    tracked.extend(current);
+}
+
 pub async fn start_gossip_loop(state: Arc<NodeState>) {
     if !state.config.cluster.enabled {
         return;
@@ -80,6 +129,16 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
     // then subsequent ticks wait `gossip_interval_seconds`.
     let mut interval = tokio::time::interval(period);
     let gossip_trigger = state.gossip_trigger.clone();
+
+    // URLs gossip has used as circuit-breaker keys. Gossip keys a target by
+    // its URL until a stored peer has that address (a seed peer not heard
+    // from yet), then by the peer's node id, so the URL's circuit stops
+    // receiving results; it is dropped then, or once the address is no longer
+    // a target, rather than exported with its last state for the life of the
+    // process. Keys stay in the set after they are dropped, because a send
+    // from an earlier round can complete later and recreate the circuit; the
+    // next round removes it again. The set grows only with distinct URLs.
+    let mut url_circuit_keys = HashSet::new();
 
     loop {
         // Wait for either the periodic interval or an instant gossip trigger
@@ -117,6 +176,7 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
         // Map URL -> node_id so circuit breaker keys match routing (which uses node_id)
         let mut url_to_node_id: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        let mut known_node_ids = HashSet::new();
 
         {
             let peers = state.peers.read().await;
@@ -124,6 +184,7 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 // peer.address might be the base URL, e.g. "http://node-b:8080"
                 targets.insert(peer.address.clone());
                 url_to_node_id.insert(peer.address.clone(), peer.node_id.clone());
+                known_node_ids.insert(peer.node_id.clone());
 
                 known_peers_info.push(PeerInfo {
                     node_id: peer.node_id.clone(),
@@ -131,6 +192,16 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                 });
             }
         }
+
+        reconcile_gossip_url_circuits(
+            &state.circuit_breaker,
+            &mut url_circuit_keys,
+            &targets,
+            &url_to_node_id,
+            &known_node_ids,
+            &my_state.address,
+        )
+        .await;
 
         // Gossip to all targets
         for peer_url in targets {
@@ -713,9 +784,98 @@ pub async fn process_gossip_message(
 mod tests {
     use super::*;
     use crate::build_manager::BuildManager;
+    use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
     use crate::config::{
         ClusterConfig, Cookbook, HttpConfig, LlamaCppConfig, ModelDefaults, NodeConfig,
     };
+
+    #[test]
+    fn test_gossip_url_circuit_keys() {
+        let tracked = ["mapped", "removed", "unmapped", "node-id", "own"]
+            .map(String::from)
+            .into_iter()
+            .collect();
+        let targets = ["mapped", "unmapped", "own", "new"]
+            .map(String::from)
+            .into_iter()
+            .collect();
+        let mapping = HashMap::from([("mapped".to_string(), "node-id".to_string())]);
+        let node_ids = HashSet::from(["node-id".to_string()]);
+
+        let (current, stale) =
+            gossip_url_circuit_keys(&tracked, &targets, &mapping, &node_ids, "own");
+
+        assert_eq!(
+            current,
+            HashSet::from(["unmapped".to_string(), "new".to_string()])
+        );
+        assert_eq!(
+            stale,
+            HashSet::from([
+                "mapped".to_string(),
+                "removed".to_string(),
+                "own".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_gossip_url_circuits_removes_late_results() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        });
+        let peer_url = "https://peer.example";
+        let node_id = "peer-node";
+        let own_address = "https://self.example";
+        let targets = HashSet::from([peer_url.to_string()]);
+        let mut tracked = HashSet::new();
+        let mut mapping = HashMap::new();
+        let node_ids = HashSet::from([node_id.to_string()]);
+        cb.record_failure(peer_url, false).await;
+        cb.record_failure(node_id, false).await;
+        let node_state = cb.get_state(node_id).await;
+        assert_eq!(node_state, CircuitState::Open);
+
+        reconcile_gossip_url_circuits(
+            &cb,
+            &mut tracked,
+            &targets,
+            &mapping,
+            &node_ids,
+            own_address,
+        )
+        .await;
+        assert!(tracked.contains(peer_url));
+        assert_eq!(cb.get_state(peer_url).await, CircuitState::Open);
+
+        mapping.insert(peer_url.to_string(), node_id.to_string());
+        reconcile_gossip_url_circuits(
+            &cb,
+            &mut tracked,
+            &targets,
+            &mapping,
+            &node_ids,
+            own_address,
+        )
+        .await;
+        let expected = HashMap::from([(node_id.to_string(), node_state)]);
+        assert_eq!(cb.get_all_states().await, expected);
+        assert!(tracked.contains(peer_url));
+
+        cb.record_failure(peer_url, false).await;
+        assert_eq!(cb.get_state(peer_url).await, CircuitState::Open);
+        reconcile_gossip_url_circuits(
+            &cb,
+            &mut tracked,
+            &targets,
+            &mapping,
+            &node_ids,
+            own_address,
+        )
+        .await;
+        assert_eq!(cb.get_all_states().await, expected);
+    }
 
     fn minimal_node_config() -> NodeConfig {
         NodeConfig {

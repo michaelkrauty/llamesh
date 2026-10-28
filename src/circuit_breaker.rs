@@ -556,6 +556,36 @@ impl CircuitBreaker {
         );
     }
 
+    /// Remove the named circuits without logging a manual reset, returning
+    /// how many existed. Keys without a circuit are ignored.
+    pub async fn forget<I, S>(&self, keys: I) -> usize
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let keys: Vec<S> = keys.into_iter().collect();
+        // Callers may name keys that are already gone on most calls. Check
+        // under the read lock first: while the write lock is held, the
+        // synchronous routing checks cannot read the map and admit the
+        // request instead.
+        {
+            let circuits = self.circuits.read().await;
+            if !keys.iter().any(|key| circuits.contains_key(key.as_ref())) {
+                return 0;
+            }
+        }
+        let mut circuits = self.circuits.write().await;
+        let mut removed = 0;
+        for key in keys {
+            let peer_id = key.as_ref();
+            if circuits.remove(peer_id).is_some() {
+                removed += 1;
+                tracing::debug!(peer_id = %peer_id, "Circuit breaker entry forgotten");
+            }
+        }
+        removed
+    }
+
     /// Reset a peer's circuit (e.g., manual intervention)
     pub async fn reset(&self, peer_id: &str) {
         let mut circuits = self.circuits.write().await;
@@ -567,6 +597,31 @@ impl CircuitBreaker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_forget_removes_only_named_keys() {
+        let cb = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            ..Default::default()
+        });
+        cb.record_failure("remove-open", false).await;
+        cb.record_success("remove-closed", false).await;
+        cb.record_failure("keep-open", false).await;
+        cb.record_success("keep-closed", false).await;
+
+        assert_eq!(
+            cb.forget(["remove-open", "remove-closed", "remove-open", "unknown"])
+                .await,
+            2
+        );
+        let expected = HashMap::from([
+            ("keep-open".to_string(), CircuitState::Open),
+            ("keep-closed".to_string(), CircuitState::Closed),
+        ]);
+        assert_eq!(cb.get_all_states().await, expected);
+        assert_eq!(cb.forget(["unknown", "remove-open"]).await, 0);
+        assert_eq!(cb.get_all_states().await, expected);
+    }
 
     #[tokio::test]
     async fn test_circuit_starts_closed() {
