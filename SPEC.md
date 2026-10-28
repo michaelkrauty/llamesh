@@ -946,6 +946,7 @@ On chosen node (or standalone):
 * If the request stays in queue longer than that (and the timeout is non-zero):
 
   * Remove it from the queue and return 503 `queue_timeout`.
+* A request that is cancelled while queued, for example because its client disconnected, is removed from the queue, so it no longer counts toward the queue length or the queue limits.
 
 **Priority token fairness:**
 

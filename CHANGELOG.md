@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.35] - 2026-10-28
+
+### Fixed
+
+- Remove a request's entry from its model queue when the request is cancelled while it waits, for example because its client disconnected. The entry stayed in the queue, counted as a waiting request, until another request for the same model was queued or the queue was woken, which on a node that cannot currently admit the model may not happen for a long time. Meanwhile it was included in the `proxy_queue_length` gauge and `/cluster/nodes`, in the queue length gossiped to peers, which route away from nodes with longer queues, and in the `max_total_queue_entries` limit, and it could lead the drain scheduler to mark another model's instance draining to make room for a request that was no longer waiting.
+
 ## [1.21.34] - 2026-10-28
 
 ### Fixed

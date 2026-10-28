@@ -241,6 +241,84 @@ pub struct QueueEntry {
     tx: oneshot::Sender<PendingQueuePermit>,
 }
 
+/// Removes a queued request's entry if the request is dropped while it waits,
+/// for example when its client disconnects. The timeout and error paths
+/// remove the entry themselves and disarm the guard; without it, a cancelled
+/// request's entry stays in the queue, counted as waiting, until the queue is
+/// next pruned or notified.
+struct QueueEntryGuard {
+    queues: Arc<RwLock<HashMap<String, VecDeque<QueueEntry>>>>,
+    key: String,
+    token: u64,
+    armed: bool,
+    /// The request's span, so the removal is logged with its request id.
+    span: tracing::Span,
+}
+
+impl QueueEntryGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for QueueEntryGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        use tracing::Instrument;
+
+        let queues = self.queues.clone();
+        let key = self.key.clone();
+        let token = self.token;
+
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(
+                    async move {
+                        if remove_queue_entry_from(&queues, &key, token).await {
+                            info!(event = "queue_cancelled", model_key = %key, token = token);
+                        }
+                    }
+                    .instrument(self.span.clone()),
+                );
+            }
+            Err(_) => {
+                warn!(
+                    token = token,
+                    model_key = %key,
+                    "Queue entry cleanup skipped: tokio runtime unavailable during drop"
+                );
+            }
+        }
+    }
+}
+
+async fn remove_queue_entry_from(
+    queues: &RwLock<HashMap<String, VecDeque<QueueEntry>>>,
+    key: &str,
+    token: u64,
+) -> bool {
+    // LOCK_ORDER: queues (2) only
+    let mut queues = queues.write().await;
+    let mut remove_empty_queue = false;
+    let removed = if let Some(queue) = queues.get_mut(key) {
+        let before = queue.len();
+        queue.retain(|entry| entry.token != token);
+        remove_empty_queue = queue.is_empty();
+        queue.len() != before
+    } else {
+        false
+    };
+
+    if remove_empty_queue {
+        queues.remove(key);
+    }
+
+    removed
+}
+
 /// Owns a promoted queue token until the request either acquires capacity,
 /// requeues, errors, or is cancelled.
 pub struct PendingQueuePermit {
@@ -1658,6 +1736,7 @@ impl NodeState {
                 guardrail_tests::pause_at(&self.test_hooks.before_enqueue).await;
                 let (tx, rx) = oneshot::channel();
                 let queue_token;
+                let mut queue_guard;
 
                 {
                     // LOCK_ORDER: queues (2)
@@ -1707,6 +1786,15 @@ impl NodeState {
                         token: queue_token,
                         tx,
                     });
+                    // Created in the same poll as the push, so a cancellation
+                    // at any later await removes the entry.
+                    queue_guard = QueueEntryGuard {
+                        queues: self.queues.clone(),
+                        key: key.clone(),
+                        token: queue_token,
+                        armed: true,
+                        span: tracing::Span::current(),
+                    };
                     // Start queue wait timer on first enqueue
                     if queue_start.is_none() {
                         queue_start = Some(std::time::Instant::now());
@@ -1729,6 +1817,7 @@ impl NodeState {
                             self.metrics
                                 .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
                             self.remove_queue_entry(&key, queue_token).await;
+                            queue_guard.disarm();
                             self.remove_pending_token(model_name, &profile.id, queue_token)
                                 .await;
                             return Err(NodeError::QueueTimeout);
@@ -1741,6 +1830,7 @@ impl NodeState {
                                 self.metrics
                                     .record_queue_drop(crate::metrics::QueueDropReason::Timeout);
                                 self.remove_queue_entry(&key, queue_token).await;
+                                queue_guard.disarm();
                                 self.remove_pending_token(model_name, &profile.id, queue_token)
                                     .await;
                                 return Err(NodeError::QueueTimeout);
@@ -1752,11 +1842,13 @@ impl NodeState {
 
                 match wait_result {
                     Ok(token) => {
+                        queue_guard.disarm();
                         my_token = Some(token);
                         continue; // Now retry with priority token
                     }
                     Err(_) => {
                         self.remove_queue_entry(&key, queue_token).await;
+                        queue_guard.disarm();
                         self.remove_pending_token(model_name, &profile.id, queue_token)
                             .await;
                         return Err(NodeError::QueueError);
@@ -1978,6 +2070,7 @@ impl NodeState {
                         guardrail_tests::pause_at(&self.test_hooks.before_enqueue).await;
                         let (tx, rx) = oneshot::channel();
                         let queue_token;
+                        let mut queue_guard;
 
                         {
                             // LOCK_ORDER: queues (2)
@@ -2025,6 +2118,14 @@ impl NodeState {
                                 token: queue_token,
                                 tx,
                             });
+                            // As above: in the same poll as the push.
+                            queue_guard = QueueEntryGuard {
+                                queues: self.queues.clone(),
+                                key: key.clone(),
+                                token: queue_token,
+                                armed: true,
+                                span: tracing::Span::current(),
+                            };
                             // Start queue wait timer on first enqueue
                             if queue_start.is_none() {
                                 queue_start = Some(std::time::Instant::now());
@@ -2075,6 +2176,7 @@ impl NodeState {
                                         crate::metrics::QueueDropReason::Timeout,
                                     );
                                     self.remove_queue_entry(&key, queue_token).await;
+                                    queue_guard.disarm();
                                     self.remove_pending_token(model_name, &profile.id, queue_token)
                                         .await;
                                     return Err(NodeError::QueueTimeout);
@@ -2088,6 +2190,7 @@ impl NodeState {
                                             crate::metrics::QueueDropReason::Timeout,
                                         );
                                         self.remove_queue_entry(&key, queue_token).await;
+                                        queue_guard.disarm();
                                         self.remove_pending_token(
                                             model_name,
                                             &profile.id,
@@ -2103,11 +2206,13 @@ impl NodeState {
 
                         match wait_result {
                             Ok(token) => {
+                                queue_guard.disarm();
                                 my_token = Some(token);
                                 continue;
                             }
                             Err(_) => {
                                 self.remove_queue_entry(&key, queue_token).await;
+                                queue_guard.disarm();
                                 self.remove_pending_token(model_name, &profile.id, queue_token)
                                     .await;
                                 return Err(NodeError::QueueError);
@@ -3270,22 +3375,7 @@ impl NodeState {
     /// Remove a queued waiter by its preassigned token. This is used on timeout
     /// to avoid dead queue entries consuming per-model or global queue slots.
     async fn remove_queue_entry(&self, key: &str, token: u64) -> bool {
-        let mut queues = self.queues.write().await;
-        let mut remove_empty_queue = false;
-        let removed = if let Some(queue) = queues.get_mut(key) {
-            let before = queue.len();
-            queue.retain(|entry| entry.token != token);
-            remove_empty_queue = queue.is_empty();
-            queue.len() != before
-        } else {
-            false
-        };
-
-        if remove_empty_queue {
-            queues.remove(key);
-        }
-
-        removed
+        remove_queue_entry_from(&self.queues, key, token).await
     }
 
     /// Notify one waiter for a specific model that capacity is available.
