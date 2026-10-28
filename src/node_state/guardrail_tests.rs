@@ -187,6 +187,89 @@ fn attach_live_child(instance: &Instance) -> u32 {
     pid
 }
 
+async fn spawnable_state() -> (Arc<NodeState>, tempfile::TempDir) {
+    let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let binary = dir.path().join("llama-server");
+    // Like the successful spawn reservation test, ignore server args and stay
+    // alive through the assertions; exec lets stop() reap the sleeper itself.
+    tokio::fs::write(&binary, "#!/bin/sh\nexec sleep 300\n")
+        .await
+        .unwrap();
+    let mut perms = tokio::fs::metadata(&binary).await.unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    tokio::fs::set_permissions(&binary, perms).await.unwrap();
+    let mut config = test_config();
+    config.llama_cpp.binary_path = binary.to_string_lossy().into_owned();
+    config.metrics_path = dir
+        .path()
+        .join("metrics.json")
+        .to_string_lossy()
+        .into_owned();
+    let mut state = test_state(config).await;
+    // The sleeper never binds; port 0 keeps readiness off real host services.
+    Arc::get_mut(&mut state).unwrap().port_pool = Arc::new(PortPool::new_without_os_port_check(
+        Some(crate::config::LlamaCppPorts {
+            ports: Some(vec![0]),
+            ranges: None,
+        }),
+    ));
+    (state, dir)
+}
+
+#[tokio::test]
+async fn spawn_across_binary_swap_returns_draining_instance() {
+    let (state, _dir) = spawnable_state().await;
+    let (entered, release) = install_pause(&state.test_hooks.after_port);
+    let spawn_state = state.clone();
+    let spawn = tokio::spawn(async move {
+        spawn_state
+            .try_get_or_spawn("a", &profile("a", 400, 100), true, "test", false)
+            .await
+    });
+    wait_for_hook(entered, "spawn generation snapshot").await;
+    assert!(state.instances.read().await.is_empty());
+    assert_eq!(state.build_manager.binary_generation(), 0);
+    state.build_manager.signal_binary_swap_for_test();
+    assert_eq!(state.build_manager.binary_generation(), 1);
+    state.drain_instances_for_binary_update().await;
+    release.send(()).unwrap();
+
+    let instance = timeout(Duration::from_secs(1), spawn)
+        .await
+        .expect("spawning request must still return its instance")
+        .unwrap()
+        .unwrap();
+    let instances = state.instances.read().await;
+    let inst = instance.read().await;
+    assert_eq!(instances.len(), 1);
+    assert!(Arc::ptr_eq(instances.get(&inst.id).unwrap(), &instance));
+    let draining = inst.draining.load(Ordering::Relaxed);
+    let in_flight = inst.in_flight_requests;
+    drop(instances);
+    inst.stop().await.unwrap();
+    assert_eq!(in_flight, 1, "the spawning request keeps its claimed slot");
+    assert!(
+        draining,
+        "a spawn missed by the binary update drain must drain"
+    );
+}
+
+#[tokio::test]
+async fn spawn_without_binary_swap_is_not_draining() {
+    let (state, _dir) = spawnable_state().await;
+    let instance = state
+        .try_get_or_spawn("a", &profile("a", 400, 100), true, "test", false)
+        .await
+        .expect("spawn should succeed");
+    let inst = instance.read().await;
+    let draining = inst.draining.load(Ordering::Relaxed);
+    inst.stop().await.unwrap();
+    assert!(
+        !draining,
+        "an unchanged binary generation must not trigger draining"
+    );
+}
+
 #[tokio::test]
 async fn cancelled_spawn_before_mapping_releases_port() {
     let port = 24_237;

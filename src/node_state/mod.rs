@@ -2473,6 +2473,7 @@ impl NodeState {
             let mut spawn_attempt = 0;
             let (instance_id, port, inst_arc, is_cold_start, final_args) = loop {
                 spawn_attempt += 1;
+                let spawn_generation = self.build_manager.binary_generation();
 
                 let instance_id = spawn_reservation.memory().id().to_string();
                 let port_overridden = port_override.is_some();
@@ -2621,6 +2622,27 @@ impl NodeState {
                                 "Killed just-spawned instance due to capacity race"
                             );
                             return Err(NodeError::MaxInstancesNode);
+                        }
+
+                        // A build swap since this attempt read the generation may
+                        // have run its drain pass before this instance was in the
+                        // map, so drain it here, before it becomes visible. If the
+                        // swap came before canonicalize, the instance already runs
+                        // the new build and is drained once needlessly.
+                        let current_generation = self.build_manager.binary_generation();
+                        if current_generation != spawn_generation {
+                            // Not shared yet, so try_read cannot fail.
+                            let inst = inst_arc.try_read().expect("unshared instance");
+                            inst.draining.store(true, Ordering::Relaxed);
+                            info!(
+                                event = "instance_spawned_across_binary_swap",
+                                instance_id = %instance_id,
+                                model = %model_name,
+                                profile = %profile.id,
+                                spawn_generation,
+                                current_generation,
+                                "Marked instance spawned across binary swap as draining"
+                            );
                         }
 
                         instances_map.insert(instance_id.clone(), inst_arc.clone());

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.37] - 2026-10-28
+
+### Fixed
+
+- Drain an instance whose spawn began before a llama.cpp build swap and completed after the swap had drained the running instances. The instance ran the old build without being marked draining, and under steady traffic it never went idle, so the node kept serving the old build while `/version` and gossip reported the new commit. It now serves the request that started it and then drains like the others.
+
 ## [1.21.36] - 2026-10-28
 
 ### Fixed

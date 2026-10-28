@@ -78,6 +78,11 @@ impl BuildManager {
         self.binary_generation.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn signal_binary_swap_for_test(&self) {
+        self.signal_binary_swap();
+    }
+
     /// Returns a reference to the Notify used to signal binary swaps.
     pub fn binary_swap_notify(&self) -> &Arc<tokio::sync::Notify> {
         &self.binary_swap_notify
