@@ -134,6 +134,10 @@ llama_cpp:
 
   # Local paths (defaults shown)
   repo_path: "./llama.cpp"
+  # Builds go into <build_path>-<commit>_<id>, where <id> identifies build_args
+  # and build_command_args, so changing them produces a new build of the same
+  # commit. A <build_path>-<commit> build made by an older version is reused
+  # only while it is the live build.
   build_path: "./llama.cpp/build"
   binary_path: "./llama.cpp/bin/llama-server"
 
@@ -165,8 +169,8 @@ llama_cpp:
   # in use (default: 3). The active build is always kept in addition, so a
   # value of 0 keeps only the active build. Only complete builds (those with a
   # bin/llama-server) count; directories left by failed or interrupted builds
-  # are removed. Only the <build_path>-<commit> directories created by builds
-  # are managed.
+  # are removed. Both <build_path>-<commit> and <build_path>-<commit>_<inputs-id>
+  # directories are managed and count toward retention.
   keep_builds: 3
 
 # -----------------------------------------------------------------------------

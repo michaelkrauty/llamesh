@@ -2,6 +2,7 @@ use crate::config::LlamaCppConfig;
 use anyhow::{anyhow, Result};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -130,7 +131,7 @@ impl BuildManager {
     }
 
     /// Returns true if the node can serve requests locally (binary exists).
-    /// Builds happen in isolated per-commit directories and the existing binary
+    /// Builds happen in isolated build directories and the existing binary
     /// symlink remains valid throughout, so building does not affect serving.
     pub fn can_serve(&self) -> bool {
         self.is_binary_available()
@@ -287,60 +288,23 @@ impl BuildManager {
 
         info!(event = "llama_build_start", branch = %self.config.branch, commit = %commit_hash);
 
-        // Determine unique build directory for this commit
-        // Assuming config.build_path is a base like "./llama.cpp/build"
-        // We make "./llama.cpp/build-<commit>"
-        let build_base = PathBuf::from(&self.config.build_path);
-        // If build_path ends in "build", strip it to get parent?
-        // Actually, let's just append the hash to the configured path to avoid confusion.
-        // If config.build_path is "./llama.cpp/build", we use "./llama.cpp/build-<hash>"
-        let base_name = build_base
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "build_path has no valid directory name: {}",
-                    build_base.display()
-                )
-            })?;
-        let build_dir_name = format!("{base_name}-{commit_hash}");
-        let build_dir = build_base
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(build_dir_name);
+        let (build_dir, reusable) = self.select_build_dir(&commit_hash).await?;
 
         // Ideally we find where the binary *will* be.
         // Standard llama.cpp cmake: <build_dir>/bin/llama-server
         let actual_binary_path = build_dir.join("bin").join("llama-server");
 
-        if actual_binary_path.exists() {
-            info!(
-                "Binary for commit {} already exists. Verifying...",
-                commit_hash
-            );
-            if self.verify_binary(&actual_binary_path).await.is_ok() {
-                // If the live symlink already points at this binary there is
-                // nothing to swap: signaling a swap anyway would drain every
-                // running instance for a binary change that never happened
-                // (the common case for the scheduled update check when
-                // upstream has no new commits, and for every restart).
-                // Builds land in immutable per-commit directories, so an
-                // identical resolved path means running instances already
-                // use exactly this binary. A rebuild into the same directory
-                // (the verification-failure path below) does not take this
-                // branch and still signals a swap.
-                if self.symlink_already_current(&actual_binary_path).await {
-                    info!("Existing binary verified and already live. Skipping binary swap.");
-                    self.record_running_version(&commit_hash);
-                    return Ok(());
-                }
-                info!("Existing binary verified. Switching symlink.");
-                self.update_symlink(&actual_binary_path).await?;
+        if reusable {
+            // A resolved path that is already live needs no swap or drain.
+            if self.symlink_already_current(&actual_binary_path).await {
+                info!("Existing binary verified and already live. Skipping binary swap.");
                 self.record_running_version(&commit_hash);
                 return Ok(());
             }
-            warn!("Existing binary verification failed. Rebuilding.");
+            info!("Existing binary verified. Switching symlink.");
+            self.update_symlink(&actual_binary_path).await?;
+            self.record_running_version(&commit_hash);
+            return Ok(());
         }
 
         // Set building flag NOW - only during actual compilation
@@ -400,6 +364,98 @@ impl BuildManager {
         Ok(())
     }
 
+    fn build_dir_for_commit(&self, commit_hash: &str) -> Result<PathBuf> {
+        let build_base = PathBuf::from(&self.config.build_path);
+        let base_name = build_base
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "build_path has no valid directory name: {}",
+                    build_base.display()
+                )
+            })?;
+        let build_dir_name = format!("{base_name}-{commit_hash}_{}", self.build_inputs_id()?);
+        Ok(build_base
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(build_dir_name))
+    }
+
+    fn build_inputs_id(&self) -> Result<String> {
+        let inputs =
+            serde_json::to_vec(&(&self.config.build_args, &self.config.build_command_args))?;
+        Ok(format!("{:x}", Sha256::digest(inputs))[..8].to_string())
+    }
+
+    /// Select a verified reusable build, or a suffixed directory to build in.
+    async fn select_build_dir(&self, commit_hash: &str) -> Result<(PathBuf, bool)> {
+        let build_dir = self.build_dir_for_commit(commit_hash)?;
+        let binary = build_dir.join("bin/llama-server");
+        if binary.exists() {
+            if self.verify_binary(&binary).await.is_ok() {
+                return Ok((build_dir, true));
+            }
+            warn!("Existing binary verification failed. Rebuilding if no reusable legacy build exists.");
+        }
+
+        let inputs_id = self.build_inputs_id()?;
+        let name = build_dir.file_name().unwrap().to_str().unwrap();
+        let legacy = build_dir.with_file_name(name.strip_suffix(&format!("_{inputs_id}")).unwrap());
+        let legacy_binary = legacy.join("bin/llama-server");
+        let stamp = legacy.join(".llamesh-build-inputs");
+        let mut adopt = false;
+        let matches = match tokio::fs::read(&stamp).await {
+            Ok(contents) => contents == inputs_id.as_bytes(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A dangling stamp symlink is unreadable, not absent.
+                let missing = matches!(tokio::fs::symlink_metadata(&stamp).await,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+                adopt = missing && self.symlink_already_current(&legacy_binary).await;
+                adopt
+            }
+            Err(_) => false,
+        };
+        if matches && self.verify_binary(&legacy_binary).await.is_ok() {
+            if adopt {
+                // Accepted upgrade gap: args changed on the first upgraded
+                // restart are assumed to match this live unstamped build.
+                self.write_build_inputs_stamp(&legacy, &inputs_id).await?;
+                info!(
+                    build_dir = %legacy.display(),
+                    inputs_id = %inputs_id,
+                    "Live build predates recorded build inputs; assuming it matches the current build arguments"
+                );
+            }
+            return Ok((legacy, true));
+        }
+        Ok((build_dir, false))
+    }
+
+    async fn write_build_inputs_stamp(&self, build_dir: &Path, inputs_id: &str) -> Result<()> {
+        // A fixed name, so a temp file left by an interrupted write is
+        // overwritten by the next attempt rather than accumulating.
+        let temp = build_dir.join(".llamesh-build-inputs.tmp");
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .await?;
+        let result = async {
+            file.write_all(inputs_id.as_bytes()).await?;
+            file.flush().await?;
+            tokio::fs::rename(&temp, build_dir.join(".llamesh-build-inputs")).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
+        }
+        result?;
+        Ok(())
+    }
+
     /// Create `build_dir` for a build of `binary`, first removing it if an
     /// earlier run of the proxy left it unfinished.
     ///
@@ -435,10 +491,10 @@ impl BuildManager {
     /// Remove previous builds that are no longer needed, after a build has
     /// been activated.
     ///
-    /// Only the per-commit `<build_path>-<commit>` directories this manager
-    /// creates are considered; anything else next to them is left alone. The
-    /// build the live binary resolves to, and a directory that contains the
-    /// configured binary path, are never removed. A build directory without
+    /// Only `<build_path>-<commit>` and `<build_path>-<commit>_<inputs-id>`
+    /// directories this manager creates are considered; anything else next to
+    /// them is left alone. The live build and directories containing the
+    /// configured binary path are never removed. A build directory without
     /// `bin/llama-server` was left by a build that failed or was interrupted:
     /// it cannot be rolled back to, so it is removed instead of taking one of
     /// the `keep_builds` slots. Of the complete previous builds, the
@@ -731,8 +787,8 @@ where
 
 /// Derive the llama.cpp commit from a *resolved* managed-build binary path.
 ///
-/// Managed builds live in `<base>-<commit>/bin/llama-server` (the same
-/// `<commit>` that `record_running_version` stores), so the commit can be read
+/// Managed builds live in `<base>-<commit>[_<inputs-id>]/bin/llama-server`
+/// (the same `<commit>` that `record_running_version` stores), so it can be read
 /// off the path of the executable a process was actually spawned from —
 /// immune to a concurrent symlink swap, and available before the startup
 /// build check has recorded a version. Returns `None` for paths that don't
@@ -804,12 +860,25 @@ async fn dirs_resolved_through(path: &Path) -> HashSet<PathBuf> {
     dirs
 }
 
-/// Split a managed build directory name, `<base>-<commit>`, into its base and
-/// commit. The commit must look like the abbreviated hash `git rev-parse
-/// --short` produces: hex digits, at least 4 of them (git's minimum, used
+/// Split a managed build directory name, `<base>-<commit>[_<inputs-id>]`, into
+/// its base and commit. An inputs id must be exactly 8 lowercase hex digits.
+/// The commit must look like the abbreviated hash `git rev-parse --short`
+/// produces: hex digits, at least 4 of them (git's minimum, used
 /// only when `core.abbrev` is set that low; the default is 7 or more).
 fn split_managed_build_name(name: &str) -> Option<(&str, &str)> {
-    let (base, commit) = name.rsplit_once('-')?;
+    let (base, identity) = name.rsplit_once('-')?;
+    let commit = if let Some((commit, inputs_id)) = identity.split_once('_') {
+        if inputs_id.len() != 8
+            || !inputs_id
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        {
+            return None;
+        }
+        commit
+    } else {
+        identity
+    };
     (commit.len() >= 4 && commit.chars().all(|c| c.is_ascii_hexdigit())).then_some((base, commit))
 }
 
@@ -937,6 +1006,218 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn build_directory_name_suffixes_empty_inputs() {
+        let bm = prepare_test_manager(Path::new("/tmp/llama.cpp"));
+        assert_eq!(
+            bm.build_dir_for_commit("abcd123").unwrap(),
+            Path::new("/tmp/llama.cpp/build-abcd123_643d5437")
+        );
+    }
+
+    #[test]
+    fn build_directory_name_includes_inputs() {
+        let mut bm = prepare_test_manager(Path::new("/tmp/llama.cpp"));
+        bm.config.build_args = vec!["-DGGML_CUDA=ON".into()];
+        bm.config.build_command_args = vec!["-j".into()];
+        let build_dir = bm.build_dir_for_commit("abcd123").unwrap();
+        assert_eq!(build_dir, bm.build_dir_for_commit("abcd123").unwrap());
+        assert_eq!(
+            build_dir,
+            Path::new("/tmp/llama.cpp/build-abcd123_fd0ae50b")
+        );
+    }
+
+    #[test]
+    fn build_directory_name_changes_with_inputs() {
+        let mut bm = prepare_test_manager(Path::new("/tmp/llama.cpp"));
+        bm.config.build_args = vec!["-DGGML_CUDA=ON".into()];
+        bm.config.build_command_args = vec!["-j 2".into()];
+        let original = bm.build_dir_for_commit("abcd123").unwrap();
+        for (configure, build) in [
+            (vec!["-DGGML_CUDA=OFF"], vec!["-j 2"]),
+            (vec!["-DGGML_CUDA=ON"], vec!["-j 4"]),
+            (vec![], vec!["-DGGML_CUDA=ON", "-j 2"]),
+            (vec!["-DGGML_CUDA=ON", "-j 2"], vec![]),
+            (vec!["-DGGML_CUDA=ON"], vec!["-j", "2"]),
+            (vec!["-j 2"], vec!["-DGGML_CUDA=ON"]),
+        ] {
+            bm.config.build_args = configure.iter().map(|arg| (*arg).into()).collect();
+            bm.config.build_command_args = build.iter().map(|arg| (*arg).into()).collect();
+            assert_ne!(original, bm.build_dir_for_commit("abcd123").unwrap());
+        }
+    }
+
+    async fn write_test_binary(build_dir: &Path, succeeds: bool) -> PathBuf {
+        let binary = build_dir.join("bin/llama-server");
+        tokio::fs::create_dir_all(binary.parent().unwrap())
+            .await
+            .unwrap();
+        let script: &[u8] = if succeeds {
+            b"#!/bin/sh\nexit 0\n"
+        } else {
+            b"#!/bin/sh\nexit 1\n"
+        };
+        tokio::fs::write(&binary, script).await.unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary
+    }
+
+    #[tokio::test]
+    async fn build_directory_selection_adopts_live_unstamped_legacy_once() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut bm = prepare_test_manager(temp_dir.path());
+        bm.config.build_args = vec!["-DGGML_CUDA=ON".into()];
+        bm.config.build_command_args = vec!["-j".into()];
+        let legacy = temp_dir.path().join("build-abcd123");
+        let binary = write_test_binary(&legacy, true).await;
+        std::os::unix::fs::symlink(&binary, &bm.config.binary_path).unwrap();
+
+        assert_eq!(
+            bm.select_build_dir("abcd123").await.unwrap(),
+            (legacy.clone(), true)
+        );
+        assert_eq!(
+            tokio::fs::read(legacy.join(".llamesh-build-inputs"))
+                .await
+                .unwrap(),
+            b"fd0ae50b"
+        );
+        assert!(!bm.build_dir_for_commit("abcd123").unwrap().exists());
+        assert!(bm.prepared_build_dirs.lock().is_empty());
+        assert!(!bm.is_building());
+        assert_eq!(bm.binary_generation(), 0);
+        assert!(bm.symlink_already_current(&binary).await);
+        assert_eq!(
+            std::fs::read_dir(&legacy).unwrap().count(),
+            2,
+            "temporary stamp files must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_directory_selection_requires_matching_stamp_or_live_missing_stamp() {
+        // A present but unreadable stamp (a directory), dangling stamp, or
+        // almost-matching bytes must never be treated as absent.
+        for (stamp, live, reusable) in [
+            ("643d5437", true, true),
+            ("643d5437", false, true),
+            ("fd0ae50b", true, false),
+            ("643d5437\n", true, false),
+            ("", true, false),
+            ("absent", false, false),
+            ("directory", true, false),
+            ("dangling", true, false),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let bm = prepare_test_manager(temp_dir.path());
+            let legacy = temp_dir.path().join("build-abcd123");
+            let binary = write_test_binary(&legacy, true).await;
+            let stamp_path = legacy.join(".llamesh-build-inputs");
+            match stamp {
+                "absent" => {}
+                "directory" => tokio::fs::create_dir(&stamp_path).await.unwrap(),
+                "dangling" => std::os::unix::fs::symlink("missing-stamp", &stamp_path).unwrap(),
+                contents => tokio::fs::write(&stamp_path, contents).await.unwrap(),
+            }
+            if live {
+                std::os::unix::fs::symlink(&binary, &bm.config.binary_path).unwrap();
+            }
+            let expected = if reusable {
+                legacy.clone()
+            } else {
+                temp_dir.path().join("build-abcd123_643d5437")
+            };
+            assert_eq!(
+                bm.select_build_dir("abcd123").await.unwrap(),
+                (expected, reusable),
+                "stamp={stamp:?}, live={live}"
+            );
+            if stamp == "absent" {
+                assert!(!stamp_path.exists(), "non-live legacy must not be stamped");
+            }
+            assert!(binary.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn build_directory_selection_never_reuses_stamped_legacy_after_inputs_change() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut bm = prepare_test_manager(temp_dir.path());
+        bm.config.build_args = vec!["-DGGML_CUDA=ON".into()];
+        bm.config.build_command_args = vec!["-j".into()];
+        let legacy = temp_dir.path().join("build-abcd123");
+        let binary = write_test_binary(&legacy, true).await;
+        std::os::unix::fs::symlink(&binary, &bm.config.binary_path).unwrap();
+        assert_eq!(
+            bm.select_build_dir("abcd123").await.unwrap(),
+            (legacy.clone(), true)
+        );
+        for (configure, build) in [(vec!["-DGGML_CUDA=OFF"], vec!["-j"]), (vec![], vec![])] {
+            bm.config.build_args = configure.iter().map(|arg| (*arg).into()).collect();
+            bm.config.build_command_args = build.iter().map(|arg| (*arg).into()).collect();
+            let (selected, reusable) = bm.select_build_dir("abcd123").await.unwrap();
+            assert!(!reusable);
+            assert_ne!(selected, legacy);
+            bm.prepare_build_dir(&selected, &selected.join("bin/llama-server"))
+                .await
+                .unwrap();
+            assert!(bm.symlink_already_current(&binary).await);
+            assert_eq!(
+                tokio::fs::read(legacy.join(".llamesh-build-inputs"))
+                    .await
+                    .unwrap(),
+                b"fd0ae50b"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn build_directory_selection_prefers_verified_suffixed_candidate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bm = prepare_test_manager(temp_dir.path());
+        let legacy = temp_dir.path().join("build-abcd123");
+        let legacy_binary = write_test_binary(&legacy, true).await;
+        std::os::unix::fs::symlink(&legacy_binary, &bm.config.binary_path).unwrap();
+        let suffixed = temp_dir.path().join("build-abcd123_643d5437");
+        write_test_binary(&suffixed, true).await;
+
+        assert_eq!(
+            bm.select_build_dir("abcd123").await.unwrap(),
+            (suffixed, true)
+        );
+        assert!(!legacy.join(".llamesh-build-inputs").exists());
+    }
+
+    #[tokio::test]
+    async fn build_directory_selection_failed_verification_never_builds_legacy() {
+        for stamp in [None, Some("643d5437")] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let bm = prepare_test_manager(temp_dir.path());
+            let legacy = temp_dir.path().join("build-abcd123");
+            let legacy_binary = write_test_binary(&legacy, false).await;
+            std::os::unix::fs::symlink(&legacy_binary, &bm.config.binary_path).unwrap();
+            let stamp_path = legacy.join(".llamesh-build-inputs");
+            if let Some(contents) = stamp {
+                tokio::fs::write(&stamp_path, contents).await.unwrap();
+            }
+            let suffixed = temp_dir.path().join("build-abcd123_643d5437");
+            write_test_binary(&suffixed, false).await;
+
+            assert_eq!(
+                bm.select_build_dir("abcd123").await.unwrap(),
+                (suffixed, false)
+            );
+            assert_eq!(
+                stamp_path.exists(),
+                stamp.is_some(),
+                "failed verification must not stamp legacy"
+            );
+            assert!(bm.prepared_build_dirs.lock().is_empty());
+            assert!(legacy_binary.exists());
+        }
+    }
+
+    #[test]
     fn test_split_managed_build_name() {
         assert_eq!(split_managed_build_name("build-abc"), None);
         assert_eq!(split_managed_build_name("build-abcdefg"), None);
@@ -954,6 +1235,47 @@ mod tests {
             split_managed_build_name("my-build-0123456789ABCDEF"),
             Some(("my-build", "0123456789ABCDEF"))
         );
+    }
+
+    #[test]
+    fn managed_build_names_accept_inputs_suffix_and_reject_malformed_suffixes() {
+        for (name, expected) in [
+            ("build-abcd_01234567", ("build", "abcd")),
+            (
+                "my-build-0123456789ABCDEF_89abcdef",
+                ("my-build", "0123456789ABCDEF"),
+            ),
+        ] {
+            assert_eq!(split_managed_build_name(name), Some(expected));
+            assert_eq!(
+                version_from_resolved_binary(
+                    &Path::new("/tmp").join(name).join("bin/llama-server")
+                )
+                .as_deref(),
+                Some(expected.1)
+            );
+        }
+        for name in [
+            "build-abc_01234567",
+            "build-abcdg_01234567",
+            "build-abcd_",
+            "build-abcd_0123456",
+            "build-abcd_012345678",
+            "build-abcd_89ABCDEF",
+            "build-abcd_0123456g",
+            "build-abcd__01234567",
+            "build-abcd_01234567_89abcdef",
+            "build-abcd_01234567-",
+        ] {
+            assert_eq!(split_managed_build_name(name), None, "{name}");
+            assert_eq!(
+                version_from_resolved_binary(
+                    &Path::new("/tmp").join(name).join("bin/llama-server")
+                ),
+                None,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -1091,7 +1413,7 @@ fi
         let commit = String::from_utf8(commit.stdout).unwrap();
         let unfinished_build = temp_dir
             .join("builds")
-            .join(format!("build-{}", commit.trim()));
+            .join(format!("build-{}_643d5437", commit.trim()));
         tokio::fs::create_dir_all(&unfinished_build).await.unwrap();
         tokio::fs::write(unfinished_build.join("truncated.o"), b"")
             .await
@@ -1167,6 +1489,37 @@ fi
         );
         let resolved = tokio::fs::canonicalize(&binary_path).await.unwrap();
         assert!(resolved.ends_with("bin/llama-server"));
+
+        // Model the first upgraded restart with only an unstamped live
+        // legacy build. With PATH restored, any attempted build would fail.
+        let suffixed = resolved.parent().unwrap().parent().unwrap();
+        let legacy = temp_dir
+            .join("builds")
+            .join(format!("build-{}", commit.trim()));
+        tokio::fs::rename(suffixed, &legacy).await.unwrap();
+        tokio::fs::remove_file(&binary_path).await.unwrap();
+        std::os::unix::fs::symlink(legacy.join("bin/llama-server"), &binary_path).unwrap();
+        let gen_before_adoption = bm.binary_generation();
+        bm.update_and_build().await.unwrap();
+        assert_eq!(
+            bm.binary_generation(),
+            gen_before_adoption,
+            "legacy adoption must not signal a swap or drain"
+        );
+        assert_eq!(
+            tokio::fs::read(legacy.join(".llamesh-build-inputs"))
+                .await
+                .unwrap(),
+            b"643d5437"
+        );
+        assert!(
+            bm.symlink_already_current(&legacy.join("bin/llama-server"))
+                .await
+        );
+        assert!(
+            !suffixed.exists(),
+            "legacy adoption must not start a new build"
+        );
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
@@ -1633,6 +1986,54 @@ fi
         bm.prepare_build_dir(&build_dir, &binary).await.unwrap();
 
         assert!(binary.exists() && object.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_keeps_newest_mixed_builds_and_live_build() {
+        for active_name in ["build-bcde234", "build-abcd123_01234567"] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let names = [
+                active_name,
+                "build-abcd123_11111111",
+                "build-abcd123",
+                "build-abcd123_22222222",
+            ];
+            for name in names {
+                let bin = temp_dir.path().join(name).join("bin");
+                tokio::fs::create_dir_all(&bin).await.unwrap();
+                tokio::fs::write(bin.join("llama-server"), b"binary")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let unfinished = temp_dir.path().join("build-abcd123_33333333");
+            tokio::fs::create_dir_all(&unfinished).await.unwrap();
+            tokio::fs::write(unfinished.join(".llamesh-build-inputs"), b"33333333")
+                .await
+                .unwrap();
+            let malformed = temp_dir.path().join("build-abcd123_89ABCDEF");
+            tokio::fs::create_dir_all(&malformed).await.unwrap();
+            let holder = temp_dir.path().join("build-cdef345_44444444");
+            tokio::fs::create_dir_all(&holder).await.unwrap();
+            let active = temp_dir.path().join(active_name);
+            std::os::unix::fs::symlink(active.join("bin"), holder.join("live")).unwrap();
+            let mut bm = prepare_test_manager(temp_dir.path());
+            bm.config.binary_path = holder
+                .join("live/llama-server")
+                .to_string_lossy()
+                .into_owned();
+            bm.config.keep_builds = 2;
+            bm.cleanup_old_builds().await.unwrap();
+
+            assert!(active.exists(), "the oldest live build must be protected");
+            assert!(holder.exists(), "the symlink holder must be protected");
+            assert!(Path::new(&bm.config.binary_path).exists());
+            assert!(!temp_dir.path().join(names[1]).exists());
+            assert!(temp_dir.path().join(names[2]).exists());
+            assert!(temp_dir.path().join(names[3]).exists());
+            assert!(!unfinished.exists());
+            assert!(malformed.exists(), "malformed names are unmanaged");
+        }
     }
 
     #[tokio::test]
