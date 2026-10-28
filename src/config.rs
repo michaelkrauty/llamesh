@@ -1057,9 +1057,153 @@ pub fn load_secrets(path: &Path) -> anyhow::Result<SecretsConfig> {
         .context("Failed to parse secrets file")
 }
 
+/// Load the secrets file for startup: `explicit` (the `--secrets` path) when
+/// given, otherwise `default_path` if it exists.
+///
+/// The default file is skipped only when there is no directory entry at
+/// `default_path`. Anything else must load, including a symlink whose target
+/// is missing (for example, a secrets volume that is not mounted): a secrets
+/// file that is present but cannot be read or parsed is an error rather than
+/// being ignored, because it can hold the `auth` and TLS settings, and
+/// starting without them would leave the node open or serving plaintext
+/// without any sign of it.
+pub fn load_startup_secrets(
+    explicit: Option<&Path>,
+    default_path: &Path,
+) -> anyhow::Result<Option<SecretsConfig>> {
+    if let Some(path) = explicit {
+        return load_secrets(path)
+            .map(Some)
+            .with_context(|| format!("Failed to load explicit secrets file: {}", path.display()));
+    }
+
+    // `symlink_metadata` rather than `try_exists`, which follows symlinks and
+    // reports a dangling one as absent.
+    match std::fs::symlink_metadata(default_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Could not determine whether default secrets file exists: {}",
+                    default_path.display()
+                )
+            })
+        }
+    }
+
+    load_secrets(default_path).map(Some).with_context(|| {
+        format!(
+            "Failed to load default secrets file: {}",
+            default_path.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VALID_SECRETS: &str =
+        "auth:\n  enabled: true\n  required_header: x-api-key\n  allowed_keys:\n    - test-key\n";
+
+    #[test]
+    fn startup_secrets_absent_default_is_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+
+        assert!(load_startup_secrets(None, &path).unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_secrets_loads_default_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        fs::write(&path, VALID_SECRETS).unwrap();
+
+        let auth = load_startup_secrets(None, &path)
+            .unwrap()
+            .unwrap()
+            .auth
+            .unwrap();
+        assert!(auth.enabled);
+        assert_eq!(auth.required_header, "x-api-key");
+        assert_eq!(auth.allowed_keys, ["test-key"]);
+    }
+
+    #[test]
+    fn startup_secrets_rejects_malformed_default_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        fs::write(&path, "auth: [").unwrap();
+
+        let error = load_startup_secrets(None, &path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("default secrets file"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn startup_secrets_rejects_invalid_default_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        fs::write(&path, "auth: invalid\n").unwrap();
+
+        let error = load_startup_secrets(None, &path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("default secrets file"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(
+            message.contains("Failed to parse secrets file"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn startup_secrets_rejects_missing_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("explicit.yaml");
+        let default_path = dir.path().join("secrets.yaml");
+
+        let error = load_startup_secrets(Some(&explicit), &default_path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&explicit.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn startup_secrets_explicit_path_overrides_malformed_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("explicit.yaml");
+        let default_path = dir.path().join("secrets.yaml");
+        fs::write(&explicit, VALID_SECRETS).unwrap();
+        fs::write(&default_path, "auth: [").unwrap();
+
+        let auth = load_startup_secrets(Some(&explicit), &default_path)
+            .unwrap()
+            .unwrap()
+            .auth
+            .unwrap();
+        assert!(auth.enabled);
+        assert_eq!(auth.allowed_keys, ["test-key"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_secrets_rejects_default_symlink_without_a_target() {
+        // A dangling link (a secrets volume that is not mounted) and a link
+        // loop are present but unreadable, not absent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.yaml");
+        for target in [dir.path().join("unmounted/secrets.yaml"), path.clone()] {
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+
+            let error = format!("{:#}", load_startup_secrets(None, &path).unwrap_err());
+            assert!(error.contains("default secrets file"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            fs::remove_file(&path).unwrap();
+        }
+    }
 
     fn defaults() -> ModelDefaults {
         ModelDefaults {

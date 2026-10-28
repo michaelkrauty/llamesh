@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.30] - 2026-10-28
+
+### Fixed
+
+- Refuse to start when the default `secrets.yaml` cannot be loaded. Without `--secrets`, the proxy loads `secrets.yaml` from its working directory if the file exists, but a file it could not read or parse was skipped without an error or a log line, so a syntax error or a wrongly typed field started the node without the `auth`, `server_tls`, or `cluster_tls` settings it held; with no `auth` block in `config.yaml`, the API and admin endpoints then accepted requests without an API key. Such a file, including a `secrets.yaml` symlink whose target is missing, is now a startup error that names it, as a file passed with `--secrets` already was. A missing `secrets.yaml` is still optional.
+
 ## [1.21.29] - 2026-10-19
 
 ### Fixed

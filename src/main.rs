@@ -70,7 +70,8 @@ struct Args {
     #[arg(long, default_value = "cookbook.yaml")]
     cookbook: PathBuf,
 
-    /// Path to secrets file (optional)
+    /// Path to secrets file. When omitted, loads secrets.yaml from the working
+    /// directory if present. A file that cannot be read or parsed aborts startup.
     #[arg(long)]
     secrets: Option<PathBuf>,
 }
@@ -99,17 +100,11 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    if let Some(secrets_path) = &args.secrets {
-        let secrets = config::load_secrets(secrets_path)?;
+    if let Some(secrets) = config::load_startup_secrets(
+        args.secrets.as_deref(),
+        std::path::Path::new("secrets.yaml"),
+    )? {
         config.merge_secrets(secrets);
-    } else {
-        // Try loading secrets.yaml from default location if it exists
-        let default_secrets = std::path::Path::new("secrets.yaml");
-        if default_secrets.exists() {
-            if let Ok(secrets) = config::load_secrets(default_secrets) {
-                config.merge_secrets(secrets);
-            }
-        }
     }
 
     // Validate config
