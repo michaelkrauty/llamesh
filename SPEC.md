@@ -1199,6 +1199,8 @@ Every `gossip_interval_seconds`, nodes exchange metadata including:
 * `known_peers`: List of known peers for transitive discovery (peers learn about peers-of-peers).
 * Current capacity and resource usage.
 
+Gossip state is ordered per sender. Each process stamps the state it sends with a random `gossip_epoch`, chosen at startup, and a `gossip_seq` that increases with every round. A receiver ignores state from the same process that is not newer than the state it holds, so a delayed message cannot undo a later one, such as a drain announcement. State from a different process of the same node is accepted unless that process started earlier than the one whose state is held; a delayed message from a previous process that started in the same second can be applied once, and is replaced by the current process's next round. Messages from older versions, which lack these fields, are accepted unless the receiver holds current ordered state for that node. Once the stored state is older than `max(3 * gossip_interval_seconds, 15)` seconds, any state is accepted, so a node can always rejoin. A rejected message does not refresh the sender's last-seen time or add the peers it lists.
+
 ### Loop Prevention
 
 The proxy attaches a `X-Llama-Mesh-Hops` header to forwarded requests. This is incremented at each hop. If the count exceeds `max_hops` (configurable, default 10), the request is rejected with a 400 Bad Request error.

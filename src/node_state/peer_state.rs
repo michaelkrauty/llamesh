@@ -45,6 +45,12 @@ pub struct PeerState {
     /// in which case the querying node falls back to its own start time.
     #[serde(default)]
     pub started_at_unix: u64,
+    /// Random process epoch and increasing snapshot sequence. Zero in either
+    /// field means ordering metadata is absent (an older sender).
+    #[serde(default)]
+    pub gossip_epoch: u64,
+    #[serde(default)]
+    pub gossip_seq: u64,
     pub supported_models: Vec<String>,
     #[serde(default)]
     pub model_stats: HashMap<String, PeerModelStats>,
@@ -139,6 +145,8 @@ mod tests {
             llama_cpp_version: "b2c3d4e5f".into(),
             last_seen: 12345,
             started_at_unix: 1_700_000_000,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["model:fast".into()],
             model_stats: HashMap::new(),
             active_instances: 2,
@@ -209,6 +217,8 @@ mod tests {
         // Older peers omit started_at_unix; it must default to 0 so the
         // querying node falls back to its own start time for their models.
         assert_eq!(parsed.started_at_unix, 0);
+        assert_eq!(parsed.gossip_epoch, 0);
+        assert_eq!(parsed.gossip_seq, 0);
         assert_eq!(parsed.external_vram_mb, 0);
         assert_eq!(parsed.device_vram_used_mb, 0);
         assert!(!parsed.gpu_telemetry_available);

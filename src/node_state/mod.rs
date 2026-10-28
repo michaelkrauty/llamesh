@@ -162,6 +162,8 @@ pub struct NodeState {
     /// so a model's reported creation time is fixed for the process lifetime
     /// rather than changing on every request.
     pub started_at_unix: u64,
+    gossip_epoch: u64,
+    gossip_seq: Arc<AtomicU64>,
     pub cookbook: Arc<RwLock<Cookbook>>,
     /// Monotonic counter incremented on each cookbook reload.
     /// `get_instance_for_model` captures it with the profile it resolved and
@@ -675,6 +677,8 @@ impl NodeState {
 
         Ok(Self {
             config: Arc::new(config),
+            gossip_epoch: rand::random_range(1..=u64::MAX),
+            gossip_seq: Arc::new(AtomicU64::new(0)),
             started_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -3090,6 +3094,18 @@ impl NodeState {
         count
     }
 
+    pub async fn get_gossip_peer_state(&self) -> PeerState {
+        // Only the gossip loop builds outgoing snapshots, sequentially.
+        let mut peer = self.get_self_peer_state().await;
+        peer.gossip_epoch = self.gossip_epoch;
+        peer.gossip_seq = self
+            .gossip_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_add(1)
+            .expect("Gossip sequence exhausted");
+        peer
+    }
+
     pub async fn get_self_peer_state(&self) -> PeerState {
         let resources = self.calculate_resource_snapshot().await;
         let instances = self.instances.read().await;
@@ -3249,6 +3265,8 @@ impl NodeState {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
             started_at_unix: self.started_at_unix,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models,
             model_stats,
             active_instances,
@@ -4424,6 +4442,8 @@ mod tests {
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: supported.into_iter().map(|s| s.to_string()).collect(),
             active_instances: 0,
             max_instances: 8,
@@ -4658,6 +4678,8 @@ mod tests {
             llama_cpp_version: "unknown".into(),
             last_seen: now, // Recent
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["remote-model:default".into()], // Supports our model
             active_instances: 0,
             max_instances: 10,
@@ -5962,6 +5984,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec![],
             active_instances: 2,
             max_instances: 8,
@@ -6000,6 +6024,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec![],
             active_instances: 0,
             max_instances: 8,
@@ -6038,6 +6064,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec![],
             active_instances: 2,
             max_instances: 8,
@@ -6078,6 +6106,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec![],
             active_instances: 2,
             max_instances: 8,
@@ -6119,6 +6149,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -6158,6 +6190,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 0,
             max_instances: 8,
@@ -6212,6 +6246,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -6251,6 +6287,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 0,
             max_instances: 8,
@@ -6307,6 +6345,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -6336,6 +6376,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -6382,6 +6424,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,
@@ -6454,6 +6498,8 @@ models:
             llama_cpp_version: "unknown".into(),
             last_seen: 0,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["gpt:fast".into()],
             active_instances: 1,
             max_instances: 8,

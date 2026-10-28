@@ -150,7 +150,7 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
         // Read before the state snapshot: draining never reverts, so a round
         // that sees it also advertises the node as not ready.
         let announces_drain = state.draining.load(std::sync::atomic::Ordering::Relaxed);
-        let my_state = state.get_self_peer_state().await;
+        let my_state = state.get_gossip_peer_state().await;
         let mut sends = Vec::new();
 
         // Collect all targets: seeds + mDNS-discovered + known peers
@@ -576,6 +576,32 @@ pub async fn process_gossip_message(
 ) {
     let mut peers = state.peers.write().await;
     let mut peer_state = msg.origin;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(existing) = peers.get(&peer_state.node_id) {
+        let timeout = state
+            .config
+            .cluster
+            .gossip_interval_seconds
+            .saturating_mul(3)
+            .max(15);
+        let ordered = |peer: &PeerState| peer.gossip_epoch != 0 && peer.gossip_seq != 0;
+        let newer = !ordered(existing)
+            || (ordered(&peer_state)
+                && if peer_state.gossip_epoch == existing.gossip_epoch {
+                    peer_state.gossip_seq > existing.gossip_seq
+                } else {
+                    // A delayed previous process started in the same second can
+                    // win once; the current process replaces it next round.
+                    peer_state.started_at_unix >= existing.started_at_unix
+                });
+        if now.saturating_sub(existing.last_seen) <= timeout && !newer {
+            debug!(peer_node_id = %peer_state.node_id, "Ignoring stale or duplicate gossip state");
+            return;
+        }
+    }
     // Provenance belongs to this receiver, never to the incoming advertisement.
     peer_state.address_from_source = false;
 
@@ -642,10 +668,7 @@ pub async fn process_gossip_message(
     }
 
     // Update the origin peer with local timestamp
-    peer_state.last_seen = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    peer_state.last_seen = now;
 
     // Handle loopback address resolution
     // This handles the case where a peer has public_url unset and gossips 127.0.0.1
@@ -753,6 +776,8 @@ pub async fn process_gossip_message(
                     last_seen: now_secs,
                     // 0 until the peer gossips its own start time directly.
                     started_at_unix: 0,
+                    gossip_epoch: 0,
+                    gossip_seq: 0,
                     supported_models: vec![],
                     active_instances: 0,
                     max_instances: 0,
@@ -954,6 +979,8 @@ mod tests {
             llama_cpp_version: "unknown".to_string(),
             last_seen: 1000,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec![],
             active_instances: 0,
             max_instances: 8,
@@ -973,6 +1000,237 @@ mod tests {
             ready: true,
             loaded_models: vec![],
         }
+    }
+
+    fn ordered_gossip(epoch: u64, seq: u64, started_at: u64, ready: bool) -> GossipMessage {
+        let mut wire = serde_json::to_value(peer_state_with_version(
+            "peer-ordered",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .unwrap();
+        wire["gossip_epoch"] = epoch.into();
+        wire["gossip_seq"] = seq.into();
+        wire["started_at_unix"] = started_at.into();
+        wire["ready"] = ready.into();
+        wire["current_requests"] = seq.into();
+        GossipMessage {
+            origin: serde_json::from_value(wire).unwrap(),
+            known_peers: vec![],
+        }
+    }
+
+    async fn receive_ordered_gossip(
+        state: &NodeState,
+        epoch: u64,
+        seq: u64,
+        started_at: u64,
+        ready: bool,
+    ) {
+        process_gossip_message(state, ordered_gossip(epoch, seq, started_at, ready), None).await;
+    }
+
+    #[tokio::test]
+    async fn gossip_ignores_older_and_duplicate_snapshots() {
+        let state = address_test_state(&[]).await;
+        receive_ordered_gossip(&state, 8, 2, 100, true).await;
+        receive_ordered_gossip(&state, 8, 1, 100, false).await;
+        assert_eq!(state.peers.read().await["peer-ordered"].current_requests, 2);
+        receive_ordered_gossip(&state, 8, 2, 100, false).await;
+        assert!(state.peers.read().await["peer-ordered"].ready);
+        receive_ordered_gossip(&state, 8, 3, 100, false).await;
+        let peers = state.peers.read().await;
+        assert!(!peers["peer-ordered"].ready);
+        assert_eq!(peers["peer-ordered"].current_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn gossip_delayed_ready_snapshot_cannot_undo_drain() {
+        let state = address_test_state(&[]).await;
+        receive_ordered_gossip(&state, 8, 2, 100, false).await;
+        receive_ordered_gossip(&state, 8, 1, 100, true).await;
+        assert!(!state.peers.read().await["peer-ordered"].ready);
+    }
+
+    #[tokio::test]
+    async fn gossip_restart_accepts_later_or_equal_start_time() {
+        for new_start in [101, 100] {
+            let state = address_test_state(&[]).await;
+            receive_ordered_gossip(&state, 8, 100, 100, true).await;
+            // Epochs are random identities, so their numeric order is irrelevant.
+            receive_ordered_gossip(&state, 2, 1, new_start, false).await;
+            assert!(!state.peers.read().await["peer-ordered"].ready);
+            if new_start > 100 {
+                receive_ordered_gossip(&state, 8, 101, 100, true).await;
+                assert!(!state.peers.read().await["peer-ordered"].ready);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_same_second_delayed_epoch_is_replaced_next_round() {
+        let state = address_test_state(&[]).await;
+        receive_ordered_gossip(&state, 8, 100, 100, true).await;
+        receive_ordered_gossip(&state, 2, 1, 100, false).await;
+        receive_ordered_gossip(&state, 8, 101, 100, true).await;
+        assert!(state.peers.read().await["peer-ordered"].ready);
+        receive_ordered_gossip(&state, 2, 2, 100, false).await;
+        assert!(!state.peers.read().await["peer-ordered"].ready);
+    }
+
+    #[tokio::test]
+    async fn gossip_unordered_cannot_replace_fresh_ordered_state() {
+        for (epoch, seq) in [(0, 0), (0, 3), (8, 0)] {
+            let state = address_test_state(&[]).await;
+            receive_ordered_gossip(&state, 8, 2, 100, false).await;
+            receive_ordered_gossip(&state, epoch, seq, 101, true).await;
+            assert!(!state.peers.read().await["peer-ordered"].ready);
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_unordered_state_accepts_legacy_and_ordered_updates() {
+        let state = address_test_state(&[]).await;
+        receive_ordered_gossip(&state, 0, 0, 200, true).await;
+        receive_ordered_gossip(&state, 0, 0, 199, false).await;
+        assert!(!state.peers.read().await["peer-ordered"].ready);
+        receive_ordered_gossip(&state, 8, 1, 100, true).await;
+        assert!(state.peers.read().await["peer-ordered"].ready);
+    }
+
+    #[tokio::test]
+    async fn gossip_rejections_leave_peer_and_discovery_unchanged() {
+        let state = address_test_state(&[]).await;
+        receive_ordered_gossip(&state, 8, 2, 100, false).await;
+        let before = {
+            let mut peers = state.peers.write().await;
+            let stored = peers.get_mut("peer-ordered").unwrap();
+            stored.last_seen -= 5;
+            serde_json::to_value(stored).unwrap()
+        };
+        for (epoch, seq, start) in [(8, 1, 100), (8, 2, 100), (9, 3, 99), (0, 0, 101)] {
+            let mut message = ordered_gossip(epoch, seq, start, true);
+            message.origin.address = "http://changed:9999".into();
+            message.origin.version = "different".into();
+            message.known_peers.push(PeerInfo {
+                node_id: "must-not-be-discovered".into(),
+                address: "http://unknown:8080".into(),
+            });
+            process_gossip_message(&state, message, None).await;
+            let peers = state.peers.read().await;
+            assert_eq!(
+                serde_json::to_value(&peers["peer-ordered"]).unwrap(),
+                before
+            );
+            assert_eq!(peers.len(), 1);
+            assert!(state.logged_peer_versions.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_stale_state_cannot_block_any_sender() {
+        for interval in [1, 20] {
+            for (epoch, seq, start) in [(8, 1, 100), (8, 2, 100), (9, 3, 99), (0, 0, 101)] {
+                let mut config = minimal_node_config();
+                config.cluster.gossip_interval_seconds = interval;
+                let state = NodeState::new(
+                    config.clone(),
+                    Cookbook { models: vec![] },
+                    BuildManager::new(config.llama_cpp.clone()),
+                )
+                .await
+                .unwrap();
+                receive_ordered_gossip(&state, 8, 2, 100, false).await;
+                // 15 s minimum for a 1 s interval; 60 s for a 20 s interval.
+                let timeout = if interval == 1 { 15 } else { 60 };
+                let last_seen = state.peers.read().await["peer-ordered"].last_seen;
+                state
+                    .peers
+                    .write()
+                    .await
+                    .get_mut("peer-ordered")
+                    .unwrap()
+                    .last_seen = last_seen - (timeout - 5);
+                receive_ordered_gossip(&state, epoch, seq, start, true).await;
+                assert!(!state.peers.read().await["peer-ordered"].ready);
+                state
+                    .peers
+                    .write()
+                    .await
+                    .get_mut("peer-ordered")
+                    .unwrap()
+                    .last_seen = last_seen - (timeout + 5);
+                receive_ordered_gossip(&state, epoch, seq, start, true).await;
+                let peers = state.peers.read().await;
+                assert!(peers["peer-ordered"].ready);
+                assert_eq!(peers["peer-ordered"].current_requests, seq);
+                assert!(peers["peer-ordered"].last_seen >= last_seen);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_sender_stamps_snapshots_without_persistent_state() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let mut config = minimal_node_config();
+        // A nonexistent metrics parent must not prevent startup for gossip.
+        config.metrics_path = dir
+            .path()
+            .join("missing/metrics.json")
+            .to_str()
+            .unwrap()
+            .into();
+        let make_state = || {
+            NodeState::new(
+                config.clone(),
+                Cookbook { models: vec![] },
+                BuildManager::new(config.llama_cpp.clone()),
+            )
+        };
+        let state = make_state().await.unwrap();
+        let first = serde_json::to_value(state.get_gossip_peer_state().await).unwrap();
+        state
+            .draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let second = serde_json::to_value(state.clone().get_gossip_peer_state().await).unwrap();
+        assert!(first["gossip_epoch"].as_u64().unwrap() > 0);
+        assert_eq!(first["gossip_epoch"], second["gossip_epoch"]);
+        assert_eq!(first["gossip_seq"], 1);
+        assert_eq!(second["gossip_seq"], 2);
+        assert_eq!(second["ready"], false);
+        let restarted =
+            serde_json::to_value(make_state().await.unwrap().get_gossip_peer_state().await)
+                .unwrap();
+        assert!(restarted["gossip_epoch"].as_u64().unwrap() > 0);
+        assert_eq!(restarted["gossip_seq"], 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        #[derive(Deserialize)]
+        struct LegacyPeerState {
+            node_id: String,
+            ready: bool,
+        }
+        let legacy: LegacyPeerState = serde_json::from_value(second.clone()).unwrap();
+        assert_eq!(legacy.node_id, second["node_id"]);
+        assert!(!legacy.ready);
+
+        let mut legacy_wire = second;
+        legacy_wire.as_object_mut().unwrap().remove("gossip_epoch");
+        legacy_wire.as_object_mut().unwrap().remove("gossip_seq");
+        let parsed: PeerState = serde_json::from_value(legacy_wire).unwrap();
+        let parsed_wire = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(parsed_wire["gossip_epoch"], 0);
+        assert_eq!(parsed_wire["gossip_seq"], 0);
+        let receiver = address_test_state(&[]).await;
+        process_gossip_message(
+            &receiver,
+            GossipMessage {
+                origin: parsed,
+                known_peers: vec![],
+            },
+            None,
+        )
+        .await;
+        assert!(!receiver.peers.read().await[&legacy.node_id].ready);
     }
 
     #[test]
@@ -1090,6 +1348,8 @@ mod tests {
             llama_cpp_version: "origincpp1".into(),
             last_seen: 1000,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec![],
             active_instances: 0,
             max_instances: 8,
@@ -1229,6 +1489,8 @@ mod tests {
                     llama_cpp_version: "unknown".into(),
                     last_seen: 1000,
                     started_at_unix: 0,
+                    gossip_epoch: 0,
+                    gossip_seq: 0,
                     supported_models: vec!["model:default".into()],
                     active_instances: 0,
                     max_instances: 8,
@@ -1260,6 +1522,8 @@ mod tests {
             llama_cpp_version: "unknown".into(),
             last_seen: 2000,
             started_at_unix: 0,
+            gossip_epoch: 0,
+            gossip_seq: 0,
             supported_models: vec!["model:default".into(), "new-model:default".into()],
             active_instances: 1,
             max_instances: 8,
