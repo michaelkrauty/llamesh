@@ -329,7 +329,7 @@ cluster:
 
 ### 2. Cookbook (Model & Profile Definitions)
 
-**Hot Reloading:** The cookbook file is watched for changes using filesystem events. When you modify `cookbook.yaml`, the proxy automatically reloads the configuration without requiring a restart. This allows you to add new models, modify profiles, or disable models on-the-fly. A running instance whose launch arguments changed, or whose model or profile was removed or disabled, is marked draining at once: it takes no new requests and stops when its in-flight requests finish, and new requests start an instance with the new configuration. Other running instances are unaffected. Launch arguments are compared through the profile's args hash, which leaves out `--host` and `--port` and treats the remaining arguments as an unordered set, so a change to only those two options, or one that only swaps values between options, does not drain the instance. A request still queued when the cookbook reloads uses the reloaded definition; a request whose profile was removed or disabled while it waited gets `404` `model_not_found`.
+**Hot Reloading:** The cookbook file is watched for changes using filesystem events. When you modify `cookbook.yaml`, the proxy automatically reloads the configuration without requiring a restart. This allows you to add new models, modify profiles, or disable models on-the-fly. A running instance whose launch arguments changed, or whose model or profile was removed or disabled, is marked draining at once: it takes no new requests and stops when its in-flight requests finish, and new requests start an instance with the new configuration. Other running instances are unaffected. Launch arguments are compared through the profile's args hash, which leaves out `--host` and `--port` and sorts option groups while keeping each option with its values (including negative numbers). Reordering independent options does not drain the instance; swapping values between options does. A request still queued when the cookbook reloads uses the reloaded definition; a request whose profile was removed or disabled while it waited gets `404` `model_not_found`.
 
 Example `cookbook.yaml`:
 
@@ -434,6 +434,8 @@ Profiles must match the request type. An embedding request (`/v1/embeddings`) is
 ### 3. Persistent Metrics Store
 
 Per node, metrics snapshots are stored as JSON files at the path specified by `metrics_path` (default: `./node-metrics.json`). Metrics are keyed by the SHA-256 hash of llama-server launch arguments, not by model name, since the same model can have different profiles with different resource characteristics. The `display_names` field maps each hash back to human-readable `model:profile` names.
+
+Earlier versions hashed the arguments as individually sorted tokens. Data stored under a profile's earlier hash is moved to its current hash at startup and on every cookbook reload, for disabled profiles too, without overwriting data already stored under the current hash; if several profiles shared an earlier hash, each gets a copy. Entries that no profile maps to are kept.
 
 ```json
 {

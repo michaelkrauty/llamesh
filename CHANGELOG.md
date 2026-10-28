@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.41] - 2026-10-28
+
+### Fixed
+
+- Keep each launch option paired with its value in the args hash. The hash sorted individual arguments, so argument lists that differed only in which value went with which option, such as `-c 4096 -b 2048` and `-c 2048 -b 4096`, hashed the same: a cookbook reload with such an edit left the running instance on the old arguments, and the two configurations shared learned memory and parsed model parameters. Options are now hashed as groups with their values; reordering independent options still does not change the hash.
+
+### Changed
+
+- Args hashes change with this version. Learned data in the metrics snapshot is moved to each profile's new hash at startup and on cookbook reload, so no profile starts cold, but `proxy_hash_*` series are exported under new `hash` label values.
+
 ## [1.21.40] - 2026-10-28
 
 ### Fixed

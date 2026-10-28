@@ -227,9 +227,14 @@ pub fn parse_llama_server_log(lines: &[String]) -> ParsedModelParams {
 
 /// Compute a deterministic hash of llama-server launch args.
 /// Filters out --host and --port (vary per instance, irrelevant to memory).
+/// Sorts option groups, keeping each option with its following values (including
+/// negative numbers). Leading values form their own groups. Tokens stay intact;
+/// callers use build_pre_args to expand --opt=value before hashing.
+/// Length prefixes delimit tokens and groups.
 pub fn compute_args_hash(args: &[String]) -> String {
-    let mut filtered: Vec<&str> = Vec::new();
+    let mut groups: Vec<Vec<&str>> = Vec::new();
     let mut skip_next = false;
+    let mut has_option = false;
 
     for arg in args.iter() {
         if skip_next {
@@ -244,19 +249,28 @@ pub fn compute_args_hash(args: &[String]) -> String {
         if arg.starts_with("--host=") || arg.starts_with("--port=") {
             continue;
         }
-        filtered.push(arg);
+        if arg.starts_with('-') && arg.parse::<f64>().is_err() {
+            groups.push(vec![arg.as_str()]);
+            has_option = true;
+        } else if has_option {
+            groups.last_mut().unwrap().push(arg);
+        } else {
+            groups.push(vec![arg]);
+        }
     }
 
-    // Sort for determinism (args order shouldn't matter)
-    filtered.sort();
+    groups.sort();
 
     // Use SHA-256 for a stable hash that won't change across Rust versions.
     // DefaultHasher is not guaranteed to be stable across toolchain upgrades,
     // and args_hash is persisted in metrics snapshots for learned memory data.
     let mut hash = Sha256::new();
-    for arg in &filtered {
-        hash.update(arg.as_bytes());
-        hash.update(b"\0"); // separator to avoid collisions
+    for group in groups {
+        hash.update((group.len() as u64).to_be_bytes());
+        for arg in group {
+            hash.update((arg.len() as u64).to_be_bytes());
+            hash.update(arg.as_bytes());
+        }
     }
     let result = hash.finalize();
     format!(
@@ -932,6 +946,94 @@ mod tests {
         // Verify mutex works (parking_lot doesn't panic)
         let status = instance.status.lock().clone();
         assert_eq!(status, InstanceStatus::Starting);
+    }
+
+    #[test]
+    fn test_compute_args_hash_preserves_option_values() {
+        let hash = |args: &[&str]| {
+            compute_args_hash(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        assert_ne!(
+            hash(&["-c", "4096", "-b", "2048"]),
+            hash(&["-c", "2048", "-b", "4096"])
+        );
+        assert_eq!(
+            hash(&["-c", "4096", "-b", "2048"]),
+            hash(&["-b", "2048", "-c", "4096"])
+        );
+        assert_eq!(
+            hash(&["--override-kv", "a=1", "--override-kv", "b=2"]),
+            hash(&["--override-kv", "b=2", "--override-kv", "a=1"])
+        );
+        assert_ne!(
+            hash(&["--override-kv", "a=1", "--override-kv", "b=2"]),
+            hash(&["--override-kv", "a=1", "b=2", "--override-kv"])
+        );
+    }
+
+    #[test]
+    fn test_compute_args_hash_group_boundaries() {
+        let hash = |args: &[&str]| {
+            compute_args_hash(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        let ambiguous = [
+            hash(&["-a", "b c"]),
+            hash(&["-a", "b", "c"]),
+            hash(&["-a b", "c"]),
+        ];
+        for i in 0..ambiguous.len() {
+            for j in i + 1..ambiguous.len() {
+                assert_ne!(ambiguous[i], ambiguous[j]);
+            }
+        }
+        assert_ne!(hash(&["-a", "b", "c"]), hash(&["-a", "c", "b"]));
+        assert_ne!(
+            hash(&["leading", "-a", "value"]),
+            hash(&["-a", "leading", "value"])
+        );
+        assert_ne!(hash(&["-a", "", "-b"]), hash(&["-a", "-b", ""]));
+    }
+
+    #[test]
+    fn test_compute_args_hash_negative_and_inline_values() {
+        let hash = |args: &[&str]| {
+            compute_args_hash(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        for value in ["-1", "-0.5"] {
+            assert_ne!(hash(&["--threads", value]), hash(&[value, "--threads"]));
+        }
+        assert_ne!(
+            hash(&["--override-kv", "-foo=bar"]),
+            hash(&["--override-kv", "-foo", "bar"])
+        );
+        // Direct calls keep inline tokens intact; build_pre_args expands them.
+        assert_ne!(hash(&["--opt=value"]), hash(&["--opt", "value"]));
+        assert_eq!(
+            hash(&["--host=localhost", "-c", "4096", "--port=8080"]),
+            hash(&["-c", "4096", "--host", "127.0.0.1", "--port", "9000"])
+        );
+        assert_eq!(
+            hash(&["-c", "4096"]),
+            hash(&["--port=8080", "-c", "4096", "--host=localhost"])
+        );
+        let profile_hash = |args: &str| {
+            let profile: crate::config::Profile = serde_yaml::from_str(&format!(
+                "id: test\nmodel_path: /models/test.gguf\nllama_server_args: '{args}'"
+            ))
+            .unwrap();
+            let (args, _, _) = crate::node_state::build_pre_args(&profile);
+            compute_args_hash(&args)
+        };
+        for value in ["value", "\"\"", "-1", "-0.5"] {
+            assert_eq!(
+                profile_hash(&format!("--opt={value}")),
+                profile_hash(&format!("--opt {value}"))
+            );
+        }
+        assert_ne!(
+            profile_hash("--override-kv=-foo=bar"),
+            profile_hash("--override-kv -foo bar")
+        );
     }
 
     #[test]
