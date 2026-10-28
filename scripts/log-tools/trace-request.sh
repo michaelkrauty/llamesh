@@ -1,7 +1,7 @@
 #!/bin/bash
 # Trace a request across nodes by request_id or session_id
 # Usage: trace-request.sh <id> [date]
-#   id: request_id or session_id (ULID format)
+#   id: request_id or session_id (generated IDs are ULIDs; caller-supplied IDs need not be)
 #   date: YYYY-MM-DD, a UTC day (default: today in UTC)
 
 set -euo pipefail

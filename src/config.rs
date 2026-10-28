@@ -474,7 +474,8 @@ fn default_compression() -> bool {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ModelDefaults {
     pub max_concurrent_requests_per_instance: usize,
-    /// Maximum queue size per model. 0 = unlimited (wait forever for capacity).
+    /// Maximum queue size per model. 0 = no queue-length limit (the queue-wait
+    /// timeout still applies).
     pub max_queue_size_per_model: usize,
     pub max_instances_per_model: usize,
     /// Maximum time (ms) to wait in queue. 0 = infinite wait (never timeout).
@@ -638,7 +639,7 @@ pub struct ClusterNoiseConfig {
     /// Path to private key file. Default: config_dir/node.key
     #[serde(default)]
     pub private_key_path: Option<String>,
-    /// Path to previous private key for rotation. Default: none
+    /// Reserved for key rotation; currently has no runtime effect. Default: none
     #[serde(default)]
     #[allow(dead_code)] // Key rotation not yet implemented
     pub previous_key_path: Option<String>,
@@ -648,7 +649,7 @@ pub struct ClusterNoiseConfig {
     /// Enterprise: list of allowed public keys. If non-empty, only these keys accepted.
     #[serde(default)]
     pub allowed_keys: Vec<String>,
-    /// Session TTL in seconds. Default: 3600 (1 hour)
+    /// Reserved for Noise session caching; currently has no runtime effect. Default: 3600 (1 hour)
     #[serde(default = "default_session_ttl")]
     #[allow(dead_code)] // Reserved for Noise session caching
     pub session_ttl_seconds: u64,
@@ -868,7 +869,8 @@ pub struct Profile {
     pub description: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Path to a local model file. Either `model_path` or `hf_repo` must be specified.
+    /// Path to a local model file. Specify `model_path`, `hf_repo`, or a model-source flag
+    /// (`-m`/`--model` or `-hfr`/`--hf-repo`) in `llama_server_args`.
     #[serde(default)]
     pub model_path: Option<String>,
     /// Hugging Face repository (e.g., "ggml-org/Qwen2.5-0.5B-Instruct-GGUF").
@@ -902,7 +904,8 @@ pub struct Profile {
     #[serde(default)]
     pub startup_timeout_seconds: Option<u64>,
     /// Timeout in seconds for downloading models from Hugging Face.
-    /// Only used when `hf_repo` is specified. Default is 3600 (1 hour).
+    /// Used when `hf_repo` or `-hfr`/`--hf-repo` in `llama_server_args` is specified.
+    /// Default is 3600 (1 hour).
     /// This timeout covers both the download and the model loading time.
     #[serde(default)]
     pub download_timeout_seconds: Option<u64>,
@@ -933,7 +936,8 @@ impl Profile {
     }
 
     /// Returns the effective startup timeout in seconds.
-    /// When using `hf_repo` (Hugging Face download), uses `download_timeout_seconds` (default 3600s).
+    /// With `hf_repo` or `-hfr`/`--hf-repo` in `llama_server_args`, uses
+    /// `download_timeout_seconds` (default 3600s).
     /// Otherwise, uses `startup_timeout_seconds` (default 60s).
     pub fn effective_startup_timeout_seconds(&self) -> u64 {
         let uses_hf = self.hf_repo.is_some() || self.has_flag(&["-hfr", "--hf-repo"]);
@@ -960,7 +964,7 @@ impl Profile {
     }
 
     pub fn validate(&self, model_name: &str) -> anyhow::Result<()> {
-        // Validate model source: either model_path or hf_repo must be specified
+        // Validate model source: model_path, hf_repo, or a model flag in the args
         let has_model_path = self.model_path.is_some();
         let has_hf_repo = self.hf_repo.is_some();
         let has_model_in_args = self.has_flag(&["-m", "--model"]);
