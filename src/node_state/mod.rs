@@ -13,7 +13,7 @@ mod wedge_tests;
 
 pub use model_index::{args_hash_for_profile, build_pre_args, get_args_hash_for_key, ModelIndex};
 pub use peer_state::{PeerModelStats, PeerState};
-pub use port_pool::PortPool;
+pub use port_pool::{PortLease, PortPool};
 use spawn_reservations::ReservationSnapshot;
 pub use spawn_reservations::{MemoryReservation, SpawnReservations};
 
@@ -815,7 +815,7 @@ impl NodeState {
         newly_drained
     }
 
-    pub async fn get_available_port(&self) -> Result<u16, NodeError> {
+    pub async fn get_available_port(&self) -> Result<PortLease, NodeError> {
         self.port_pool
             .get_available_port()
             .await
@@ -829,7 +829,7 @@ impl NodeState {
         self.port_pool.release_port(port).await;
     }
 
-    pub async fn reserve_specific_port(&self, port: u16) -> Result<(), NodeError> {
+    pub async fn reserve_specific_port(&self, port: u16) -> Result<PortLease, NodeError> {
         self.port_pool
             .reserve_specific_port(port)
             .await
@@ -2476,11 +2476,8 @@ impl NodeState {
 
                 let instance_id = spawn_reservation.memory().id().to_string();
                 let port_overridden = port_override.is_some();
-                let port = match port_override {
-                    Some(p) => {
-                        self.reserve_specific_port(p).await?;
-                        p
-                    }
+                let port_lease = match port_override {
+                    Some(p) => self.reserve_specific_port(p).await?,
                     None => match self.get_available_port().await {
                         Ok(p) => p,
                         Err(e) => {
@@ -2489,6 +2486,11 @@ impl NodeState {
                         }
                     },
                 };
+
+                let port = port_lease.port();
+
+                #[cfg(test)]
+                guardrail_tests::pause_at(&self.test_hooks.after_port).await;
 
                 // Build final args: pre_args + host/port
                 let mut args = pre_args.clone();
@@ -2557,7 +2559,7 @@ impl NodeState {
                         || resources.effective_sysmem_mb > self.config.max_sysmem_mb
                     {
                         drop(instances);
-                        self.release_port(port).await;
+                        port_lease.release().await;
                         return Err(NodeError::InsufficientResources);
                     }
                 }
@@ -2587,7 +2589,7 @@ impl NodeState {
                             profile.effective_max_instances(&self.config.model_defaults);
                         if current_profile_count >= max_profile {
                             drop(instances_map);
-                            self.release_port(port).await;
+                            port_lease.release().await;
                             let inst = inst_arc.read().await;
                             let _ = inst.stop().await;
                             warn!(
@@ -2606,7 +2608,7 @@ impl NodeState {
                         if current_count >= max_node {
                             // Race detected: another spawn filled capacity while we were spawning
                             drop(instances_map);
-                            self.release_port(port).await;
+                            port_lease.release().await;
                             // Kill the process we just spawned
                             let inst = inst_arc.read().await;
                             let _ = inst.stop().await;
@@ -2622,6 +2624,7 @@ impl NodeState {
                         }
 
                         instances_map.insert(instance_id.clone(), inst_arc.clone());
+                        port_lease.handoff();
                         // The instance is now counted via the map; release the
                         // reservation while still holding the lock so the
                         // hand-off is atomic for concurrent capacity checks.
@@ -2650,7 +2653,7 @@ impl NodeState {
                         );
 
                         // Cleanup the failed attempt - just release port (instance was never in map)
-                        self.release_port(port).await;
+                        port_lease.release().await;
 
                         // If we've exhausted retries or have a port override (can't try different port), fail
                         if spawn_attempt >= MAX_SPAWN_RETRIES || port_override.is_some() {
@@ -5236,7 +5239,7 @@ mod tests {
             .expect("Failed to bind test port");
 
         // The first port in range is 30000. It should be skipped.
-        let picked = state.get_available_port().await.unwrap();
+        let picked = state.get_available_port().await.unwrap().handoff();
         assert_ne!(picked, port);
         assert_eq!(picked, 30001);
 

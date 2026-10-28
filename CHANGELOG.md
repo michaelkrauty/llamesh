@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.36] - 2026-10-28
+
+### Fixed
+
+- Return a port to the pool when a spawn is cancelled after taking it and before its instance is registered, for example because the client disconnected. The port stayed marked as in use until the process restarted, so on a node whose `llama_cpp_ports` lists few ports, later spawns could fail with `No available ports`.
+
 ## [1.21.35] - 2026-10-28
 
 ### Fixed
