@@ -162,7 +162,10 @@ llama_cpp:
 
   # Number of previous builds to keep for rollback, besides the one currently
   # in use (default: 3). The active build is always kept in addition, so a
-  # value of 0 keeps only the active build.
+  # value of 0 keeps only the active build. Only complete builds (those with a
+  # bin/llama-server) count; directories left by failed or interrupted builds
+  # are removed. Only the <build_path>-<commit> directories created by builds
+  # are managed.
   keep_builds: 3
 
 # -----------------------------------------------------------------------------
