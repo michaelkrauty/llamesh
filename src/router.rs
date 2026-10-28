@@ -76,6 +76,28 @@ fn node_error_to_app_error(error: NodeError) -> AppError {
 /// The caller creates `capacity` from `capacity_notify.notified()` before it
 /// checks the state the wait depends on, such as the draining flag:
 /// `notify_waiters` wakes only the waiters that already exist.
+/// The per-hash metrics for the instance that serves a local request. The
+/// request was counted under the args hash resolved before queueing; after a
+/// cookbook reload it can be served by an instance started from the reloaded
+/// profile, so move its count to that instance's hash, where its latency and
+/// tokens are then recorded.
+async fn served_hash_metrics(
+    metrics: &Metrics,
+    counted: &Arc<HashMetrics>,
+    counted_hash: &str,
+    served_hash: &str,
+    model_key: &str,
+) -> Arc<HashMetrics> {
+    if served_hash == counted_hash {
+        return counted.clone();
+    }
+    counted.requests_total.fetch_sub(1, Ordering::Relaxed);
+    let served = metrics.get_hash_metrics(served_hash).await;
+    served.add_display_name(model_key);
+    served.requests_total.fetch_add(1, Ordering::Relaxed);
+    served
+}
+
 async fn wait_for_capacity_or_disconnect(
     capacity: tokio::sync::futures::Notified<'_>,
     conn: &Option<ConnectionHandle>,
@@ -1261,7 +1283,13 @@ pub async fn route_request(
                 Ok(instance_lock) => {
                     guard.set_instance(instance_lock.clone());
 
-                    let (target_host, target_port, streams_awaiting_downstream, backend_api_key) = {
+                    let (
+                        target_host,
+                        target_port,
+                        streams_awaiting_downstream,
+                        backend_api_key,
+                        served_args_hash,
+                    ) = {
                         let mut inst = instance_lock.write().await;
                         inst.last_activity = std::time::Instant::now();
                         (
@@ -1269,8 +1297,17 @@ pub async fn route_request(
                             inst.port,
                             inst.streams_awaiting_downstream.clone(),
                             inst.backend_api_key.clone(),
+                            inst.args_hash.clone(),
                         )
                     };
+                    let hash_metrics = served_hash_metrics(
+                        &state.metrics,
+                        &hash_metrics,
+                        &args_hash,
+                        &served_args_hash,
+                        &model_key,
+                    )
+                    .await;
 
                     let url = format!("http://{target_host}:{target_port}{path_and_query}");
 
@@ -2628,6 +2665,27 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "draining");
+    }
+
+    #[tokio::test]
+    async fn local_request_is_counted_under_the_serving_instance_hash() {
+        let metrics = Metrics::new();
+        let counted = metrics.get_hash_metrics("before-reload").await;
+        counted.requests_total.fetch_add(1, Ordering::Relaxed);
+
+        let same =
+            served_hash_metrics(&metrics, &counted, "before-reload", "before-reload", "m:p").await;
+        assert!(Arc::ptr_eq(&same, &counted));
+        assert_eq!(counted.requests_total.load(Ordering::Relaxed), 1);
+
+        let served =
+            served_hash_metrics(&metrics, &counted, "before-reload", "after-reload", "m:p").await;
+        assert!(Arc::ptr_eq(
+            &served,
+            &metrics.get_hash_metrics("after-reload").await
+        ));
+        assert_eq!(counted.requests_total.load(Ordering::Relaxed), 0);
+        assert_eq!(served.requests_total.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
