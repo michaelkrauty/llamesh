@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.31] - 2026-10-28
+
+### Fixed
+
+- Keep `keep_builds` usable previous builds after a llama.cpp build fails. Cleanup, which runs after a new build is activated, counted every build directory toward `keep_builds`, including directories left by a build that failed or was interrupted, which hold no `llama-server` binary and cannot be rolled back to. Such a directory took one of the kept slots, so a usable older build was removed in its place, and it stayed on disk, as large as a build tree, until newer builds pushed it out. Only complete builds now count, and directories without a binary are removed.
+- Stop build cleanup from removing directories it did not create. Every directory whose name started with the build directory's name and a hyphen was treated as a previous build, so a directory such as `build-current` holding the configured `binary_path` link, or any other directory named that way, was removed once it fell outside `keep_builds`. Cleanup now considers only the per-commit `<build_path>-<commit>` directories that builds create, and never removes a directory that contains the configured `binary_path`.
+
 ## [1.21.30] - 2026-10-28
 
 ### Fixed

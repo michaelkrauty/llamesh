@@ -427,6 +427,22 @@ impl BuildManager {
         Ok(())
     }
 
+    /// Remove previous builds that are no longer needed, after a build has
+    /// been activated.
+    ///
+    /// Only the per-commit `<build_path>-<commit>` directories this manager
+    /// creates are considered; anything else next to them is left alone. The
+    /// build the live binary resolves to, and a directory that contains the
+    /// configured binary path, are never removed. A build directory without
+    /// `bin/llama-server` was left by a build that failed or was interrupted:
+    /// it cannot be rolled back to, so it is removed instead of taking one of
+    /// the `keep_builds` slots. Of the complete previous builds, the
+    /// `keep_builds` most recent are kept for rollback and older ones are
+    /// removed. A directory whose binary or timestamp cannot be read is left
+    /// in place and not counted.
+    ///
+    /// Callers hold the rebuild lock, so no build is in progress in any of
+    /// these directories.
     async fn cleanup_old_builds(&self) -> Result<()> {
         let build_base = PathBuf::from(&self.config.build_path);
         let parent_dir = build_base.parent().unwrap_or(Path::new("."));
@@ -441,7 +457,24 @@ impl BuildManager {
                 return Ok(());
             }
         };
-        let prefix = format!("{base_name}-");
+
+        // Resolve the build directory the live binary symlink currently points
+        // into, so cleanup never deletes the build that is actively serving,
+        // even when keep_builds is small (e.g. 0) or a build's timestamp is out
+        // of order. The managed layout is `<build-dir>/bin/llama-server`, so the
+        // build dir is two levels up from the resolved binary.
+        let active_build_dir = tokio::fs::canonicalize(&self.config.binary_path)
+            .await
+            .ok()
+            .and_then(|bin| Some(bin.parent()?.parent()?.to_path_buf()));
+        // The directory holding the configured path itself (normally the
+        // symlink's own directory) must survive too, wherever it points.
+        let configured_binary_dir =
+            if let Some(parent) = Path::new(&self.config.binary_path).parent() {
+                tokio::fs::canonicalize(parent).await.ok()
+            } else {
+                None
+            };
 
         let mut entries = tokio::fs::read_dir(parent_dir).await?;
         let mut builds = Vec::new();
@@ -451,14 +484,50 @@ impl BuildManager {
             if !path.is_dir() {
                 continue;
             }
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with(&prefix) {
-                    if let Ok(metadata) = entry.metadata().await {
-                        let time = metadata.created().or_else(|_| metadata.modified());
-                        if let Ok(t) = time {
-                            builds.push((path, t));
-                        }
+            let Some((base, _)) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(split_managed_build_name)
+            else {
+                continue;
+            };
+            if base != base_name {
+                continue;
+            }
+
+            if let Ok(canonical) = tokio::fs::canonicalize(&path).await {
+                if active_build_dir.as_ref() == Some(&canonical)
+                    || configured_binary_dir
+                        .as_ref()
+                        .is_some_and(|dir| dir.starts_with(&canonical))
+                {
+                    continue;
+                }
+            }
+
+            match tokio::fs::try_exists(path.join("bin/llama-server")).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!("Removing unfinished build: {}", path.display());
+                    if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+                        warn!(
+                            "Failed to remove unfinished build {}: {}",
+                            path.display(),
+                            e
+                        );
                     }
+                    continue;
+                }
+                Err(e) => {
+                    warn!("Failed to check build binary {}: {}", path.display(), e);
+                    continue;
+                }
+            }
+
+            if let Ok(metadata) = entry.metadata().await {
+                let time = metadata.created().or_else(|_| metadata.modified());
+                if let Ok(t) = time {
+                    builds.push((path, t));
                 }
             }
         }
@@ -466,37 +535,10 @@ impl BuildManager {
         // Sort by creation time (oldest first)
         builds.sort_by_key(|(_, created)| *created);
 
-        // Resolve the build directory the live binary symlink currently points
-        // into, so cleanup never deletes the build that is actively serving —
-        // even when keep_builds is small (e.g. 0) or a build's timestamp is out
-        // of order. The managed layout is `<build-dir>/bin/llama-server`, so the
-        // build dir is two levels up from the resolved binary.
-        let active_build_dir = tokio::fs::canonicalize(&self.config.binary_path)
-            .await
-            .ok()
-            .and_then(|bin| Some(bin.parent()?.parent()?.to_path_buf()));
-
-        // The active build is always retained. Among the remaining (non-active)
-        // builds, keep the `keep_builds` most recent and remove the older ones,
-        // so protecting the active build never reduces how many previous builds
-        // are kept for rollback — even when the active build is itself old.
-        let mut non_active = Vec::new();
-        for (path, _) in &builds {
-            let is_active = match &active_build_dir {
-                Some(active) => {
-                    tokio::fs::canonicalize(path).await.ok().as_deref() == Some(active.as_path())
-                }
-                None => false,
-            };
-            if !is_active {
-                non_active.push(path);
-            }
-        }
-
         let keep_count = self.config.keep_builds;
-        if non_active.len() > keep_count {
-            let remove_upto = non_active.len() - keep_count;
-            for &path in &non_active[..remove_upto] {
+        if builds.len() > keep_count {
+            let remove_upto = builds.len() - keep_count;
+            for (path, _) in &builds[..remove_upto] {
                 info!("Removing old build: {}", path.display());
                 if let Err(e) = tokio::fs::remove_dir_all(path).await {
                     warn!("Failed to remove old build {}: {}", path.display(), e);
@@ -707,9 +749,16 @@ where
 pub fn version_from_resolved_binary(path: &std::path::Path) -> Option<String> {
     let bin_dir = path.parent()?;
     let build_dir = bin_dir.parent()?.file_name()?.to_str()?;
-    let (_, commit) = build_dir.rsplit_once('-')?;
-    let looks_like_commit = commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit());
-    looks_like_commit.then(|| commit.to_string())
+    let (_, commit) = split_managed_build_name(build_dir)?;
+    Some(commit.to_string())
+}
+
+/// Split a managed build directory name, `<base>-<commit>`, into its base and
+/// commit. The commit must look like an abbreviated git hash (at least 7 hex
+/// digits), as `git rev-parse --short` produces.
+fn split_managed_build_name(name: &str) -> Option<(&str, &str)> {
+    let (base, commit) = name.rsplit_once('-')?;
+    (commit.len() >= 7 && commit.chars().all(|c| c.is_ascii_hexdigit())).then_some((base, commit))
 }
 
 /// Reads lines from a child process stream, echoing each to the parent's
@@ -834,6 +883,22 @@ async fn run_command(cmd: &mut Command) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn test_split_managed_build_name() {
+        assert_eq!(split_managed_build_name("build-abcdef"), None);
+        assert_eq!(split_managed_build_name("build-abcdefg"), None);
+        assert_eq!(split_managed_build_name("build-current"), None);
+        assert_eq!(split_managed_build_name("build"), None);
+        assert_eq!(
+            split_managed_build_name("build-abcdef0"),
+            Some(("build", "abcdef0"))
+        );
+        assert_eq!(
+            split_managed_build_name("my-build-0123456789ABCDEF"),
+            Some(("my-build", "0123456789ABCDEF"))
+        );
+    }
 
     #[test]
     fn test_version_from_resolved_binary() {
@@ -1512,6 +1577,152 @@ fi
         bm.prepare_build_dir(&build_dir, &binary).await.unwrap();
 
         assert!(binary.exists() && object.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_unfinished_build_does_not_take_retention_slot() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous = temp_dir.path().join("build-aaaaaaaaa");
+        let unfinished = temp_dir.path().join("build-bbbbbbbbb");
+        let active = temp_dir.path().join("build-ccccccccc");
+
+        // Match the existing cleanup fixtures' creation-time ordering.
+        for build in [&previous, &unfinished, &active] {
+            tokio::fs::create_dir_all(build.join("bin")).await.unwrap();
+            if build != &unfinished {
+                tokio::fs::write(build.join("bin/llama-server"), b"binary")
+                    .await
+                    .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut bm = prepare_test_manager(temp_dir.path());
+        bm.config.keep_builds = 1;
+        std::os::unix::fs::symlink(active.join("bin/llama-server"), &bm.config.binary_path)
+            .unwrap();
+        bm.cleanup_old_builds().await.unwrap();
+
+        assert!(
+            previous.exists(),
+            "the complete previous build must be kept"
+        );
+        assert!(active.exists(), "the active build must be kept");
+        assert!(!unfinished.exists(), "the unfinished build must be removed");
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_unfinished_builds_below_retention_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let active = temp_dir.path().join("build-ccccccccc");
+        tokio::fs::create_dir_all(active.join("bin")).await.unwrap();
+        tokio::fs::write(active.join("bin/llama-server"), b"binary")
+            .await
+            .unwrap();
+        let unfinished = ["build-aaaaaaaaa", "build-bbbbbbbbb"];
+        for name in unfinished {
+            tokio::fs::create_dir_all(temp_dir.path().join(name))
+                .await
+                .unwrap();
+        }
+
+        let bm = prepare_test_manager(temp_dir.path());
+        std::os::unix::fs::symlink(active.join("bin/llama-server"), &bm.config.binary_path)
+            .unwrap();
+        bm.cleanup_old_builds().await.unwrap();
+
+        assert!(active.exists(), "the active build must be kept");
+        for name in unfinished {
+            assert!(!temp_dir.path().join(name).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_leaves_unmanaged_entries_untouched() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let current = temp_dir.path().join("build-current");
+        let notes = temp_dir.path().join("build-notes");
+        let file = temp_dir.path().join("build-abcdef0");
+        let other_base = temp_dir.path().join("build-extra-abcdef0");
+        tokio::fs::create_dir_all(current.join("bin"))
+            .await
+            .unwrap();
+        tokio::fs::write(current.join("bin/llama-server"), b"binary")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&notes).await.unwrap();
+        tokio::fs::create_dir_all(&other_base).await.unwrap();
+        tokio::fs::write(&file, b"user file").await.unwrap();
+
+        let mut bm = prepare_test_manager(temp_dir.path());
+        bm.config.keep_builds = 0;
+        bm.cleanup_old_builds().await.unwrap();
+
+        assert!(current.join("bin/llama-server").exists());
+        assert!(notes.is_dir());
+        assert!(other_base.is_dir(), "the build base must match exactly");
+        assert_eq!(tokio::fs::read(&file).await.unwrap(), b"user file");
+    }
+
+    #[tokio::test]
+    async fn cleanup_preserves_configured_binary_directory() {
+        // Protect the configured path even when its symlink resolves outside
+        // the candidate, with or without the candidate's standard binary.
+        for bin_dir in ["bin", "live"] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let active = temp_dir.path().join("build-aaaaaaaaa");
+            tokio::fs::create_dir_all(active.join("bin")).await.unwrap();
+            tokio::fs::write(active.join("bin/llama-server"), b"binary")
+                .await
+                .unwrap();
+            let configured = temp_dir.path().join("build-bbbbbbbbb");
+            let link_dir = configured.join(bin_dir);
+            tokio::fs::create_dir_all(&link_dir).await.unwrap();
+            let link = link_dir.join("llama-server");
+            std::os::unix::fs::symlink(active.join("bin/llama-server"), &link).unwrap();
+
+            let mut bm = prepare_test_manager(temp_dir.path());
+            bm.config.binary_path = link.to_string_lossy().to_string();
+            bm.config.keep_builds = 0;
+            bm.cleanup_old_builds().await.unwrap();
+
+            assert!(active.exists(), "the resolved active build must be kept");
+            assert!(link.exists(), "the configured binary path must be kept");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_leaves_build_with_binary_lookup_error_untouched() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let previous = temp_dir.path().join("build-aaaaaaaaa");
+        tokio::fs::create_dir_all(previous.join("bin"))
+            .await
+            .unwrap();
+        tokio::fs::write(previous.join("bin/llama-server"), b"binary")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let unreadable = temp_dir.path().join("build-bbbbbbbbb");
+        tokio::fs::create_dir_all(&unreadable).await.unwrap();
+        // A symlink loop makes try_exists fail even when running as root.
+        std::os::unix::fs::symlink("bin", unreadable.join("bin")).unwrap();
+        assert!(tokio::fs::try_exists(unreadable.join("bin/llama-server"))
+            .await
+            .is_err());
+
+        let mut bm = prepare_test_manager(temp_dir.path());
+        bm.config.keep_builds = 1;
+        bm.cleanup_old_builds().await.unwrap();
+
+        assert!(
+            unreadable.exists(),
+            "a lookup error must not trigger removal"
+        );
+        assert!(
+            previous.exists(),
+            "a lookup error must not take a retention slot"
+        );
     }
 
     #[tokio::test]
