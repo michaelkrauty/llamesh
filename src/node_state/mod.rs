@@ -48,6 +48,9 @@ pub enum NodeError {
     QueueTimeout,
     #[error("Queue error")]
     QueueError,
+    /// The profile this request resolved was removed or disabled while it waited.
+    #[error("Model not found: {0}")]
+    ModelNotFound(String),
     #[error("Insufficient resources even after eviction")]
     InsufficientResources,
     #[error("Yield to pending waiters")]
@@ -160,9 +163,12 @@ pub struct NodeState {
     /// rather than changing on every request.
     pub started_at_unix: u64,
     pub cookbook: Arc<RwLock<Cookbook>>,
-    /// Version counter incremented on each cookbook reload.
-    /// Callers can capture this at request start and compare at end
-    /// to detect if cookbook changed mid-request.
+    /// Monotonic counter incremented on each cookbook reload.
+    /// `get_instance_for_model` captures it with the profile it resolved and
+    /// re-reads it on every queue retry, re-resolving `model:profile` when the
+    /// counter has moved. Instance insertion reads it again so a spawn that
+    /// straddles a reload is not published as a live instance of the definition
+    /// that reload replaced.
     pub cookbook_version: Arc<AtomicU64>,
     pub instances: Arc<RwLock<HashMap<String, Arc<RwLock<Instance>>>>>,
     pub port_pool: Arc<PortPool>,
@@ -592,6 +598,16 @@ fn build_local_upstream_client(read_timeout_ms: u64) -> reqwest::Result<reqwest:
     builder.build()
 }
 
+fn server_args_api_key(args: &[String]) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == "--api-key")
+        .and_then(|idx| args.get(idx + 1).cloned())
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix("--api-key=").map(|s| s.to_string()))
+        })
+}
+
 impl NodeState {
     pub async fn new(
         config: NodeConfig,
@@ -698,7 +714,8 @@ impl NodeState {
     }
 
     /// Reload the cookbook from the given path. Returns Ok(()) if successful.
-    /// Increments cookbook_version to allow detection of mid-request changes.
+    /// Increments `cookbook_version` so queued requests and in-flight spawns
+    /// can detect the reload.
     pub async fn reload_cookbook(&self, path: &std::path::Path) -> Result<()> {
         let new_cookbook = crate::config::load_cookbook(path)?;
         new_cookbook.validate()?;
@@ -1632,15 +1649,29 @@ impl NodeState {
         model_name: &str,
         profile: &Profile,
         reserve_slot: bool,
+        resolved_cookbook_version: u64,
     ) -> Result<Arc<RwLock<Instance>>, NodeError> {
+        let mut profile = profile.clone();
+        // The caller sampled the version before it resolved `profile`, so a
+        // reload at any point after that resolution is seen below.
+        let mut resolved_version = resolved_cookbook_version;
         if !reserve_slot {
             return self
-                .try_get_or_spawn(model_name, profile, false, "prewarm", false)
+                .try_get_or_spawn_resolved(
+                    model_name,
+                    &profile,
+                    false,
+                    "prewarm",
+                    false,
+                    resolved_version,
+                )
                 .await;
         }
 
         let loop_start = std::time::Instant::now();
-        let queue_timeout = self.queue_timeout_duration(profile); // None = infinite wait
+        // Deadline stays on the profile this request resolved before queueing,
+        // even if a reload replaces the definition while it waits.
+        let queue_timeout = self.queue_timeout_duration(&profile); // None = infinite wait
 
         // Track cold-start OOM retry stage:
         // 0 = no failure yet
@@ -1660,6 +1691,22 @@ impl NodeState {
         let mut queue_start: Option<std::time::Instant> = None;
 
         loop {
+            // A reload while this request waited (or during the fairness awaits
+            // below) replaced the profile captured above. Spawn the definition
+            // that is live now, or fail if it was removed or disabled. A
+            // reload that lands during the resolve itself is retried; the
+            // queue key and the deadline captured above stay as they were.
+            if self
+                .adopt_reloaded_profile(
+                    model_name,
+                    &mut profile,
+                    &mut resolved_version,
+                    &mut my_token,
+                )
+                .await?
+            {
+                continue;
+            }
             // After repeated spawn failures, give up on local spawning and return
             // an error so the router can try forwarding to a peer node.
             // 3 attempts covers cold-start recovery (evict idle, evict all) plus
@@ -1856,8 +1903,29 @@ impl NodeState {
                 }
             }
 
+            // The fairness path above awaits. Re-check once more so a reload
+            // in that window fails a removed profile here instead of spawning it.
+            if self
+                .adopt_reloaded_profile(
+                    model_name,
+                    &mut profile,
+                    &mut resolved_version,
+                    &mut my_token,
+                )
+                .await?
+            {
+                continue;
+            }
+
             match self
-                .try_get_or_spawn(model_name, profile, true, "demand", my_token.is_some())
+                .try_get_or_spawn_resolved(
+                    model_name,
+                    &profile,
+                    true,
+                    "demand",
+                    my_token.is_some(),
+                    resolved_version,
+                )
                 .await
             {
                 Ok(inst) => {
@@ -2163,7 +2231,7 @@ impl NodeState {
                                 | NodeError::MaxInstancesNode
                                 | NodeError::InsufficientResources
                         ) {
-                            self.wake_queue_if_admissible(model_name, profile).await;
+                            self.wake_queue_if_admissible(model_name, &profile).await;
                         }
 
                         // Wait for queue notification with optional timeout
@@ -2241,6 +2309,94 @@ impl NodeState {
         get_args_hash_for_key(&self.cookbook, key).await
     }
 
+    /// `Ok(true)` means a reload landed during the lookup and the caller
+    /// should retry. `Err` is a profile that no longer resolves; the queue
+    /// permit is released the same way as the other error exits.
+    async fn adopt_reloaded_profile(
+        &self,
+        model_name: &str,
+        profile: &mut Profile,
+        resolved_version: &mut u64,
+        token: &mut Option<PendingQueuePermit>,
+    ) -> Result<bool, NodeError> {
+        match self
+            .refresh_profile_after_reload(model_name, profile, resolved_version)
+            .await
+        {
+            Ok(retry) => Ok(retry),
+            Err(error) => {
+                if let Some(mut permit) = token.take() {
+                    permit.release().await;
+                }
+                // A reload wakes one waiter per queue. This request leaves
+                // without taking capacity, so pass the wake on: the next
+                // request queued for the removed profile then fails the same
+                // way instead of waiting for an unrelated event.
+                self.notify_queue(model_name, &profile.id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-resolve `profile` when the cookbook has moved since `resolved_version`.
+    /// `Ok(true)` means a further reload landed during the lookup.
+    async fn refresh_profile_after_reload(
+        &self,
+        model_name: &str,
+        profile: &mut Profile,
+        resolved_version: &mut u64,
+    ) -> Result<bool, NodeError> {
+        let observed = self.cookbook_version.load(Ordering::SeqCst);
+        if observed == *resolved_version {
+            return Ok(false);
+        }
+        let key = format!("{model_name}:{}", profile.id);
+        let resolved = self.resolve_model(&key).await;
+        // The index read and the version bump are not one atomic step. A
+        // reload in between may have published a newer definition than the
+        // one just read; leave the captured version stale so the caller
+        // resolves again.
+        if self.cookbook_version.load(Ordering::SeqCst) != observed {
+            return Ok(true);
+        }
+        match resolved {
+            Some((_, current)) => {
+                *profile = current;
+                *resolved_version = observed;
+                Ok(false)
+            }
+            None => Err(NodeError::ModelNotFound(key)),
+        }
+    }
+
+    /// `Some(reason)` when `profile` is gone or its launch args no longer match
+    /// the cookbook. Compared the same way as reload reconciliation.
+    async fn profile_replaced_since_resolve(
+        &self,
+        model_name: &str,
+        profile: &Profile,
+    ) -> Option<&'static str> {
+        match self
+            .resolve_model(&format!("{model_name}:{}", profile.id))
+            .await
+        {
+            None => Some("model_or_profile_missing_or_disabled"),
+            Some((_, current)) => {
+                let (spawned_args, _, _) = build_pre_args(profile);
+                let (current_args, _, _) = build_pre_args(&current);
+                if compute_args_hash(&spawned_args) != compute_args_hash(&current_args) {
+                    Some("args_changed")
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Samples `cookbook_version` for callers that resolved `profile` at this
+    /// call. Production queueing goes through `try_get_or_spawn_resolved` with
+    /// the version from the last successful resolve. Tests call this wrapper.
+    #[cfg(test)]
     async fn try_get_or_spawn(
         &self,
         model_name: &str,
@@ -2248,6 +2404,29 @@ impl NodeState {
         reserve_slot: bool,
         reason: &str,
         has_priority_token: bool,
+    ) -> Result<Arc<RwLock<Instance>>, NodeError> {
+        // Direct callers resolved `profile` at this call. Sample before the
+        // first await so a reload during spawn is visible at insertion.
+        let resolved_cookbook_version = self.cookbook_version.load(Ordering::SeqCst);
+        self.try_get_or_spawn_resolved(
+            model_name,
+            profile,
+            reserve_slot,
+            reason,
+            has_priority_token,
+            resolved_cookbook_version,
+        )
+        .await
+    }
+
+    async fn try_get_or_spawn_resolved(
+        &self,
+        model_name: &str,
+        profile: &Profile,
+        reserve_slot: bool,
+        reason: &str,
+        has_priority_token: bool,
+        resolved_cookbook_version: u64,
     ) -> Result<Arc<RwLock<Instance>>, NodeError> {
         // Defer retirement wakes across all retries until admission or failure.
         // Dropping the future at any await releases already-completed wakes;
@@ -2535,6 +2714,7 @@ impl NodeState {
                 );
                 new_instance.memory_reservation = Some(spawn_reservation.memory());
                 new_instance.llama_cpp_version = llama_cpp_version;
+                new_instance.backend_api_key = profile.get_api_key();
                 if reserve_slot {
                     // Claim the spawning request's slot before the instance
                     // is shared: once it is in the map, concurrent requests
@@ -2574,7 +2754,25 @@ impl NodeState {
 
                 match spawn_result {
                     Ok(()) => {
-                        // Spawn succeeded - NOW insert into map and update peak memory
+                        // Spawn succeeded - NOW insert into map and update peak memory.
+                        // The process was exec'd from `profile` as resolved at
+                        // `resolved_cookbook_version`. A reload since then may
+                        // have replaced that definition. Re-check before taking
+                        // the instances write lock; a further bump under the
+                        // lock is treated as a change, because resolving there
+                        // would await while holding the lock.
+                        let mut replaced_reason: Option<&'static str> = None;
+                        let version_seen = self.cookbook_version.load(Ordering::SeqCst);
+                        if version_seen != resolved_cookbook_version {
+                            replaced_reason = self
+                                .profile_replaced_since_resolve(model_name, profile)
+                                .await;
+                        }
+                        let version_checked = self.cookbook_version.load(Ordering::SeqCst);
+                        if version_checked != version_seen {
+                            replaced_reason = Some("cookbook_changed");
+                        }
+
                         let mut instances_map = self.instances.write().await;
 
                         // Re-check capacity constraints to close the race window between
@@ -2628,21 +2826,40 @@ impl NodeState {
                         // have run its drain pass before this instance was in the
                         // map, so drain it here, before it becomes visible. If the
                         // swap came before canonicalize, the instance already runs
-                        // the new build and is drained once needlessly.
+                        // the new build and is drained once needlessly. A cookbook
+                        // reload in the same window is the same shape: the process
+                        // already has the old args, and the spawning request still
+                        // uses it, but it must not take later requests.
+                        if self.cookbook_version.load(Ordering::SeqCst) != version_checked {
+                            replaced_reason = Some("cookbook_changed");
+                        }
                         let current_generation = self.build_manager.binary_generation();
-                        if current_generation != spawn_generation {
+                        let binary_swap = current_generation != spawn_generation;
+                        if binary_swap || replaced_reason.is_some() {
                             // Not shared yet, so try_read cannot fail.
                             let inst = inst_arc.try_read().expect("unshared instance");
                             inst.draining.store(true, Ordering::Relaxed);
-                            info!(
-                                event = "instance_spawned_across_binary_swap",
-                                instance_id = %instance_id,
-                                model = %model_name,
-                                profile = %profile.id,
-                                spawn_generation,
-                                current_generation,
-                                "Marked instance spawned across binary swap as draining"
-                            );
+                            if let Some(reason) = replaced_reason {
+                                info!(
+                                    event = "instance_spawned_across_cookbook_reload",
+                                    instance_id = %instance_id,
+                                    model = %model_name,
+                                    profile = %profile.id,
+                                    reason = reason,
+                                    "Marked instance spawned across cookbook reload as draining"
+                                );
+                            }
+                            if binary_swap {
+                                info!(
+                                    event = "instance_spawned_across_binary_swap",
+                                    instance_id = %instance_id,
+                                    model = %model_name,
+                                    profile = %profile.id,
+                                    spawn_generation,
+                                    current_generation,
+                                    "Marked instance spawned across binary swap as draining"
+                                );
+                            }
                         }
 
                         instances_map.insert(instance_id.clone(), inst_arc.clone());
@@ -2698,15 +2915,7 @@ impl NodeState {
             let startup_timeout = profile.effective_startup_timeout_seconds();
             let eviction_tenure_secs =
                 profile.effective_min_eviction_tenure_secs(&self.config.model_defaults);
-            let api_key = final_args
-                .iter()
-                .position(|arg| arg == "--api-key")
-                .and_then(|idx| final_args.get(idx + 1).cloned())
-                .or_else(|| {
-                    final_args
-                        .iter()
-                        .find_map(|arg| arg.strip_prefix("--api-key=").map(|s| s.to_string()))
-                });
+            let api_key = server_args_api_key(&final_args);
 
             let http_client = self.http_client.clone();
             let metrics = self.metrics.clone();
@@ -4776,7 +4985,12 @@ mod tests {
         }
 
         let instance = state
-            .get_instance_for_model("test", &profile, true)
+            .get_instance_for_model(
+                "test",
+                &profile,
+                true,
+                state.cookbook_version.load(Ordering::SeqCst),
+            )
             .await
             .expect("closed queue entry should be pruned before queue capacity is enforced");
 

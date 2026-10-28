@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.39] - 2026-10-28
+
+### Fixed
+
+- Use the reloaded cookbook for requests that were waiting in a local queue when the cookbook changed. Such a request spawned the profile as it was before the reload: if the profile had been removed or disabled, it still started an instance of it, and if its arguments had changed, the new instance ran the old ones and kept serving later requests under steady traffic. A waiting request now picks up the current definition, and one whose profile was removed or disabled gets `404` `model_not_found`. An instance whose spawn began before a reload that changed or removed its profile is marked draining when it starts, so it serves only the request that started it.
+- Send a local instance the API key it was started with. After a cookbook reload changed a profile's `--api-key`, requests served by an instance started before the reload sent the new key and were rejected by `llama-server`.
+
 ## [1.21.38] - 2026-10-28
 
 ### Fixed

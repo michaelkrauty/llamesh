@@ -51,6 +51,9 @@ fn node_error_to_app_error(error: NodeError) -> AppError {
             AppError::service_unavailable("Insufficient resources", "no_capacity")
                 .with_header(RETRY_AFTER, HeaderValue::from_static("30"))
         }
+        NodeError::ModelNotFound(model) => {
+            AppError::model_not_found(format!("Model not found: {model}"))
+        }
         NodeError::Other(inner) => {
             let msg = inner.to_string();
             if msg.contains("timed out") {
@@ -902,7 +905,10 @@ pub async fn route_request(
     async move {
         info!("Received request");
 
-        // Try local model resolution first
+        // Try local model resolution first. The cookbook version is sampled
+        // before resolving, so a reload after this point makes local queueing
+        // re-resolve the profile (see `get_instance_for_model`).
+        let resolved_cookbook_version = state.cookbook_version.load(Ordering::SeqCst);
         let local_resolution = state.resolve_model(&model_to_use).await;
 
         // If local resolution fails, check if any peer supports this model.
@@ -1233,7 +1239,7 @@ pub async fn route_request(
             let instance_result = match &conn_handle {
                 Some(handle) => {
                     tokio::select! {
-                        res = state.get_instance_for_model(&model_name, &profile, true) => res,
+                        res = state.get_instance_for_model(&model_name, &profile, true, resolved_cookbook_version) => res,
                         _ = crate::connection::poll_client_disconnect(handle, DISCONNECT_POLL_INTERVAL) => {
                             info!(event = "client_disconnected", "Client disconnected during instance acquisition");
                             return Err(AppError::client_disconnected());
@@ -1242,7 +1248,12 @@ pub async fn route_request(
                 }
                 None => {
                     state
-                        .get_instance_for_model(&model_name, &profile, true)
+                        .get_instance_for_model(
+                            &model_name,
+                            &profile,
+                            true,
+                            resolved_cookbook_version,
+                        )
                         .await
                 }
             };
@@ -1250,13 +1261,14 @@ pub async fn route_request(
                 Ok(instance_lock) => {
                     guard.set_instance(instance_lock.clone());
 
-                    let (target_host, target_port, streams_awaiting_downstream) = {
+                    let (target_host, target_port, streams_awaiting_downstream, backend_api_key) = {
                         let mut inst = instance_lock.write().await;
                         inst.last_activity = std::time::Instant::now();
                         (
                             inst.host.clone(),
                             inst.port,
                             inst.streams_awaiting_downstream.clone(),
+                            inst.backend_api_key.clone(),
                         )
                     };
 
@@ -1267,8 +1279,10 @@ pub async fn route_request(
                     let mut headers =
                         build_local_upstream_headers(&parts.headers, response_streaming);
 
-                    // Inject authorization if the profile defines an API key
-                    if let Some(api_key) = profile.get_api_key() {
+                    // Send the key this instance was started with: after a
+                    // cookbook reload, the profile this request resolved can
+                    // name a different `--api-key` than a running instance.
+                    if let Some(api_key) = backend_api_key {
                         let value =
                             axum::http::HeaderValue::from_str(&format!("Bearer {api_key}"))
                                 .map_err(|e| {
@@ -2614,6 +2628,18 @@ mod tests {
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "draining");
+    }
+
+    #[tokio::test]
+    async fn model_not_found_while_queued_returns_404() {
+        let response = node_error_to_app_error(NodeError::ModelNotFound("queued:default".into()))
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "model_not_found");
     }
 
     // A live, connected server-side socket whose peer is still attached.

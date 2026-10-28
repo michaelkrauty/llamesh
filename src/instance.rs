@@ -344,6 +344,10 @@ pub struct Instance {
     pub streams_awaiting_downstream: Arc<AtomicUsize>,
     /// Set by `claim_startup_failure`.
     startup_failure_claimed: AtomicBool,
+    /// `--api-key` the process was exec'd with. Requests forwarded to this
+    /// instance send this key, including when a later cookbook reload has a
+    /// different one. `None` means the process was started without a key.
+    pub backend_api_key: Option<String>,
 }
 
 /// Transfer process ownership before returning: dropping a caller's wait must
@@ -449,6 +453,7 @@ impl Instance {
             memory_reservation: None,
             streams_awaiting_downstream: Arc::new(AtomicUsize::new(0)),
             startup_failure_claimed: AtomicBool::new(false),
+            backend_api_key: None,
         }
     }
 
