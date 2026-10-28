@@ -513,7 +513,7 @@ cargo build --release
 
 All file locations are configurable, but the defaults are self-contained:
 
-* By default, the proxy looks for `config.yaml`, `cookbook.yaml`, and optional `secrets.yaml` in its working directory.
+* By default, the proxy looks for `config.yaml`, `cookbook.yaml`, and optional `secrets.yaml` in its working directory. A present but unreadable or invalid secrets file is a startup error.
 * You can override these with CLI flags such as `--config PATH`, `--cookbook PATH`, `--secrets PATH`, and with config options like `llama_cpp.repo_path`, `metrics_path`, and `logging.directory`.
 * Paths such as `llama_cpp.repo_path`, `llama_cpp.build_path`, `llama_cpp.binary_path`, TLS cert/key paths, metrics file path, and log directory are resolved relative to the working directory when relative, and may be set to absolute paths for more advanced deployments.
 
