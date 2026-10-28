@@ -1060,10 +1060,13 @@ pub fn load_secrets(path: &Path) -> anyhow::Result<SecretsConfig> {
 /// Load the secrets file for startup: `explicit` (the `--secrets` path) when
 /// given, otherwise `default_path` if it exists.
 ///
-/// Only a missing default file is skipped. A secrets file that exists but
-/// cannot be read or parsed is an error rather than being ignored: it can
-/// hold the `auth` and TLS settings, and starting without them would leave
-/// the node open or serving plaintext without any sign of it.
+/// The default file is skipped only when there is no directory entry at
+/// `default_path`. Anything else must load, including a symlink whose target
+/// is missing (for example, a secrets volume that is not mounted): a secrets
+/// file that is present but cannot be read or parsed is an error rather than
+/// being ignored, because it can hold the `auth` and TLS settings, and
+/// starting without them would leave the node open or serving plaintext
+/// without any sign of it.
 pub fn load_startup_secrets(
     explicit: Option<&Path>,
     default_path: &Path,
@@ -1074,13 +1077,19 @@ pub fn load_startup_secrets(
             .with_context(|| format!("Failed to load explicit secrets file: {}", path.display()));
     }
 
-    if !default_path.try_exists().with_context(|| {
-        format!(
-            "Could not determine whether default secrets file exists: {}",
-            default_path.display()
-        )
-    })? {
-        return Ok(None);
+    // `symlink_metadata` rather than `try_exists`, which follows symlinks and
+    // reports a dangling one as absent.
+    match std::fs::symlink_metadata(default_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Could not determine whether default secrets file exists: {}",
+                    default_path.display()
+                )
+            })
+        }
     }
 
     load_secrets(default_path).map(Some).with_context(|| {
@@ -1181,17 +1190,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn startup_secrets_rejects_default_existence_check_error() {
+    fn startup_secrets_rejects_default_symlink_without_a_target() {
+        // A dangling link (a secrets volume that is not mounted) and a link
+        // loop are present but unreadable, not absent.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.yaml");
-        std::os::unix::fs::symlink("secrets.yaml", &path).unwrap();
+        for target in [dir.path().join("unmounted/secrets.yaml"), path.clone()] {
+            std::os::unix::fs::symlink(&target, &path).unwrap();
 
-        let error = load_startup_secrets(None, &path).unwrap_err().to_string();
-        assert!(
-            error.contains("Could not determine whether default secrets file exists"),
-            "{error}"
-        );
-        assert!(error.contains(&path.display().to_string()), "{error}");
+            let error = format!("{:#}", load_startup_secrets(None, &path).unwrap_err());
+            assert!(error.contains("default secrets file"), "{error}");
+            assert!(error.contains(&path.display().to_string()), "{error}");
+            fs::remove_file(&path).unwrap();
+        }
     }
 
     fn defaults() -> ModelDefaults {
