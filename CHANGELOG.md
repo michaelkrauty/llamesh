@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.34] - 2026-10-28
+
+### Fixed
+
+- Let a node shut down promptly while requests wait in a local model queue. Shutdown woke requests waiting for cluster capacity, but not requests queued for a local instance, and it waits for queues to empty, so with `max_wait_in_queue_ms: 0` a single queued request kept the node from exiting until `shutdown_grace_period_seconds` ran out, after which its connection was dropped; with a queue timeout it held shutdown until the request timed out. Queued requests are now woken when shutdown begins and fail with `503` `draining`, with `Retry-After`, as new requests on a draining node do; a request that joins a queue just after the wake does too. A queued request that reached the shutdown check before, when it was woken for another reason, failed with `500`.
+
 ## [1.21.33] - 2026-10-28
 
 ### Documentation

@@ -166,13 +166,7 @@ async fn wait_for_shutdown_signal(state: Arc<NodeState>) {
     }
 
     tracing::info!("Signal received, starting graceful shutdown");
-    state
-        .draining
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    state.shutdown_notify.notify_waiters();
-    // Wake any requests blocked on capacity_notify so they can check
-    // the draining flag and exit instead of blocking shutdown.
-    state.capacity_notify.notify_waiters();
+    state.begin_shutdown_drain().await;
     // Gossip now, so peers learn this node is no longer ready and stop
     // routing to it, rather than at the next periodic round.
     state.gossip_trigger.notify_one();
