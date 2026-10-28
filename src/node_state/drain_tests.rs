@@ -169,7 +169,12 @@ async fn queue_waiter(
     profile.max_wait_in_queue_ms = Some(wait_ms);
     profile.max_queue_size = Some(0);
     let state = state.clone();
-    tokio::spawn(async move { state.get_instance_for_model("queued", &profile, true).await })
+    let version = state.cookbook_version.load(Ordering::SeqCst);
+    tokio::spawn(async move {
+        state
+            .get_instance_for_model("queued", &profile, true, version)
+            .await
+    })
 }
 
 async fn assert_queue_drained(state: &NodeState) {
@@ -482,4 +487,288 @@ async fn shutdown_drain_leaves_no_queue_entry_for_a_request_cancelled_after_enqu
         }
     }
     assert_queue_drained(&state).await;
+}
+
+async fn reload_queued_profile(state: &NodeState, path: &std::path::Path, profiles: &str) {
+    tokio::fs::write(
+        path,
+        format!("models:\n  - name: queued\n    profiles: {profiles}\n"),
+    )
+    .await
+    .unwrap();
+    state.reload_cookbook(path).await.unwrap();
+}
+
+const QUEUED_PROFILE: &str = "[{id: default, max_instances: 1, model_path: /tmp/model.gguf, llama_server_args: '--ctx-size 1024'}]";
+const RELOADED_PROFILE: &str = "[{id: default, max_instances: 1, model_path: /tmp/model.gguf, llama_server_args: '--ctx-size 2048'}]";
+const DISABLED_PROFILE: &str = "[{id: default, enabled: false, max_instances: 1, model_path: /tmp/model.gguf, llama_server_args: '--ctx-size 1024'}]";
+
+async fn queued_request_fails_when_profile_stops_resolving(profiles: &str) {
+    let (state, dir) = guardrail_tests::spawnable_state().await;
+    let path = dir.path().join("cookbook.yaml");
+    reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+    let blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let waiter = queue_waiter(&state, 0).await;
+    wait_for_queue_length(&state, 1).await;
+
+    reload_queued_profile(&state, &path, profiles).await;
+    let result = timeout(Duration::from_secs(1), waiter).await;
+    drop(blocker);
+    let error = result
+        .expect("removed profile must fail promptly while capacity stays blocked")
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(error, NodeError::ModelNotFound(ref name) if name == "queued:default"),
+        "{error:?}"
+    );
+    assert_queue_drained(&state).await;
+}
+
+#[tokio::test]
+async fn queued_request_across_cookbook_reload_returns_model_not_found() {
+    queued_request_fails_when_profile_stops_resolving("[]").await;
+}
+
+#[tokio::test]
+async fn queued_request_across_cookbook_reload_of_disabled_profile_returns_model_not_found() {
+    queued_request_fails_when_profile_stops_resolving(DISABLED_PROFILE).await;
+}
+
+#[tokio::test]
+async fn queued_request_across_cookbook_reload_spawns_new_args() {
+    let (state, dir) = guardrail_tests::spawnable_state().await;
+    let path = dir.path().join("cookbook.yaml");
+    reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+    let version = state.cookbook_version.load(Ordering::SeqCst);
+    let (_, mut profile) = state.resolve_model("queued:default").await.unwrap();
+    // The request only queues so the reload can land. 0 waits forever, so a
+    // slow reload cannot surface as QueueTimeout before the hash assert.
+    profile.max_wait_in_queue_ms = Some(0);
+    let blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    // The first enqueue is the reservation block. Release that pause, then
+    // arm the hook again so the post-reload requeue is the one we observe.
+    // Reloading before the blocker drops forces a re-resolve while admission
+    // is still impossible, so the spawn cannot start on the old profile.
+    let (first_enqueued, first_release) =
+        guardrail_tests::install_pause(&state.test_hooks.after_enqueue);
+    let caller = state.clone();
+    let waiter = tokio::spawn(async move {
+        caller
+            .get_instance_for_model("queued", &profile, true, version)
+            .await
+    });
+    timeout(Duration::from_secs(1), first_enqueued)
+        .await
+        .unwrap()
+        .unwrap();
+    first_release.send(()).unwrap();
+    wait_for_queue_length(&state, 1).await;
+
+    let (reenqueued, re_release) = guardrail_tests::install_pause(&state.test_hooks.after_enqueue);
+    reload_queued_profile(&state, &path, RELOADED_PROFILE).await;
+    timeout(Duration::from_secs(1), reenqueued)
+        .await
+        .unwrap()
+        .unwrap();
+    // Free the slot before the waiter's admission re-check runs, so that
+    // check, rather than an unrelated wake, starts the spawn.
+    let (entered, release) = guardrail_tests::install_pause(&state.test_hooks.after_port);
+    drop(blocker);
+    re_release.send(()).unwrap();
+    timeout(Duration::from_secs(1), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    release.send(()).unwrap();
+
+    let instance = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(instance) = state.instances.read().await.values().next().cloned() {
+                break instance;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("queued request did not spawn");
+    let inst = instance.read().await;
+    let actual_hash = inst.args_hash.clone();
+    *inst.status.lock() = InstanceStatus::Ready;
+    inst.ready_signal.notify_waiters();
+    drop(inst);
+    let returned = timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&instance, &returned));
+    instance.read().await.stop().await.unwrap();
+    state.instances.write().await.clear();
+    assert_queue_drained(&state).await;
+    let (_, current) = state.resolve_model("queued:default").await.unwrap();
+    assert_eq!(actual_hash, args_hash_for_profile(&current));
+}
+
+async fn spawn_across_cookbook_reload(changed: bool) {
+    let (state, dir) = guardrail_tests::spawnable_state().await;
+    let path = dir.path().join("cookbook.yaml");
+    reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+    let (_, profile) = state.resolve_model("queued:default").await.unwrap();
+    let (entered, release) = guardrail_tests::install_pause(&state.test_hooks.after_port);
+    let caller = state.clone();
+    let spawn = tokio::spawn(async move {
+        caller
+            .try_get_or_spawn("queued", &profile, true, "test", false)
+            .await
+    });
+    timeout(Duration::from_secs(1), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.instances.read().await.is_empty());
+    // Captured on this thread. The changed-args test runs on the current-thread
+    // runtime so the spawn task's info event is visible here.
+    let capture = changed.then(|| crate::test_support::capture_logs(tracing::Level::INFO));
+    if changed {
+        // Both reloads finish while after_port is held, before the pre-lock
+        // version check. The first keeps the args and the second changes
+        // them, so the inserted instance must be draining. This pause does
+        // not put a reload between that pre-lock snapshot and the write
+        // lock; the atomic re-read under the lock covers that window.
+        reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+        reload_queued_profile(&state, &path, RELOADED_PROFILE).await;
+    } else {
+        let cookbook = format!(
+            "models:\n  - name: queued\n    profiles: {QUEUED_PROFILE}\n  - name: unrelated\n    profiles: {RELOADED_PROFILE}\n"
+        );
+        tokio::fs::write(&path, cookbook).await.unwrap();
+        state.reload_cookbook(&path).await.unwrap();
+    }
+    release.send(()).unwrap();
+    let instance = timeout(Duration::from_secs(1), spawn)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let inst = instance.read().await;
+    let draining = inst.draining.load(Ordering::Relaxed);
+    let in_flight = inst.in_flight_requests;
+    inst.stop().await.unwrap();
+    assert_eq!(in_flight, 1, "spawning request retains its slot");
+    assert_eq!(draining, changed);
+    if let Some(capture) = capture {
+        let logged = capture.contents();
+        assert_eq!(
+            logged
+                .matches("instance_spawned_across_cookbook_reload")
+                .count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("args_changed"), "{logged}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_across_cookbook_reload_with_changed_args_drains() {
+    spawn_across_cookbook_reload(true).await;
+}
+
+#[tokio::test]
+async fn spawn_across_cookbook_reload_with_unrelated_change_does_not_drain() {
+    spawn_across_cookbook_reload(false).await;
+}
+
+#[tokio::test]
+async fn every_request_queued_for_a_removed_profile_returns_model_not_found() {
+    let (state, dir) = guardrail_tests::spawnable_state().await;
+    let path = dir.path().join("cookbook.yaml");
+    reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+    let blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let first = queue_waiter(&state, 0).await;
+    wait_for_queue_length(&state, 1).await;
+    let second = queue_waiter(&state, 0).await;
+    wait_for_queue_length(&state, 2).await;
+
+    // The reload wakes one waiter for the queue; the second must still fail
+    // promptly rather than wait for an unrelated capacity event.
+    reload_queued_profile(&state, &path, "[]").await;
+    for waiter in [first, second] {
+        let error = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("every waiter for a removed profile must fail promptly")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, NodeError::ModelNotFound(_)), "{error:?}");
+    }
+    drop(blocker);
+    assert_queue_drained(&state).await;
+}
+
+#[tokio::test]
+async fn request_resolved_before_a_reload_uses_the_reloaded_cookbook() {
+    let (state, dir) = guardrail_tests::spawnable_state().await;
+    let path = dir.path().join("cookbook.yaml");
+    reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+    // As the router does: sample the version, then resolve.
+    let version = state.cookbook_version.load(Ordering::SeqCst);
+    let (_, profile) = state.resolve_model("queued:default").await.unwrap();
+    // The reload lands after resolution but before the request reaches
+    // instance acquisition.
+    reload_queued_profile(&state, &path, "[]").await;
+    let error = timeout(
+        Duration::from_secs(1),
+        state.get_instance_for_model("queued", &profile, true, version),
+    )
+    .await
+    .expect("a profile removed after resolution must fail promptly")
+    .unwrap_err();
+    assert!(matches!(error, NodeError::ModelNotFound(_)), "{error:?}");
+    assert!(state.instances.read().await.is_empty());
+    assert_queue_drained(&state).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reload_between_the_spawn_check_and_insertion_drains_the_instance() {
+    let (state, dir) = guardrail_tests::spawnable_state().await;
+    let path = dir.path().join("cookbook.yaml");
+    reload_queued_profile(&state, &path, QUEUED_PROFILE).await;
+    let (_, profile) = state.resolve_model("queued:default").await.unwrap();
+    let (entered, release) = guardrail_tests::install_pause(&state.test_hooks.before_insert);
+    let caller = state.clone();
+    let spawn = tokio::spawn(async move {
+        caller
+            .try_get_or_spawn("queued", &profile, true, "test", false)
+            .await
+    });
+    timeout(Duration::from_secs(1), entered)
+        .await
+        .unwrap()
+        .unwrap();
+    // The spawn has already compared its profile with the cookbook; only the
+    // version re-read under the instance map lock can see this reload.
+    let capture = crate::test_support::capture_logs(tracing::Level::INFO);
+    reload_queued_profile(&state, &path, RELOADED_PROFILE).await;
+    release.send(()).unwrap();
+    let instance = timeout(Duration::from_secs(1), spawn)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let inst = instance.read().await;
+    let draining = inst.draining.load(Ordering::Relaxed);
+    inst.stop().await.unwrap();
+    assert!(
+        draining,
+        "a reload before insertion must drain the instance"
+    );
+    let logged = capture.contents();
+    assert!(logged.contains("cookbook_changed"), "{logged}");
 }

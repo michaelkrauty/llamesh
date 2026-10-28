@@ -319,9 +319,12 @@ async fn prewarm_handler(
     let model_req = body.get("model").and_then(|v| v.as_str());
 
     if let Some(model_str) = model_req {
+        let resolved_cookbook_version = state
+            .cookbook_version
+            .load(std::sync::atomic::Ordering::SeqCst);
         if let Some((model_name, profile)) = state.resolve_model(model_str).await {
             match state
-                .get_instance_for_model(&model_name, &profile, false)
+                .get_instance_for_model(&model_name, &profile, false, resolved_cookbook_version)
                 .await
             {
                 Ok(_) => {

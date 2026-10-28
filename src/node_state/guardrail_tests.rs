@@ -16,6 +16,7 @@ use tokio::time::{timeout, Duration};
 #[derive(Default)]
 pub(super) struct TestHooks {
     pub(super) after_port: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    pub(super) before_insert: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) after_reserve: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) before_enqueue: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     pub(super) after_enqueue: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
@@ -32,7 +33,7 @@ pub(super) async fn pause_at(hook: &Mutex<Option<(oneshot::Sender<()>, oneshot::
     }
 }
 
-fn install_pause(
+pub(super) fn install_pause(
     hook: &Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     let (entered_tx, entered_rx) = oneshot::channel();
@@ -187,7 +188,7 @@ fn attach_live_child(instance: &Instance) -> u32 {
     pid
 }
 
-async fn spawnable_state() -> (Arc<NodeState>, tempfile::TempDir) {
+pub(super) async fn spawnable_state() -> (Arc<NodeState>, tempfile::TempDir) {
     let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     let binary = dir.path().join("llama-server");
     // Like the successful spawn reservation test, ignore server args and stay
@@ -896,8 +897,9 @@ async fn abandoned_reservation_before_enqueue_self_wakes_waiter_and_evicts_idle_
     let (entered, release) = install_pause(&state.test_hooks.before_enqueue);
     let waiter_state = state.clone();
     let waiter = tokio::spawn(async move {
+        let version = waiter_state.cookbook_version.load(Ordering::SeqCst);
         waiter_state
-            .get_instance_for_model("next", &requested, true)
+            .get_instance_for_model("next", &requested, true, version)
             .await
     });
     wait_for_hook(entered, "waiter pre-enqueue pause").await;
