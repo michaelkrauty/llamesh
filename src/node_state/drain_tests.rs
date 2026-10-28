@@ -182,6 +182,165 @@ async fn assert_queue_drained(state: &NodeState) {
     assert!(state.is_idle().await);
 }
 
+async fn wait_for_queue_length(state: &NodeState, count: usize) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if state
+                .queues
+                .read()
+                .await
+                .get("queued:default")
+                .map_or(0, VecDeque::len)
+                == count
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("queue length did not reach the expected value");
+}
+
+async fn assert_cancelled_queue_removed(state: &NodeState) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if !state.queues.read().await.contains_key("queued:default")
+                && state.total_queue_length().await == 0
+                && state.is_idle().await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancelled request left a queue entry behind");
+}
+
+async fn cancel_queued_waiter(wait_ms: u64, fairness: bool) {
+    let state = state().await;
+    let _blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let mut prior = if fairness {
+        Some(
+            state
+                .promote_pending_token("queued:default".into(), 100)
+                .await,
+        )
+    } else {
+        None
+    };
+    let waiter = queue_waiter(&state, wait_ms).await;
+    wait_for_queue_length(&state, 1).await;
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    if let Some(ref mut permit) = prior {
+        permit.release().await;
+    }
+    assert_cancelled_queue_removed(&state).await;
+}
+
+#[tokio::test]
+async fn cancelled_admission_waiter_with_infinite_wait_is_removed() {
+    cancel_queued_waiter(0, false).await;
+}
+
+#[tokio::test]
+async fn cancelled_admission_waiter_with_finite_wait_is_removed() {
+    cancel_queued_waiter(60_000, false).await;
+}
+
+#[tokio::test]
+async fn cancelled_fairness_waiter_with_infinite_wait_is_removed() {
+    cancel_queued_waiter(0, true).await;
+}
+
+#[tokio::test]
+async fn cancelled_fairness_waiter_with_finite_wait_is_removed() {
+    cancel_queued_waiter(60_000, true).await;
+}
+
+#[tokio::test]
+async fn cancelled_waiter_before_queue_wait_is_removed() {
+    let state = state().await;
+    let _blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    *state.test_hooks.after_enqueue.lock() = Some((entered_tx, release_rx));
+    let waiter = queue_waiter(&state, 0).await;
+    timeout(Duration::from_secs(1), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.total_queue_length().await, 1);
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert_cancelled_queue_removed(&state).await;
+}
+
+#[tokio::test]
+async fn cancelled_waiter_preserves_and_wakes_survivor() {
+    let state = state().await;
+    let _blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let cancelled = queue_waiter(&state, 0).await;
+    wait_for_queue_length(&state, 1).await;
+    let survivor = queue_waiter(&state, 0).await;
+    wait_for_queue_length(&state, 2).await;
+    let survivor_token = state.queues.read().await["queued:default"][1].token;
+    cancelled.abort();
+    assert!(cancelled.await.unwrap_err().is_cancelled());
+    wait_for_queue_length(&state, 1).await;
+    assert_eq!(
+        state.queues.read().await["queued:default"][0].token,
+        survivor_token
+    );
+
+    // The survivor retries admission after notification, then pauses before requeueing.
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (_release_tx, release_rx) = oneshot::channel();
+    *state.test_hooks.before_enqueue.lock() = Some((entered_tx, release_rx));
+    assert!(state.notify_queue("queued", "default").await);
+    timeout(Duration::from_secs(1), entered_rx)
+        .await
+        .expect("surviving waiter was not woken")
+        .unwrap();
+    survivor.abort();
+    assert!(survivor.await.unwrap_err().is_cancelled());
+    assert_queue_drained(&state).await;
+}
+
+#[tokio::test]
+async fn cancelled_waiter_no_longer_needs_competitor_eviction() {
+    let state = state().await;
+    let _blocker = state
+        .spawn_reservations
+        .reserve("queued:default".into(), (0, 0), None);
+    let waiter = queue_waiter(&state, 0).await;
+    wait_for_queue_length(&state, 1).await;
+    state
+        .needs_eviction
+        .write()
+        .await
+        .insert("queued:default".into());
+    assert!(state.has_queued_competitors_needing_eviction("other").await);
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    timeout(Duration::from_secs(1), async {
+        while state.has_queued_competitors_needing_eviction("other").await {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("cancelled waiter still demands competitor eviction");
+    assert_cancelled_queue_removed(&state).await;
+}
+
 async fn shutdown_wakes_local_queue(wait_ms: u64) {
     let state = state().await;
     // A pre-map reservation fills the profile limit without starting a process.
