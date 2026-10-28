@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.42] - 2026-10-28
+
+### Fixed
+
+- Order gossip state per sender, so a delayed older message can no longer replace newer state. Gossip messages carried no ordering, and a receiver applied whichever arrived last: a message held up on a slow connection could, for example, mark a node that had just announced its drain as ready again, and peers routed to it until its next round. Each process now stamps its state with a random epoch and an increasing sequence number, and receivers ignore state from the same process that is not newer than what they hold, and state from a process that started before the one they last heard from. Nodes on earlier versions, which send no ordering, keep working with nodes on this version.
+
 ## [1.21.41] - 2026-10-28
 
 ### Fixed
