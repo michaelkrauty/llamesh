@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.32] - 2026-10-28
+
+### Fixed
+
+- Stop exporting circuit-breaker state for peer addresses that gossip no longer uses. Gossip tracks a peer it has not heard from yet, such as a configured seed that is down when the node starts, under the peer's URL, and switches to the peer's node id once it learns it; the URL's entry then received no further results, so `proxy_circuit_breaker_state{peer="<url>"}` reported its last state, often open (`1`) or half-open (`2`), until the node restarted, while the peer was healthy. The same happened to an address that stopped being a gossip target, such as one discovered over mDNS that went away. Such entries are now removed from the next gossip round on. Routing, which tracks peers by node id, is unaffected.
+
 ## [1.21.31] - 2026-10-28
 
 ### Fixed
