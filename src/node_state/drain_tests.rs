@@ -172,7 +172,7 @@ async fn queue_waiter(
     let version = state.cookbook_version.load(Ordering::SeqCst);
     tokio::spawn(async move {
         state
-            .get_instance_for_model("queued", &profile, true, version)
+            .get_instance_for_model("queued", &profile, true, version, None)
             .await
     })
 }
@@ -559,7 +559,7 @@ async fn queued_request_across_cookbook_reload_spawns_new_args() {
     let caller = state.clone();
     let waiter = tokio::spawn(async move {
         caller
-            .get_instance_for_model("queued", &profile, true, version)
+            .get_instance_for_model("queued", &profile, true, version, None)
             .await
     });
     timeout(Duration::from_secs(1), first_enqueued)
@@ -725,7 +725,7 @@ async fn request_resolved_before_a_reload_uses_the_reloaded_cookbook() {
     reload_queued_profile(&state, &path, "[]").await;
     let error = timeout(
         Duration::from_secs(1),
-        state.get_instance_for_model("queued", &profile, true, version),
+        state.get_instance_for_model("queued", &profile, true, version, None),
     )
     .await
     .expect("a profile removed after resolution must fail promptly")

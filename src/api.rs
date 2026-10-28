@@ -324,7 +324,13 @@ async fn prewarm_handler(
             .load(std::sync::atomic::Ordering::SeqCst);
         if let Some((model_name, profile)) = state.resolve_model(model_str).await {
             match state
-                .get_instance_for_model(&model_name, &profile, false, resolved_cookbook_version)
+                .get_instance_for_model(
+                    &model_name,
+                    &profile,
+                    false,
+                    resolved_cookbook_version,
+                    None,
+                )
                 .await
             {
                 Ok(_) => {
