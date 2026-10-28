@@ -1122,9 +1122,10 @@ Each node is responsible for its local `llama.cpp`.
   * Fetch branches and tags, check out the configured ref, attempt `git reset --hard origin/<ref>` for non-tags, and resolve `HEAD` to detect the commit. Tracked local edits in an existing branch checkout can be discarded.
 * On update:
 
-  * Configure and build `llama.cpp` with configured `build_args` in per-commit build directories (`build-<hash>/`).
-  * A commit's build directory that holds no `llama-server` binary when the node first builds into it is left over from an earlier run whose build never finished, and is deleted so the build starts from scratch. A crash or power loss during a build can leave object files truncated, often to zero bytes, but newer than their sources, which the build tool treats as up to date, so reusing the directory would fail every later build of that commit. Retries within the same run reuse the directory and build incrementally.
-  * `keep_builds` controls how many previous (non-active) builds are retained for rollback (default 3); the build the live binary currently resolves to is always kept in addition, regardless of this count or age. Only builds that contain `bin/llama-server` count. Cleanup, which runs after a new build is activated, removes build directories without one, which a build that failed or was interrupted leaves behind, and considers only the per-commit `<build_path>-<commit>` directories it creates: other directories next to them, and any directory that resolving the configured `binary_path` passes through (including one that only holds a symlink along the way), are left alone.
+  * Configure and build `llama.cpp` with configured `build_args` and `build_command_args`. New build directories are always named `<build_path>-<commit>_<inputs-id>`, including when both lists are empty, where `inputs-id` is the first 8 lowercase hex digits of SHA-256 over the JSON encoding of `[build_args, build_command_args]`. Changing either list selects a different build identity even when the commit is unchanged; reported versions remain the commit alone.
+  * Reuse a verified binary for the current commit and inputs in the suffixed directory first. Otherwise, reuse a verified legacy `<build_path>-<commit>` only if its `.llamesh-build-inputs` file contains exactly the current inputs id, or if the stamp is absent and `binary_path` already resolves to its binary. In the latter case, atomically stamp the live legacy build with the current inputs id and assume it matches, without rebuilding, swapping the symlink or draining instances. If neither candidate qualifies, build in the suffixed directory.
+  * A build directory that holds no `llama-server` binary when the node first builds into it is left over from an earlier run whose build never finished, and is deleted so the build starts from scratch. A crash or power loss during a build can leave object files truncated, often to zero bytes, but newer than their sources, which the build tool treats as up to date, so reusing the directory would fail every later build of that commit. Retries within the same run reuse the directory and build incrementally.
+  * `keep_builds` controls how many previous (non-active) builds are retained for rollback (default 3); the build the live binary currently resolves to is always kept in addition, regardless of this count or age. Only builds that contain `bin/llama-server` count; an inputs stamp alone does not make a build complete. Cleanup, which runs after a new build is activated, removes build directories without a binary, which a build that failed or was interrupted leaves behind, and considers both legacy `<build_path>-<commit>` and current `<build_path>-<commit>_<inputs-id>` directories. Both forms count toward retention; other directories next to them, and any directory that resolving the configured `binary_path` passes through (including one that only holds a symlink along the way), are left alone.
   * Run smoke test:
 
     * `llama-server --help` or simple trivial prompt.
@@ -1137,9 +1138,9 @@ Each node is responsible for its local `llama.cpp`.
 When a new binary is ready:
 
 * The symlink swap signals `binary_swap_notify`, which triggers instance draining.
-* No-op checks are recognized: when the verified binary for the current commit
+* No-op checks are recognized: when the verified binary for the current commit and build inputs
   is already what the symlink resolves to, no swap is performed or signaled,
-  so running instances are not drained (per-commit build directories are
+  so running instances are not drained (build directories are
   immutable, so an identical resolved path implies an identical binary).
 * **Version-aware drain**: All existing instances are marked as draining (they stop accepting new requests but continue serving in-flight requests).
 * An instance whose spawn began before the swap is drained too, even if it enters the instance map after that drain pass.

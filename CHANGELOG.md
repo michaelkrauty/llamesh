@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.38] - 2026-10-28
+
+### Fixed
+
+- Rebuild llama.cpp when `llama_cpp.build_args` or `build_command_args` change, even if the llama.cpp commit has not. Builds were stored per commit, so a node kept reusing the existing build of its commit, for example after enabling CUDA with `branch` pinned to a tag, until the commit changed or the build directory was deleted by hand. Changing the build arguments now produces a new build, which replaces the running one like an update does.
+
+### Changed
+
+- Build directories are named `<build_path>-<commit>_<id>`, where `<id>` identifies the build arguments. A node upgrading to this version keeps the build it is running, which earlier versions named `<build_path>-<commit>`, and stamps it with the current build arguments instead of rebuilding. Change build arguments in a later restart, not in the one that upgrades to this version, or the running build is assumed to match them; to recover from that, empty the `.llamesh-build-inputs` file in that build directory and restart or call `POST /admin/rebuild-llama`.
+
 ## [1.21.37] - 2026-10-28
 
 ### Fixed
