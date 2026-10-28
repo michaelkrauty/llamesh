@@ -1142,6 +1142,7 @@ When a new binary is ready:
   so running instances are not drained (per-commit build directories are
   immutable, so an identical resolved path implies an identical binary).
 * **Version-aware drain**: All existing instances are marked as draining (they stop accepting new requests but continue serving in-flight requests).
+* An instance whose spawn began before the swap is drained too, even if it enters the instance map after that drain pass.
 * New requests spawn fresh instances using the new binary.
 * Drained instances are terminated when their in-flight request count hits 0.
 
