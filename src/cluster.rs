@@ -191,17 +191,21 @@ pub async fn start_gossip_loop(state: Arc<NodeState>) {
                     address: peer.address.clone(),
                 });
             }
-        }
 
-        reconcile_gossip_url_circuits(
-            &state.circuit_breaker,
-            &mut url_circuit_keys,
-            &targets,
-            &url_to_node_id,
-            &known_node_ids,
-            &my_state.address,
-        )
-        .await;
+            // Still holding the peers lock, so no peer, and so no node-id
+            // circuit, can appear between reading the known node ids and
+            // removing URL circuits; a node id is an arbitrary string and
+            // could equal a URL gossip once used as a key.
+            reconcile_gossip_url_circuits(
+                &state.circuit_breaker,
+                &mut url_circuit_keys,
+                &targets,
+                &url_to_node_id,
+                &known_node_ids,
+                &my_state.address,
+            )
+            .await;
+        }
 
         // Gossip to all targets
         for peer_url in targets {
