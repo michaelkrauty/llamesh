@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.46] - 2026-10-29
+
+### Fixed
+
+- Reach a local instance whose profile sets `--host` to an IPv6 address or to the unspecified address `::`. The proxy built an instance's readiness check and request URLs by joining its host and port, which gives an invalid URL for an IPv6 address such as `::1`, so such an instance never passed its readiness check and was stopped at its startup timeout. With `--host ::` the readiness check used `127.0.0.1` and passed, but every request to the instance failed. IPv6 addresses are now enclosed in brackets, and an instance listening on the unspecified address of either family (`0.0.0.0` or `::`) is reached through that family's loopback address (`127.0.0.1` or `::1`).
+
 ## [1.21.45] - 2026-10-29
 
 ### Fixed

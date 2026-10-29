@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -434,6 +435,26 @@ impl Drop for Instance {
     }
 }
 
+/// The `host:port` authority of a URL that reaches a server listening on
+/// `host` (its `--host` value) and `port`. A server listening on the
+/// unspecified address (`0.0.0.0` or `::`) accepts connections on every
+/// interface, so it is reached through the loopback address of the same
+/// family. An IPv6 address is enclosed in brackets, as URLs require; a host
+/// name is used as given.
+fn connect_authority(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => {
+            let ip = match ip {
+                IpAddr::V4(v4) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+                IpAddr::V6(v6) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+                ip => ip,
+            };
+            SocketAddr::new(ip, port).to_string()
+        }
+        Err(_) => format!("{host}:{port}"),
+    }
+}
+
 impl Instance {
     pub fn new(
         id: String,
@@ -469,6 +490,11 @@ impl Instance {
             startup_failure_claimed: AtomicBool::new(false),
             backend_api_key: None,
         }
+    }
+
+    /// The `host:port` to connect to this instance at; see [`connect_authority`].
+    pub fn connect_authority(&self) -> String {
+        connect_authority(&self.host, self.port)
     }
 
     /// Get the PID of the child process, if running.
@@ -616,16 +642,10 @@ impl Instance {
         api_key: Option<String>,
         client: &reqwest::Client,
     ) -> Result<()> {
-        let health_addr = {
-            let inst = instance.read().await;
-            let host = inst.host.as_str();
-            let check_host = if host == "0.0.0.0" || host == "::" {
-                "127.0.0.1"
-            } else {
-                host
-            };
-            format!("http://{}:{}/health", check_host, inst.port)
-        };
+        let health_addr = format!(
+            "http://{}/health",
+            instance.read().await.connect_authority()
+        );
         let start = Instant::now();
 
         // Enforce minimum timeout to prevent infinite wait
@@ -919,6 +939,20 @@ mod tests {
 
         let status = InstanceStatus::Failed;
         assert_eq!(status, InstanceStatus::Failed);
+    }
+
+    #[test]
+    fn connect_authority_reaches_the_listening_address() {
+        assert_eq!(connect_authority("127.0.0.1", 8080), "127.0.0.1:8080");
+        assert_eq!(connect_authority("192.0.2.10", 8080), "192.0.2.10:8080");
+        assert_eq!(connect_authority("0.0.0.0", 8080), "127.0.0.1:8080");
+        assert_eq!(connect_authority("::1", 8080), "[::1]:8080");
+        assert_eq!(
+            connect_authority("2001:db8::10", 8080),
+            "[2001:db8::10]:8080"
+        );
+        assert_eq!(connect_authority("::", 8080), "[::1]:8080");
+        assert_eq!(connect_authority("localhost", 8080), "localhost:8080");
     }
 
     #[test]

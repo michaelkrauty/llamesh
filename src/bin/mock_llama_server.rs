@@ -13,7 +13,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -193,7 +193,9 @@ async fn main() {
         .layer(axum::middleware::from_fn(connection_headers))
         .with_state(state);
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse().unwrap();
+    // Like llama-server, accept an IPv6 address without brackets.
+    let ip: IpAddr = args.host.parse().expect("--host must be an IP address");
+    let addr = SocketAddr::new(ip, args.port);
     println!("Starting mock llama-server on {addr} with {num_slots} slots");
 
     // Mimic the llama-server startup lines (at default verbosity) that the
