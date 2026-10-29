@@ -16,7 +16,7 @@
 #   enabled: true                    # set false to hide/disable one profile
 #   idle_timeout_seconds: 300        # 5 minutes
 #   startup_timeout_seconds: 60      # load timeout for local models (model_path or -m)
-#   download_timeout_seconds: 3600   # download and load timeout for Hugging Face models (hf_repo or -hfr)
+#   download_timeout_seconds: 3600   # download and load timeout for Hugging Face models (hf_repo, -hf or -hfr)
 #   max_instances: (from model_defaults)
 #   max_queue_size: (from model_defaults.max_queue_size_per_model)
 #   estimated_vram_mb: unset         # optional cold-start admission hint
