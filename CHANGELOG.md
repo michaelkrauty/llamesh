@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.48] - 2026-10-29
+
+### Fixed
+
+- Wait for capacity, instead of returning `404` `model_not_found` at once, when a request names a profile of a model that has no `default` profile and no node can serve it yet, for example while a node builds llama.cpp for the first time. When no node was available, the router checked that the requested model still existed by resolving its bare name, which means its `default` profile, so such a request failed immediately with a message naming only the model. The router now checks the requested profile: the request waits until `max_wait_in_queue_ms` like any other, a drain that starts meanwhile answers it with `503` `draining`, and a request whose profile a cookbook reload removed returns `404` even when the model's `default` profile remains.
+
 ## [1.21.47] - 2026-10-29
 
 ### Fixed

@@ -1329,14 +1329,17 @@ pub async fn route_request(
                 break node;
             }
 
-            // No node available - check if model exists in local cookbook
-            // If it does, wait for capacity (local node might be draining)
-            // If it doesn't, the model truly doesn't exist anywhere → 404
-            if state.resolve_model(&model_name).await.is_none() {
+            // No node available - check if the requested profile still exists
+            // in the local cookbook. If it does, wait for capacity. If a reload
+            // removed or disabled it → 404. Resolve the full key: a bare model
+            // name means its `default` profile, which this request may not use.
+            if state.resolve_model(&model_key).await.is_none() {
                 // Model doesn't exist in local cookbook and no peer supports it
                 state.metrics.inc_errors();
                 hash_metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                return Err(AppError::model_not_found(&model_name));
+                return Err(AppError::model_not_found(format!(
+                    "Model '{model_to_use}' not found in local cookbook or any peer"
+                )));
             }
 
             // If node is draining (shutdown in progress), don't wait — bail out
