@@ -236,7 +236,7 @@ wedge_detector:
 #   enabled: true
 #   directory: "./logs"
 #   filename: "proxy.log"
-#   max_keep_files: 7       # rotated files to keep
+#   max_keep_files: 7       # daily files kept, including the current day's (>= 1)
 #   compression: true       # gzip compress rotated files
 
 # API auth (optional)
@@ -346,7 +346,7 @@ models:
         idle_timeout_seconds: 600         # optional, default 300
         startup_timeout_seconds: 60        # optional, default 60 (for local models)
         download_timeout_seconds: 3600     # optional, default 3600 (for HF downloads)
-        max_instances: 4                   # 0 = disabled (won't run on this node), omit = use defaults
+        max_instances: 4                   # 0 = never run on this node, route to peers (see below), omit = use defaults
         max_wait_in_queue_ms: 45000
         max_request_duration_ms: 0         # optional, default 0 (unlimited)
         max_queue_size: 128                # optional, overrides global max_queue_size_per_model
@@ -412,6 +412,13 @@ profile removes that profile from local routing, `/v1/models`, prewarm, and
 cluster advertisements while leaving sibling profiles available. If a cookbook
 reload disables a profile, existing instances for that profile are drained
 gracefully and stopped once idle.
+
+`max_instances: 0` on a profile does not disable it. The node never starts an
+instance of the profile and does not advertise it to peers, but still lists it
+in `/v1/models` and accepts requests for it, which are routed to a peer that
+serves the profile. When no peer serves it, a request waits for one up to
+`max_wait_in_queue_ms` and then fails with `503` `queue_timeout` (with `0`, it
+waits indefinitely). Use `enabled: false` to remove a profile from a node.
 
 To mirror upstream `llama-server` behaviors ([docs](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)), you typically configure different profiles with appropriate flags:
 
@@ -674,7 +681,8 @@ Behavior:
 
 * Resolves `model` to a reranking-capable profile in the cookbook.
 * Forwards the request to a reranking-capable `llama-server` instance using whatever reranking HTTP endpoint and JSON schema are defined by the deployed `llama-server` version (see `tools/server` docs), and returns its response unchanged.
-* If reranking is not configured or not supported by the underlying `llama-server` build, returns a 404 or 400 depending on implementation choice.
+* If the requested model resolves to a profile whose `llama_server_args` include neither `--rerank` nor `--reranking`, returns a 404 `model_not_found` error with `param: "model"`.
+* If the profile is configured for reranking but the `llama-server` instance rejects the request, the instance's error status and body are relayed to the client unchanged.
 
 ### Endpoints Summary
 
@@ -1395,7 +1403,7 @@ cluster:
 
 All logs are structured (JSON), one event per line, with UTC timestamps. `RUST_LOG` controls the log filter and defaults to `info` when unset.
 
-With `logging.enabled`, events are also written to `<directory>/<filename>.YYYY-MM-DD`, one file per UTC day, rotated at UTC midnight. With `compression` (the default), a rotated file is gzip-compressed to `<filename>.YYYY-MM-DD.gz`. `max_keep_files` limits how many rotated files are kept. If the current day's file was already rotated when the node starts (for example, because the clock was set back), its compressed file is restored and appended to instead of being overwritten at the next rotation.
+With `logging.enabled`, events are also written to `<directory>/<filename>.YYYY-MM-DD`, one file per UTC day, rotated at UTC midnight. With `compression` (the default), a rotated file is gzip-compressed to `<filename>.YYYY-MM-DD.gz`. `max_keep_files` is the number of daily files kept, counting the current day's file: at each rotation the oldest files beyond that number are deleted, so the default `7` keeps the current day's file and the six before it. Set it to at least `1`; `0` also deletes the current day's file at each rotation. If the current day's file was already rotated when the node starts (for example, because the clock was set back), its compressed file is restored and appended to instead of being overwritten at the next rotation.
 
 Log event fields (only `timestamp` and `level` are guaranteed):
 
@@ -1470,7 +1478,11 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="https://node-a.example.com/v1",
-    api_key="my-secret-key-1",
+    # llamesh reads the key from the configured `auth.required_header`
+    # (`x-api-key` in the example config), not from `Authorization: Bearer`.
+    # The client still requires an `api_key` value, so pass a placeholder.
+    api_key="unused",
+    default_headers={"x-api-key": "my-secret-key-1"},
 )
 
 resp = client.chat.completions.create(

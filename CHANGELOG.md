@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.50] - 2026-10-29
+
+### Documentation
+
+- Describe the errors for a rerank request precisely: a profile without `--rerank`/`--reranking` returns `404` `model_not_found`, and an error from a reranking instance is relayed unchanged.
+- Fix the Python client example in SPEC.md, which sent its key as `Authorization: Bearer` while the example configuration reads it from `x-api-key`.
+- Correct `logging.max_keep_files`: it counts the current day's file, so the default `7` keeps that file and the six before it, and `0` also deletes the current day's file.
+- Correct `max_instances: 0` on a profile, which was documented as disabling it: the node never runs the profile and routes its requests to peers, but still lists and accepts it. `enabled: false` removes a profile.
+
 ## [1.21.49] - 2026-10-29
 
 ### Fixed

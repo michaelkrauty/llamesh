@@ -40,7 +40,7 @@ models:
         model_path: "./models/gpt-oss-20b-q4_K_M.gguf"
         idle_timeout_seconds: 600    # default: 300
         startup_timeout_seconds: 60  # default: 60 (Hugging Face models use download_timeout_seconds)
-        max_instances: 4             # 0=disabled, omit=use model_defaults
+        max_instances: 4             # 0=never run here, route to peers (enabled: false removes it); omit=use model_defaults
         max_queue_size: 128          # optional, per-profile queue limit
         max_wait_in_queue_ms: 45000  # optional, overrides model_defaults
         max_request_duration_ms: 0   # 0=unlimited
