@@ -1397,8 +1397,7 @@ pub async fn route_request(
                     guard.set_instance(instance_lock.clone());
 
                     let (
-                        target_host,
-                        target_port,
+                        target_authority,
                         streams_awaiting_downstream,
                         backend_api_key,
                         served_args_hash,
@@ -1406,8 +1405,7 @@ pub async fn route_request(
                         let mut inst = instance_lock.write().await;
                         inst.last_activity = std::time::Instant::now();
                         (
-                            inst.host.clone(),
-                            inst.port,
+                            inst.connect_authority(),
                             inst.streams_awaiting_downstream.clone(),
                             inst.backend_api_key.clone(),
                             inst.args_hash.clone(),
@@ -1422,7 +1420,7 @@ pub async fn route_request(
                     )
                     .await;
 
-                    let url = format!("http://{target_host}:{target_port}{path_and_query}");
+                    let url = format!("http://{target_authority}{path_and_query}");
 
                     info!("Forwarding locally to {}", url);
 
