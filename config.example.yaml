@@ -53,7 +53,8 @@ model_defaults:
   # Max requests waiting in queue per model
   max_queue_size_per_model: 64
   # Max instances of same model that can run simultaneously
-  # 0 is treated as 1; disable a profile with max_instances: 0 or enabled: false
+  # 0 is treated as 1. A profile's own max_instances: 0 means this node never
+  # runs it and routes its requests to peers; enabled: false removes a profile
   max_instances_per_model: 4
   # Max time (ms) request waits in queue before timeout (default: 60000)
   max_wait_in_queue_ms: 60000
@@ -302,7 +303,8 @@ metrics_path: "./node-metrics.json"
 #   enabled: true              # Enable file logging (default: false)
 #   directory: "./logs"        # Log directory (default: "./logs")
 #   filename: "proxy.log"      # Log filename (default: "proxy.log")
-#   max_keep_files: 7          # Rotated files to keep (default: 7)
+#   max_keep_files: 7          # Daily files kept, incl. the current day's (default: 7);
+#                              # use >= 1: 0 also deletes the current day's file
 #   compression: true          # Gzip compress rotated files (default: true)
 
 # -----------------------------------------------------------------------------
