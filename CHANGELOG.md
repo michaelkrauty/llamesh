@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.49] - 2026-10-29
+
+### Fixed
+
+- Accept `llama-server`'s `-hf` alias of `-hfr`/`--hf-repo` as a profile's model source. A profile whose only model source was `-hf` failed validation, so the whole cookbook was rejected at startup or reload. Such profiles now load, and like other Hugging Face sources they use `download_timeout_seconds` for startup.
+- Honor `llama-server`'s `-fit` alias of `--fit`. The proxy did not recognize it and appended its default `--fit off` after a profile's `-fit on`, and `llama-server` applies the last value, so the profile's setting was ignored.
+
 ## [1.21.48] - 2026-10-29
 
 ### Fixed

@@ -95,8 +95,10 @@ pub fn build_pre_args(profile: &Profile) -> (Vec<String>, bool, bool) {
         {
             model_arg_present = true;
         }
-        if arg == "-hfr"
+        if arg == "-hf"
+            || arg == "-hfr"
             || arg == "--hf-repo"
+            || arg.starts_with("-hf=")
             || arg.starts_with("-hfr=")
             || arg.starts_with("--hf-repo=")
         {
@@ -109,7 +111,8 @@ pub fn build_pre_args(profile: &Profile) -> (Vec<String>, bool, bool) {
         {
             ctx_size_present = true;
         }
-        if arg == "--fit" || arg.starts_with("--fit=") {
+        if arg == "-fit" || arg == "--fit" || arg.starts_with("-fit=") || arg.starts_with("--fit=")
+        {
             fit_present = true;
         }
     }
@@ -692,5 +695,108 @@ mod tests {
         assert_eq!(fit_count, 1);
         assert!(args.contains(&"on".to_string()));
         assert!(!args.contains(&"off".to_string()));
+    }
+
+    fn profile_with_args(args: &[&str]) -> Profile {
+        Profile {
+            id: "test".to_string(),
+            description: None,
+            enabled: true,
+            model_path: Some("/model.gguf".to_string()),
+            hf_repo: None,
+            hf_file: None,
+            idle_timeout_seconds: 300,
+            max_instances: Some(1),
+            llama_server_args: args.iter().map(|s| s.to_string()).collect(),
+            estimated_vram_mb: None,
+            estimated_sysmem_mb: None,
+            max_wait_in_queue_ms: None,
+            max_request_duration_ms: None,
+            startup_timeout_seconds: None,
+            download_timeout_seconds: None,
+            max_queue_size: None,
+            min_eviction_tenure_secs: None,
+        }
+    }
+
+    /// A profile whose own model source is `hf_repo`/`hf_file`, launched with
+    /// the given args.
+    fn hf_profile_with_args(args: &[&str]) -> Profile {
+        let mut profile = profile_with_args(args);
+        profile.model_path = None;
+        profile.hf_repo = Some("org/default-GGUF".to_string());
+        profile.hf_file = Some("default.gguf".to_string());
+        profile
+    }
+
+    #[test]
+    fn test_build_pre_args_detects_short_hf_alias() {
+        // llama-server accepts -hf as an alias of -hfr/--hf-repo, so the
+        // profile's own hf_repo/hf_file must not be appended as a second source.
+        let (args, model_present, hf_present) =
+            build_pre_args(&hf_profile_with_args(&["-hf", "org/custom-GGUF"]));
+
+        assert!(!model_present);
+        assert!(hf_present, "-hf not detected: {args:?}");
+        assert!(!args.contains(&"-hfr".to_string()), "{args:?}");
+        assert!(!args.contains(&"org/default-GGUF".to_string()), "{args:?}");
+        assert!(!args.contains(&"-hff".to_string()), "{args:?}");
+        assert!(args.contains(&"org/custom-GGUF".to_string()));
+    }
+
+    #[test]
+    fn test_build_pre_args_detects_short_hf_alias_equals_format() {
+        let (args, model_present, hf_present) =
+            build_pre_args(&hf_profile_with_args(&["-hf=org/custom-GGUF"]));
+
+        assert!(!model_present);
+        assert!(hf_present, "-hf= not detected: {args:?}");
+        assert!(!args.contains(&"-hfr".to_string()), "{args:?}");
+        assert!(!args.contains(&"org/default-GGUF".to_string()), "{args:?}");
+        assert!(!args.contains(&"-hff".to_string()), "{args:?}");
+        // -hf=value is expanded like the long forms.
+        let hf_pos = args.iter().position(|a| a == "-hf").unwrap();
+        assert_eq!(args[hf_pos + 1], "org/custom-GGUF");
+    }
+
+    #[test]
+    fn test_build_pre_args_short_hf_alias_skips_model_path() {
+        let (args, model_present, hf_present) =
+            build_pre_args(&profile_with_args(&["-hf", "org/custom-GGUF"]));
+
+        assert!(!model_present);
+        assert!(hf_present);
+        assert!(!args.contains(&"-m".to_string()), "{args:?}");
+        assert!(!args.contains(&"/model.gguf".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn test_build_pre_args_skips_fit_off_when_short_fit_present() {
+        // llama-server accepts -fit as an alias of --fit and keeps the last
+        // value, so an appended --fit off would override the profile's -fit on.
+        let (args, _, _) = build_pre_args(&profile_with_args(&["-fit", "on"]));
+
+        assert_eq!(args.iter().filter(|a| *a == "-fit").count(), 1);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--fit").count(),
+            0,
+            "--fit appended after -fit: {args:?}"
+        );
+        assert!(args.contains(&"on".to_string()));
+        assert!(!args.contains(&"off".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn test_build_pre_args_skips_fit_off_when_short_fit_equals_format() {
+        let (args, _, _) = build_pre_args(&profile_with_args(&["-fit=on"]));
+
+        assert_eq!(args.iter().filter(|a| *a == "-fit").count(), 1);
+        assert_eq!(
+            args.iter().filter(|a| *a == "--fit").count(),
+            0,
+            "--fit appended after -fit=: {args:?}"
+        );
+        assert!(args.contains(&"on".to_string()));
+        assert!(!args.contains(&"off".to_string()), "{args:?}");
     }
 }

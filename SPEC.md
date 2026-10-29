@@ -395,16 +395,16 @@ Each profile must specify a model source using one of these approaches:
   * `hf_file`: (Optional) Specific file within the repository (e.g., `"qwen2.5-0.5b-instruct-q4_k_m.gguf"`). If omitted, `llama-server` will use the default file.
   * `download_timeout_seconds`: Maximum time for download + model loading. Default: 3600 seconds (1 hour).
 
-You can also specify model source directly in `llama_server_args` using `-m`/`--model` or `-hfr`/`--hf-repo` flags.
+You can also specify model source directly in `llama_server_args` using `-m`/`--model` or `-hf`/`-hfr`/`--hf-repo` flags.
 
 **Startup Timeouts:**
 
 * **`startup_timeout_seconds`**: Maximum time to wait for a local model to load and become ready. Default: 60 seconds. Used for local sources, including `model_path` and `-m`/`--model` launch args, when no Hugging Face source is specified.
-* **`download_timeout_seconds`**: Maximum time to wait for a Hugging Face model to download and become ready. Default: 3600 seconds (1 hour). Used when `hf_repo` or `-hfr`/`--hf-repo` launch args specify a Hugging Face source. This timeout covers both the download time and the model loading time.
+* **`download_timeout_seconds`**: Maximum time to wait for a Hugging Face model to download and become ready. Default: 3600 seconds (1 hour). Used when `hf_repo` or `-hf`/`-hfr`/`--hf-repo` launch args specify a Hugging Face source. This timeout covers both the download time and the model loading time.
 
 **Default Arguments:**
 
-`llama_server_args` is merged with proxy-managed connection settings. By default the proxy appends `--host 127.0.0.1`, an auto-chosen `--port`, `-c 0` (max context size), and `--fit off` (disable auto-optimization) for each instance; if you explicitly include `--host`, `--port`, `-c`/`--ctx-size`, or `--fit` in `llama_server_args`, those values override the defaults. The `-c 0` default tells llama-server to use the model's maximum trained context length. The `--fit off` default ensures your hand-crafted cookbook settings are not overridden by llama-server's automatic optimization feature.
+`llama_server_args` is merged with proxy-managed connection settings. By default the proxy appends `--host 127.0.0.1`, an auto-chosen `--port`, `-c 0` (max context size), and `--fit off` (disable auto-optimization) for each instance; if you explicitly include `--host`, `--port`, `-c`/`--ctx-size`, or `-fit`/`--fit` in `llama_server_args`, those values override the defaults. The `-c 0` default tells llama-server to use the model's maximum trained context length. The `--fit off` default ensures your hand-crafted cookbook settings are not overridden by llama-server's automatic optimization feature.
 
 Model and profile `enabled` fields are independent. A profile is available only
 when both its parent model and the profile are enabled. `enabled: false` on a

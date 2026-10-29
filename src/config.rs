@@ -870,7 +870,7 @@ pub struct Profile {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Path to a local model file. Specify `model_path`, `hf_repo`, or a model-source flag
-    /// (`-m`/`--model` or `-hfr`/`--hf-repo`) in `llama_server_args`.
+    /// (`-m`/`--model` or `-hf`/`-hfr`/`--hf-repo`) in `llama_server_args`.
     #[serde(default)]
     pub model_path: Option<String>,
     /// Hugging Face repository (e.g., "ggml-org/Qwen2.5-0.5B-Instruct-GGUF").
@@ -904,7 +904,7 @@ pub struct Profile {
     #[serde(default)]
     pub startup_timeout_seconds: Option<u64>,
     /// Timeout in seconds for downloading models from Hugging Face.
-    /// Used when `hf_repo` or `-hfr`/`--hf-repo` in `llama_server_args` is specified.
+    /// Used when `hf_repo` or `-hf`/`-hfr`/`--hf-repo` in `llama_server_args` is specified.
     /// Default is 3600 (1 hour).
     /// This timeout covers both the download and the model loading time.
     #[serde(default)]
@@ -936,11 +936,11 @@ impl Profile {
     }
 
     /// Returns the effective startup timeout in seconds.
-    /// With `hf_repo` or `-hfr`/`--hf-repo` in `llama_server_args`, uses
+    /// With `hf_repo` or `-hf`/`-hfr`/`--hf-repo` in `llama_server_args`, uses
     /// `download_timeout_seconds` (default 3600s).
     /// Otherwise, uses `startup_timeout_seconds` (default 60s).
     pub fn effective_startup_timeout_seconds(&self) -> u64 {
-        let uses_hf = self.hf_repo.is_some() || self.has_flag(&["-hfr", "--hf-repo"]);
+        let uses_hf = self.hf_repo.is_some() || self.has_flag(&["-hf", "-hfr", "--hf-repo"]);
 
         if uses_hf {
             // For HF downloads, use download_timeout_seconds (default 1 hour)
@@ -968,11 +968,11 @@ impl Profile {
         let has_model_path = self.model_path.is_some();
         let has_hf_repo = self.hf_repo.is_some();
         let has_model_in_args = self.has_flag(&["-m", "--model"]);
-        let has_hf_in_args = self.has_flag(&["-hfr", "--hf-repo"]);
+        let has_hf_in_args = self.has_flag(&["-hf", "-hfr", "--hf-repo"]);
 
         if !has_model_path && !has_hf_repo && !has_model_in_args && !has_hf_in_args {
             return Err(anyhow::anyhow!(
-                "Profile {}:{} must specify either 'model_path', 'hf_repo', or include -m/--model/-hfr/--hf-repo in llama_server_args",
+                "Profile {}:{} must specify either 'model_path', 'hf_repo', or include -m/--model/-hf/-hfr/--hf-repo in llama_server_args",
                 model_name, self.id
             ));
         }
@@ -1337,6 +1337,19 @@ mod tests {
     #[test]
     fn effective_startup_timeout_detects_hf_in_args() {
         let profile = profile_with_args(&["--hf-repo", "org/model-GGUF"]);
+        assert_eq!(profile.effective_startup_timeout_seconds(), 3600);
+    }
+
+    #[test]
+    fn effective_startup_timeout_detects_short_hf_alias_in_args() {
+        // llama-server accepts -hf as an alias of -hfr/--hf-repo.
+        let profile = profile_with_args(&["-hf", "org/model-GGUF"]);
+        assert_eq!(profile.effective_startup_timeout_seconds(), 3600);
+    }
+
+    #[test]
+    fn effective_startup_timeout_detects_short_hf_alias_equals_format() {
+        let profile = profile_with_args(&["-hf=org/model-GGUF"]);
         assert_eq!(profile.effective_startup_timeout_seconds(), 3600);
     }
 
@@ -1987,6 +2000,54 @@ models:
             min_eviction_tenure_secs: None,
         };
         assert!(profile.validate("test_model").is_ok());
+    }
+
+    #[test]
+    fn validate_cookbook_accepts_short_hf_alias_in_args() {
+        // llama-server accepts -hf as an alias of -hfr/--hf-repo, and
+        // llama.cpp's documentation uses the short form.
+        let yaml = r#"
+models:
+  - name: foo
+    profiles:
+      - id: default
+        llama_server_args: "-hf org/model-GGUF"
+"#;
+        let cb: Cookbook = serde_yaml::from_str(yaml).unwrap();
+        cb.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_profile_short_hf_alias_equals_format() {
+        let mut profile = profile_with_args(&["-hf=org/model-GGUF"]);
+        profile.model_path = None;
+        profile.validate("test_model").unwrap();
+    }
+
+    #[test]
+    fn validate_hf_file_with_short_hf_alias_does_not_warn() {
+        // model_path keeps both profiles valid, so only the hf_file warning
+        // depends on whether -hf is recognized as a Hugging Face source.
+        let mut with_alias = profile_with_args(&["-hf", "org/model-GGUF"]);
+        with_alias.hf_file = Some("model-q4_k_m.gguf".into());
+        let mut without_hf_source = profile_with_args(&[]);
+        without_hf_source.hf_file = Some("model-q4_k_m.gguf".into());
+
+        let capture = crate::test_support::capture_logs(tracing::Level::WARN);
+        with_alias.validate("test_model").unwrap();
+        let logged = capture.contents();
+        assert!(
+            !logged.contains("'hf_file' will be ignored"),
+            "unexpected hf_file warning: {logged}"
+        );
+
+        // Control: the same hf_file without a Hugging Face source warns.
+        without_hf_source.validate("test_model").unwrap();
+        let logged = capture.contents();
+        assert!(
+            logged.contains("'hf_file' will be ignored"),
+            "expected hf_file warning: {logged}"
+        );
     }
 
     #[test]
