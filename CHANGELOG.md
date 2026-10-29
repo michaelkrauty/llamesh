@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.45] - 2026-10-29
+
+### Fixed
+
+- Stop logging an `insufficient_resources` warning every 10 seconds while a request waits for memory. A queued request's profile is rechecked against current memory after it is enqueued and on every maintenance tick, and each recheck that still found too little memory logged the same warning as a spawn attempt, so a request waiting for memory held by another process repeated it until it was served or timed out, indefinitely with `max_wait_in_queue_ms: 0`. The warning is now logged by the blocked spawn attempt only, and the rechecks log the same entry at `DEBUG`.
+
 ## [1.21.44] - 2026-10-28
 
 ### Fixed

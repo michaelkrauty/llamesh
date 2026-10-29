@@ -555,6 +555,7 @@ async fn retirement_keeps_unmapped_process_memory_until_confirmed_reaping() {
             "next",
             &profile("default", 500, 0),
             (500, 0),
+            AdmissionCheck::Spawn,
         )
         .await;
     assert!(matches!(blocked, Err(NodeError::InsufficientResources)));
@@ -566,6 +567,7 @@ async fn retirement_keeps_unmapped_process_memory_until_confirmed_reaping() {
             "next",
             &profile("default", 500, 0),
             (500, 0),
+            AdmissionCheck::Spawn,
         )
         .await
         .expect("confirmed reaping frees the reservation");
@@ -954,6 +956,63 @@ async fn periodic_recheck_wakes_queue_when_external_vram_falls() {
         .expect("periodic recheck should wake admitted waiter")
         .expect("queue sender should remain live");
     permit.release().await;
+}
+
+/// Levels of the `insufficient_resources` events in captured JSON log lines.
+fn shortfall_levels(logged: &str) -> Vec<String> {
+    logged
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["fields"]["event"] == "insufficient_resources")
+        .map(|event| event["level"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn queue_recheck_logs_a_memory_shortfall_below_warn() {
+    let requested = profile("default", 400, 0);
+    let state = test_state_with_cookbook(
+        test_config(),
+        Cookbook {
+            models: vec![Model {
+                name: "next".into(),
+                description: None,
+                enabled: true,
+                profiles: vec![requested.clone()],
+            }],
+        },
+    )
+    .await;
+    state
+        .memory_sampler
+        .set_device_vram_override(Some(gpu_snapshot(800, 1_000)));
+
+    // A request's own blocked attempt is reported as a warning.
+    let capture = crate::test_support::capture_logs(tracing::Level::DEBUG);
+    let err = state
+        .try_get_or_spawn("next", &requested, false, "test", false)
+        .await
+        .expect_err("external VRAM leaves no room for the profile");
+    assert!(matches!(err, NodeError::InsufficientResources));
+    assert_eq!(shortfall_levels(&capture.contents()), ["WARN"]);
+    drop(capture);
+
+    // While that request waits, every recheck finds the same shortfall. It is
+    // still logged, but below WARN, so a long wait does not repeat the warning
+    // on every maintenance tick.
+    let (tx, mut rx) = oneshot::channel();
+    state.queues.write().await.insert(
+        "next:default".to_string(),
+        std::collections::VecDeque::from([QueueEntry { token: 7, tx }]),
+    );
+    let capture = crate::test_support::capture_logs(tracing::Level::DEBUG);
+    state.wake_admissible_queues().await;
+    state.wake_admissible_queues().await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(shortfall_levels(&capture.contents()), ["DEBUG", "DEBUG"]);
 }
 
 #[tokio::test]
