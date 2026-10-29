@@ -946,7 +946,7 @@ On chosen node (or standalone):
 
 * Each request has a `max_wait_in_queue_ms` configured globally or per model.
 * A `max_wait_in_queue_ms` of 0 means infinite wait (no timeout).
-* After enqueueing, recheck admission, including capacity obtainable by evicting idle instances, to close notification races. Periodic maintenance also rechecks queued profiles against current memory usage so an external GPU consumer freeing memory can unblock them without an instance lifecycle event.
+* After enqueueing, recheck admission, including capacity obtainable by evicting idle instances, to close notification races. Periodic maintenance also rechecks queued profiles against current memory usage so an external GPU consumer freeing memory can unblock them without an instance lifecycle event. A spawn attempt that cannot free enough memory logs an `insufficient_resources` warning with the memory figures; these rechecks log the same entry at `DEBUG`, so a request that waits for memory does not repeat the warning on every maintenance tick.
 * An abandoned spawn wakes queues after its retained memory commitment is released, including when child reaping outlives the cancelled request.
 * Removed instances are cleaned up independently of the requesting future. Cancellation cannot strand later victims in an eviction batch or suppress the wake after memory is released. Capacity-driven eviction defers that wake until the contender finishes admission or abandons it, preserving its opportunity to claim the freed capacity.
 * The timeout runs from when the router starts looking for capacity, so time spent waiting in the router before the request was queued locally counts toward it. If it passes while the request is waiting (and the timeout is non-zero):

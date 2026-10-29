@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Notify, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -451,6 +451,17 @@ struct ResourceAccounting {
 struct SpawnPlan {
     victims: Vec<String>,
     revision: u64,
+}
+
+/// Who asks for an admission plan, which decides how a memory shortfall is
+/// logged. A request's own spawn attempt logs it as a warning. Queue rechecks
+/// log it at debug level: they run after every enqueue and on every
+/// maintenance tick while a request waits, and the request already logged the
+/// warning when its own attempt was blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionCheck {
+    Spawn,
+    QueueRecheck,
 }
 
 impl ResourceSnapshot {
@@ -1341,6 +1352,7 @@ impl NodeState {
         model: &str,
         profile: &Profile,
         required: (u64, u64),
+        check: AdmissionCheck,
     ) -> Result<SpawnPlan, NodeError> {
         let accounting = self.resource_accounting_for_instances(instances).await;
         let count = Self::count_profile_instances(instances, model, &profile.id).await;
@@ -1353,7 +1365,7 @@ impl NodeState {
             return Err(NodeError::MaxInstancesProfile);
         }
         let victims = self
-            .pick_victims_from_accounting(instances, &accounting, required)
+            .pick_victims_from_accounting(instances, &accounting, required, check)
             .await?;
         Ok(SpawnPlan {
             victims,
@@ -1373,6 +1385,7 @@ impl NodeState {
             instances_map,
             &accounting,
             (required_vram, required_sysmem),
+            AdmissionCheck::Spawn,
         )
         .await
     }
@@ -1382,6 +1395,7 @@ impl NodeState {
         instances_map: &HashMap<String, Arc<RwLock<Instance>>>,
         accounting: &ResourceAccounting,
         (required_vram, required_sysmem): (u64, u64),
+        check: AdmissionCheck,
     ) -> Result<Vec<String>, NodeError> {
         struct Candidate {
             id: String,
@@ -1452,23 +1466,31 @@ impl NodeState {
 
         // Log detailed info about why resources are insufficient
         let busy_count = instances_map.len() - idle_count;
-        warn!(
-            event = "insufficient_resources",
-            curr_vram_mb = curr_vram,
-            curr_sysmem_mb = curr_sysmem,
-            llamesh_vram_mb = resource_snapshot.llamesh_vram_mb,
-            external_vram_mb = resource_snapshot.external_vram_mb,
-            device_vram_used_mb = resource_snapshot.device_vram_used_mb,
-            gpu_telemetry_available = resource_snapshot.gpu_telemetry_available,
-            required_vram_mb = required_vram,
-            required_sysmem_mb = required_sysmem,
-            max_vram_mb = max_vram,
-            max_sysmem_mb = max_sysmem,
-            total_instances = instances_map.len(),
-            busy_instances = busy_count,
-            idle_candidates = idle_count,
-            "Cannot free enough resources for new instance"
-        );
+        macro_rules! log_shortfall {
+            ($level:ident) => {
+                $level!(
+                    event = "insufficient_resources",
+                    curr_vram_mb = curr_vram,
+                    curr_sysmem_mb = curr_sysmem,
+                    llamesh_vram_mb = resource_snapshot.llamesh_vram_mb,
+                    external_vram_mb = resource_snapshot.external_vram_mb,
+                    device_vram_used_mb = resource_snapshot.device_vram_used_mb,
+                    gpu_telemetry_available = resource_snapshot.gpu_telemetry_available,
+                    required_vram_mb = required_vram,
+                    required_sysmem_mb = required_sysmem,
+                    max_vram_mb = max_vram,
+                    max_sysmem_mb = max_sysmem,
+                    total_instances = instances_map.len(),
+                    busy_instances = busy_count,
+                    idle_candidates = idle_count,
+                    "Cannot free enough resources for new instance"
+                )
+            };
+        }
+        match check {
+            AdmissionCheck::Spawn => log_shortfall!(warn),
+            AdmissionCheck::QueueRecheck => log_shortfall!(debug),
+        }
         Err(NodeError::InsufficientResources)
     }
 
@@ -2576,6 +2598,7 @@ impl NodeState {
                     model_name,
                     profile,
                     (required_vram, required_sysmem),
+                    AdmissionCheck::Spawn,
                 )
                 .await?;
 
@@ -3610,9 +3633,15 @@ impl NodeState {
             .await;
         let can_spawn = {
             let instances = self.instances.read().await;
-            self.plan_spawn(&instances, model, profile, required)
-                .await
-                .is_ok()
+            self.plan_spawn(
+                &instances,
+                model,
+                profile,
+                required,
+                AdmissionCheck::QueueRecheck,
+            )
+            .await
+            .is_ok()
         };
         if can_spawn {
             self.notify_queue(model, &profile.id).await;
