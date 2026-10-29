@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.47] - 2026-10-29
+
+### Fixed
+
+- Remove old llama.cpp builds when `llama_cpp.build_path` is a bare name such as `build`. Cleanup listed the parent directory of `build_path`, which for a bare name is the empty path and cannot be read, so it failed after every build with "Failed to cleanup old builds: No such file or directory", `keep_builds` was never applied, and every llama.cpp update left another build directory behind. Such a `build_path` is now treated like `./build`.
+
 ## [1.21.46] - 2026-10-29
 
 ### Fixed

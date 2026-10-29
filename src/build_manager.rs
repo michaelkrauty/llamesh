@@ -377,10 +377,7 @@ impl BuildManager {
                 )
             })?;
         let build_dir_name = format!("{base_name}-{commit_hash}_{}", self.build_inputs_id()?);
-        Ok(build_base
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(build_dir_name))
+        Ok(builds_dir(&build_base).join(build_dir_name))
     }
 
     fn build_inputs_id(&self) -> Result<String> {
@@ -506,7 +503,7 @@ impl BuildManager {
     /// these directories.
     async fn cleanup_old_builds(&self) -> Result<()> {
         let build_base = PathBuf::from(&self.config.build_path);
-        let parent_dir = build_base.parent().unwrap_or(Path::new("."));
+        let parent_dir = builds_dir(&build_base);
         let base_name = match build_base
             .file_name()
             .and_then(|n| n.to_str())
@@ -798,6 +795,16 @@ pub fn version_from_resolved_binary(path: &std::path::Path) -> Option<String> {
     let build_dir = bin_dir.parent()?.file_name()?.to_str()?;
     let (_, commit) = split_managed_build_name(build_dir)?;
     Some(commit.to_string())
+}
+
+/// The directory that holds the build directories named after `build_base`
+/// (`llama_cpp.build_path`): its parent, or the working directory when it is a
+/// bare name such as `build`, whose parent is the empty path.
+fn builds_dir(build_base: &Path) -> &Path {
+    match build_base.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// Resolve `path` one component at a time, following symlinks the way the
@@ -2227,6 +2234,20 @@ fi
                 "{via}: the configured path must still resolve"
             );
         }
+    }
+
+    #[test]
+    fn builds_dir_is_the_working_directory_for_a_bare_name() {
+        assert_eq!(builds_dir(Path::new("build")), Path::new("."));
+        assert_eq!(builds_dir(Path::new("./build")), Path::new("."));
+        assert_eq!(
+            builds_dir(Path::new("llama.cpp/build")),
+            Path::new("llama.cpp")
+        );
+        assert_eq!(
+            builds_dir(Path::new("/opt/llama/build")),
+            Path::new("/opt/llama")
+        );
     }
 
     #[tokio::test]
