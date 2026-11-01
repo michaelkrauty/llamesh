@@ -280,6 +280,141 @@ pub fn compute_args_hash(args: &[String]) -> String {
     )
 }
 
+/// The API key the proxy sends, as `Authorization: Bearer <key>`, to a
+/// `llama-server` started with `args`, or `None` if the server is given no key.
+///
+/// `llama-server` accepts every key it is given, in any of these forms: an
+/// `--api-key` value is a comma-separated list, an `--api-key-file` names a
+/// file with one key per line, and the `LLAMA_API_KEY` and
+/// `LLAMA_ARG_API_KEY_FILE` environment variables, which the server inherits
+/// from the proxy, take the same two forms. Since any one key is enough, this
+/// returns the first key of the last argument that yields one, and consults the
+/// environment only when no argument does. That key stays valid even if
+/// `llama-server` someday keeps only the last occurrence of a repeated option,
+/// or lets arguments replace the environment, as its warnings for those cases
+/// already say. Keys from llama.cpp's own `config.ini` files are not read.
+///
+/// Fails when a key file it reads cannot be read, or when the key cannot be
+/// sent in an HTTP header, such as a line of a file with Windows line endings,
+/// which keeps its `\r` as it does in `llama-server`. Such an instance could
+/// not be started or could not be authenticated to, so the spawn fails early
+/// instead.
+///
+/// This reads key files, which can block, so call it off the async workers,
+/// when the instance is started, which is also when `llama-server` reads them.
+/// `args` must have any `--option=value` already split in two, as
+/// `build_pre_args` does.
+pub fn backend_api_key(args: &[String]) -> Result<Option<String>> {
+    backend_api_key_with_env(args, |name| std::env::var(name).ok())
+}
+
+fn backend_api_key_with_env(
+    args: &[String],
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>> {
+    let mut key = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        // Like llama.cpp, read `_` in a long option's name as `-`.
+        let option = if arg.starts_with("--") {
+            arg.replace('_', "-")
+        } else {
+            continue;
+        };
+        // Take a value only for the key options: any other option may be a
+        // flag without one, so the next argument may be a key option itself.
+        let found = match option.as_str() {
+            "--api-key" => args.next().and_then(|keys| first_listed_key(keys)),
+            "--api-key-file" => match args.next() {
+                Some(path) => first_key_in_file(path)?,
+                None => None,
+            },
+            _ => continue,
+        };
+        if found.is_some() {
+            key = found;
+        }
+    }
+    if key.is_none() {
+        key = env("LLAMA_API_KEY").and_then(|keys| first_listed_key(&keys));
+    }
+    if key.is_none() {
+        if let Some(path) = env("LLAMA_ARG_API_KEY_FILE") {
+            key = first_key_in_file(&path)?;
+        }
+    }
+    if let Some(key) = &key {
+        if axum::http::HeaderValue::from_str(&format!("Bearer {key}")).is_err() {
+            let hint = if key.ends_with('\r') {
+                " (it ends with a carriage return; is the key file saved with Windows line endings?)"
+            } else {
+                ""
+            };
+            return Err(anyhow!(
+                "the API key cannot be sent in an HTTP header{hint}"
+            ));
+        }
+    }
+    Ok(key)
+}
+
+/// The first non-empty key in an `--api-key` value.
+fn first_listed_key(keys: &str) -> Option<String> {
+    parse_csv_row(keys).into_iter().find(|key| !key.is_empty())
+}
+
+/// The first key in an `--api-key-file`, read the way llama.cpp reads the
+/// file: line by line as bytes, skipping empty lines and lines that start with
+/// `#`, without trimming. Reading stops at the first key.
+fn first_key_in_file(path: &str) -> Result<Option<String>> {
+    use std::io::BufRead;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("failed to open API key file {path}"))?;
+    for line in std::io::BufReader::new(file).split(b'\n') {
+        let line = line.with_context(|| format!("failed to read API key file {path}"))?;
+        if line.is_empty() || line[0] == b'#' {
+            continue;
+        }
+        return String::from_utf8(line)
+            .map(Some)
+            .map_err(|_| anyhow!("the first key in API key file {path} is not valid UTF-8"));
+    }
+    Ok(None)
+}
+
+/// Split a `llama-server` multi-value argument into fields the way llama.cpp's
+/// `parse_csv_row` does: fields are separated by commas; a field that begins
+/// with `"` is quoted, so it may contain commas, and `""` within it is a
+/// literal quote; a quote anywhere else is literal.
+fn parse_csv_row(input: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if !in_quotes => {
+                if field.is_empty() {
+                    in_quotes = true;
+                } else {
+                    field.push('"');
+                }
+            }
+            '"' => {
+                if chars.next_if_eq(&'"').is_some() {
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            }
+            ',' if !in_quotes => fields.push(std::mem::take(&mut field)),
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
 /// Per-probe timeout for a single readiness health check (see [`probe_ready`]).
 /// Short enough that the readiness loop keeps its polling cadence and respects
 /// the overall startup timeout even when a probe stalls, yet generous enough to
@@ -359,9 +494,10 @@ pub struct Instance {
     pub streams_awaiting_downstream: Arc<AtomicUsize>,
     /// Set by `claim_startup_failure`.
     startup_failure_claimed: AtomicBool,
-    /// `--api-key` the process was exec'd with. Requests forwarded to this
-    /// instance send this key, including when a later cookbook reload has a
-    /// different one. `None` means the process was started without a key.
+    /// A key the process accepts, resolved from its arguments when it was
+    /// started (see [`backend_api_key`]). Requests forwarded to this instance
+    /// send this key, including when a later cookbook reload or key-file edit
+    /// has a different one. `None` means the process was started without a key.
     pub backend_api_key: Option<String>,
 }
 
@@ -812,6 +948,197 @@ impl Instance {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    fn key_without_env(args: &[&str]) -> Option<String> {
+        backend_api_key_with_env(&strings(args), |_| None).unwrap()
+    }
+
+    fn key_error(args: &[&str]) -> String {
+        format!(
+            "{:#}",
+            backend_api_key_with_env(&strings(args), |_| None).unwrap_err()
+        )
+    }
+
+    #[test]
+    fn csv_rows_split_like_llama_cpp() {
+        assert_eq!(parse_csv_row("a"), ["a"]);
+        assert_eq!(parse_csv_row("a,b,,c"), ["a", "b", "", "c"]);
+        assert_eq!(parse_csv_row(""), [""]);
+        assert_eq!(parse_csv_row("\"a,b\",c"), ["a,b", "c"]);
+        assert_eq!(parse_csv_row("\"say \"\"hi\"\"\""), ["say \"hi\""]);
+        // A quote inside an unquoted field is literal.
+        assert_eq!(parse_csv_row("a\"b"), ["a\"b"]);
+        // An unterminated quoted field runs to the end.
+        assert_eq!(parse_csv_row("\"a,b"), ["a,b"]);
+    }
+
+    #[test]
+    fn backend_api_key_reads_each_argument_form() {
+        assert_eq!(key_without_env(&["-c", "4096"]), None);
+        assert_eq!(
+            key_without_env(&["--api-key", "secret"]).as_deref(),
+            Some("secret")
+        );
+        // The first key of a comma-separated list, skipping empty fields.
+        assert_eq!(
+            key_without_env(&["--api-key", ",alpha,beta"]).as_deref(),
+            Some("alpha")
+        );
+        // A quoted field may itself contain commas.
+        assert_eq!(
+            key_without_env(&["--api-key", "\"a,b\",c"]).as_deref(),
+            Some("a,b")
+        );
+        // llama.cpp reads `_` in a long option's name as `-`.
+        assert_eq!(
+            key_without_env(&["--api_key", "secret"]).as_deref(),
+            Some("secret")
+        );
+        // Other options, with or without a value, around the key option.
+        assert_eq!(
+            key_without_env(&["--embedding", "--api-key", "secret", "--no-kv-offload"]).as_deref(),
+            Some("secret")
+        );
+        assert_eq!(
+            key_without_env(&["--alias", "name", "--api-key", "secret", "-c", "0"]).as_deref(),
+            Some("secret")
+        );
+        // A list of only empty fields gives the server no key.
+        assert_eq!(key_without_env(&["--api-key", ",,"]), None);
+        // A trailing option without a value has no key.
+        assert_eq!(key_without_env(&["--api-key"]), None);
+    }
+
+    #[test]
+    fn backend_api_key_reads_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, "# rotated monthly\n\nfirst\nsecond\n").unwrap();
+        let path = path.to_str().unwrap();
+        assert_eq!(
+            key_without_env(&["--api-key-file", path]).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            key_without_env(&["--no-kv-offload", "--api-key-file", path]).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            key_without_env(&["--api_key_file", path]).as_deref(),
+            Some("first")
+        );
+
+        // Lines are not trimmed, as in llama.cpp.
+        let spaced = dir.path().join("spaced");
+        std::fs::write(&spaced, " padded \n").unwrap();
+        assert_eq!(
+            key_without_env(&["--api-key-file", spaced.to_str().unwrap()]).as_deref(),
+            Some(" padded ")
+        );
+
+        // A file of only comments and blank lines has no key.
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "# none yet\n\n").unwrap();
+        assert_eq!(
+            key_without_env(&["--api-key-file", empty.to_str().unwrap()]),
+            None
+        );
+
+        // Bytes that are not UTF-8 after the first key do not matter.
+        let latin1 = dir.path().join("latin1");
+        std::fs::write(&latin1, b"first\n# caf\xe9\n").unwrap();
+        assert_eq!(
+            key_without_env(&["--api-key-file", latin1.to_str().unwrap()]).as_deref(),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn backend_api_key_rejects_keys_it_cannot_send() {
+        let dir = tempfile::tempdir().unwrap();
+        // llama-server keeps the `\r` of a Windows line ending in the key,
+        // which no client can send in a header.
+        let crlf = dir.path().join("crlf");
+        std::fs::write(&crlf, "secret\r\n").unwrap();
+        let error = key_error(&["--api-key-file", crlf.to_str().unwrap()]);
+        assert!(error.contains("carriage return"), "{error}");
+
+        let latin1 = dir.path().join("latin1");
+        std::fs::write(&latin1, b"caf\xe9\n").unwrap();
+        let error = key_error(&["--api-key-file", latin1.to_str().unwrap()]);
+        assert!(error.contains("not valid UTF-8"), "{error}");
+
+        let error = key_error(&["--api-key", "line\nbreak"]);
+        assert!(error.contains("cannot be sent"), "{error}");
+
+        // llama-server fails to start on a key file it cannot open.
+        let missing = dir.path().join("missing");
+        let error = key_error(&["--api-key-file", missing.to_str().unwrap()]);
+        assert!(error.contains("failed to open API key file"), "{error}");
+    }
+
+    #[test]
+    fn backend_api_key_prefers_the_last_argument_with_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, "from-file\n").unwrap();
+        let path = path.to_str().unwrap();
+        assert_eq!(
+            key_without_env(&["--api-key", "first", "--api-key", "second"]).as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            key_without_env(&["--api-key", "inline", "--api-key-file", path]).as_deref(),
+            Some("from-file")
+        );
+        // A later argument that yields no key does not discard an earlier key.
+        assert_eq!(
+            key_without_env(&["--api-key", "inline", "--api-key", ""]).as_deref(),
+            Some("inline")
+        );
+    }
+
+    #[test]
+    fn backend_api_key_falls_back_to_the_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys");
+        std::fs::write(&path, "env-file\n").unwrap();
+        let path = path.to_str().unwrap().to_string();
+        let env = |api_key: Option<&str>, key_file: Option<&str>| {
+            let api_key = api_key.map(str::to_string);
+            let key_file = key_file.map(str::to_string);
+            move |name: &str| match name {
+                "LLAMA_API_KEY" => api_key.clone(),
+                "LLAMA_ARG_API_KEY_FILE" => key_file.clone(),
+                _ => None,
+            }
+        };
+        let no_args: Vec<String> = Vec::new();
+        assert_eq!(
+            backend_api_key_with_env(&no_args, env(Some("env-a,env-b"), Some(&path)))
+                .unwrap()
+                .as_deref(),
+            Some("env-a")
+        );
+        assert_eq!(
+            backend_api_key_with_env(&no_args, env(None, Some(&path)))
+                .unwrap()
+                .as_deref(),
+            Some("env-file")
+        );
+        // An argument's key wins over the environment.
+        assert_eq!(
+            backend_api_key_with_env(&strings(&["--api-key", "arg"]), env(Some("env"), None))
+                .unwrap()
+                .as_deref(),
+            Some("arg")
+        );
+    }
 
     async fn accounted_child(
         ignore_term: bool,

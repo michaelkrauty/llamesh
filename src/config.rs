@@ -996,17 +996,6 @@ impl Profile {
         Ok(())
     }
 
-    pub fn get_api_key(&self) -> Option<String> {
-        let args = &self.llama_server_args;
-        args.iter()
-            .position(|arg| arg == "--api-key")
-            .and_then(|idx| args.get(idx + 1).cloned())
-            .or_else(|| {
-                args.iter()
-                    .find_map(|arg| arg.strip_prefix("--api-key=").map(|s| s.to_string()))
-            })
-    }
-
     fn has_flag(&self, needles: &[&str]) -> bool {
         let mut iter = self.llama_server_args.iter();
         iter.any(|arg| {

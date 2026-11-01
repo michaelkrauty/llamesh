@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.51] - 2026-11-01
+
+### Fixed
+
+- Send a key that `llama-server` accepts when a profile gives an instance a comma-separated list of keys (`--api-key key1,key2`) or a key file (`--api-key-file`), both of which `llama-server` supports. The proxy sent the whole list as a single key, and no key at all for a key file, so the instance answered every forwarded request with `401`. It now sends the first key, reading a key file the way `llama-server` does (one key per line, skipping blank lines and lines that start with `#`) when the instance starts. When the arguments give no key, it also uses one the instance inherits from the proxy's environment through `LLAMA_API_KEY` or `LLAMA_ARG_API_KEY_FILE`. A key file that cannot be read, or a key that cannot be sent in an HTTP header, such as one from a file with Windows line endings, now fails the request with `500` without starting the instance.
+
 ## [1.21.50] - 2026-10-29
 
 ### Documentation
