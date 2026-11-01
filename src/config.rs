@@ -790,6 +790,27 @@ impl Cookbook {
                 profile.validate(&model.name)?;
 
                 if model.enabled && profile.enabled {
+                    let ignored = profile.source_fields_overridden_by_args();
+                    if !ignored.is_empty() {
+                        let quoted: Vec<String> =
+                            ignored.iter().map(|field| format!("'{field}'")).collect();
+                        let (fields, verb) = match quoted.as_slice() {
+                            [only] => (only.clone(), "is"),
+                            [first, second] => (format!("{first} and {second}"), "are"),
+                            [rest @ .., last] => {
+                                (format!("{}, and {last}", rest.join(", ")), "are")
+                            }
+                            [] => unreachable!("checked non-empty"),
+                        };
+                        tracing::warn!(
+                            model = %model.name,
+                            profile = %profile.id,
+                            "Profile {}:{} sets its model source in llama_server_args, so its {fields} {verb} ignored",
+                            model.name,
+                            profile.id
+                        );
+                    }
+
                     // A ':' in a model or profile name collides with the reserved
                     // `model:profile` request separator: the index key is built as
                     // `model:profile` and resolution splits on the first ':', so an
@@ -984,8 +1005,14 @@ impl Profile {
             ));
         }
 
-        // Warn if hf_file is specified without hf_repo
-        if self.hf_file.is_some() && !has_hf_repo && !has_hf_in_args {
+        // Warn if hf_file is specified without hf_repo. With a model source in
+        // the args, Cookbook::validate reports hf_file among the overridden
+        // fields instead.
+        if self.hf_file.is_some()
+            && !has_hf_repo
+            && !has_hf_in_args
+            && !self.args_are_model_source()
+        {
             tracing::warn!(
                 "Profile {}:{} specifies 'hf_file' without 'hf_repo'; 'hf_file' will be ignored",
                 model_name,
@@ -994,6 +1021,32 @@ impl Profile {
         }
 
         Ok(())
+    }
+
+    /// Whether `llama_server_args` are the model source: they name a model
+    /// (`-m`/`--model`) or a Hugging Face repository (`-hf`/`-hfr`/
+    /// `--hf-repo`), so `build_pre_args` adds none of the profile's own
+    /// `model_path`, `hf_repo`, or `hf_file`. Asks `build_pre_args` itself, so
+    /// the two cannot disagree about which spellings count.
+    fn args_are_model_source(&self) -> bool {
+        let (_, model_in_args, hf_repo_in_args) = crate::node_state::build_pre_args(self);
+        model_in_args || hf_repo_in_args
+    }
+
+    /// The profile's own model source fields that `llama_server_args`
+    /// overrides (see [`Self::args_are_model_source`]).
+    pub fn source_fields_overridden_by_args(&self) -> Vec<&'static str> {
+        if !self.args_are_model_source() {
+            return Vec::new();
+        }
+        [
+            ("model_path", self.model_path.is_some()),
+            ("hf_repo", self.hf_repo.is_some()),
+            ("hf_file", self.hf_file.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, set)| set.then_some(field))
+        .collect()
     }
 
     fn has_flag(&self, needles: &[&str]) -> bool {
@@ -2016,7 +2069,9 @@ models:
     #[test]
     fn validate_hf_file_with_short_hf_alias_does_not_warn() {
         // model_path keeps both profiles valid, so only the hf_file warning
-        // depends on whether -hf is recognized as a Hugging Face source.
+        // depends on whether -hf is recognized as a Hugging Face source. (The
+        // args' source overrides hf_file either way, which Cookbook::validate
+        // reports; see cookbook_warns_when_args_override_source_fields.)
         let mut with_alias = profile_with_args(&["-hf", "org/model-GGUF"]);
         with_alias.hf_file = Some("model-q4_k_m.gguf".into());
         let mut without_hf_source = profile_with_args(&[]);
@@ -2037,6 +2092,126 @@ models:
             logged.contains("'hf_file' will be ignored"),
             "expected hf_file warning: {logged}"
         );
+    }
+
+    #[test]
+    fn source_fields_overridden_by_args_lists_ignored_fields() {
+        let mut profile = profile_with_args(&[]);
+        profile.hf_file = Some("model-q4_k_m.gguf".into());
+        assert!(profile.source_fields_overridden_by_args().is_empty());
+
+        // The launch arguments carry none of the fields reported as ignored.
+        let launched = |profile: &Profile| crate::node_state::build_pre_args(profile).0;
+
+        profile.llama_server_args = vec!["-m".into(), "/models/other.gguf".into()];
+        assert_eq!(
+            profile.source_fields_overridden_by_args(),
+            ["model_path", "hf_file"]
+        );
+        let args = launched(&profile);
+        assert!(!args.contains(&"/tmp/model.gguf".to_string()), "{args:?}");
+        assert!(!args.contains(&"model-q4_k_m.gguf".to_string()), "{args:?}");
+
+        profile.model_path = None;
+        profile.hf_repo = Some("org/model-GGUF".into());
+        profile.llama_server_args = vec!["-hfr=org/other-GGUF".into()];
+        assert_eq!(
+            profile.source_fields_overridden_by_args(),
+            ["hf_repo", "hf_file"]
+        );
+        let args = launched(&profile);
+        assert!(!args.contains(&"org/model-GGUF".to_string()), "{args:?}");
+        assert!(!args.contains(&"model-q4_k_m.gguf".to_string()), "{args:?}");
+
+        // Only the spellings build_pre_args recognizes override the fields:
+        // with "-M", which it does not, model_path is still launched.
+        let mut upper = profile_with_args(&["-M", "./other.gguf"]);
+        upper.hf_file = Some("model-q4_k_m.gguf".into());
+        assert!(upper.source_fields_overridden_by_args().is_empty());
+        assert!(launched(&upper).contains(&"/tmp/model.gguf".to_string()));
+
+        // A model source only in the args overrides nothing.
+        let mut args_only = profile_with_args(&["-hf", "org/model-GGUF"]);
+        args_only.model_path = None;
+        assert!(args_only.source_fields_overridden_by_args().is_empty());
+    }
+
+    #[test]
+    fn cookbook_warns_when_args_override_source_fields() {
+        let cookbook = |model_enabled: bool, profile_enabled: bool| -> Cookbook {
+            serde_yaml::from_str(&format!(
+                r#"
+models:
+  - name: foo
+    enabled: {model_enabled}
+    profiles:
+      - id: default
+        enabled: {profile_enabled}
+        hf_file: "model-q4_k_m.gguf"
+        llama_server_args: "-hf org/model-GGUF"
+"#
+            ))
+            .unwrap()
+        };
+
+        let capture = crate::test_support::capture_logs(tracing::Level::WARN);
+        cookbook(true, false).validate().unwrap();
+        cookbook(false, true).validate().unwrap();
+        // Disabled entries are never launched, so their fields do not matter.
+        let logged = capture.contents();
+        assert!(!logged.contains("sets its model source"), "{logged}");
+
+        cookbook(true, true).validate().unwrap();
+        let logged = capture.contents();
+        assert!(
+            logged.contains(
+                "Profile foo:default sets its model source in llama_server_args, so its 'hf_file' is ignored"
+            ),
+            "{logged}"
+        );
+
+        // With -m, hf_file is reported once, with model_path, and not again by
+        // the warning for an hf_file without hf_repo.
+        let capture = crate::test_support::capture_logs(tracing::Level::WARN);
+        let local: Cookbook = serde_yaml::from_str(
+            r#"
+models:
+  - name: bar
+    profiles:
+      - id: default
+        model_path: "./bar.gguf"
+        hf_file: "bar-q4_k_m.gguf"
+        llama_server_args: "-m ./other.gguf"
+"#,
+        )
+        .unwrap();
+        local.validate().unwrap();
+        let logged = capture.contents();
+        assert!(
+            logged.contains("so its 'model_path' and 'hf_file' are ignored"),
+            "{logged}"
+        );
+        assert!(!logged.contains("without 'hf_repo'"), "{logged}");
+
+        // With a spelling build_pre_args does not take as a model source, the
+        // hf_file is ignored for lack of hf_repo, which that warning reports.
+        let capture = crate::test_support::capture_logs(tracing::Level::WARN);
+        let upper: Cookbook = serde_yaml::from_str(
+            r#"
+models:
+  - name: baz
+    profiles:
+      - id: default
+        model_path: "./baz.gguf"
+        hf_file: "baz-q4_k_m.gguf"
+        llama_server_args: "-M ./other.gguf"
+"#,
+        )
+        .unwrap();
+        upper.validate().unwrap();
+        let logged = capture.contents();
+        assert!(logged.contains("without 'hf_repo'"), "{logged}");
+        assert!(!logged.contains("sets its model source"), "{logged}");
     }
 
     #[test]

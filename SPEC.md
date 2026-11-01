@@ -395,7 +395,7 @@ Each profile must specify a model source using one of these approaches:
   * `hf_file`: (Optional) Specific file within the repository (e.g., `"qwen2.5-0.5b-instruct-q4_k_m.gguf"`). If omitted, `llama-server` will use the default file.
   * `download_timeout_seconds`: Maximum time for download + model loading. Default: 3600 seconds (1 hour).
 
-You can also specify model source directly in `llama_server_args` using `-m`/`--model` or `-hf`/`-hfr`/`--hf-repo` flags.
+You can also specify model source directly in `llama_server_args` using `-m`/`--model` or `-hf`/`-hfr`/`--hf-repo` flags. A model source in `llama_server_args` takes precedence: the profile's `model_path`, `hf_repo`, and `hf_file` are then ignored, and loading or reloading the cookbook logs a warning naming them for each enabled profile. To choose a file from a repository given in the arguments, pass `-hff`/`--hf-file` there too.
 
 **Startup Timeouts:**
 
