@@ -179,9 +179,9 @@ impl Peer {
     }
 }
 
-/// `/healthz` stays 503 when the cookbook is empty or the llama-server binary
-/// is missing. Either response means the proxy is accepting requests; only a
-/// missing answer means it is not up yet.
+/// `/healthz` stays 503 when a standalone node's cookbook is empty or the
+/// llama-server binary for its models is missing. Either response means the
+/// proxy is accepting requests; only a missing answer means it is not up yet.
 async fn wait_for_accepting(base_url: &str) -> bool {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(1))

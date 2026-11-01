@@ -798,6 +798,7 @@ The proxy exposes standard Kubernetes-style probes:
     * At least one model is defined in cookbook, AND
     * `llama.cpp` binary exists.
   * Non-200 (503) otherwise.
+  * A forwarding-only node, a cluster member (`cluster.enabled`) with an empty cookbook, returns 200 without either: it routes every request to its peers and never starts an instance.
 
 * `GET /readyz`:
 
@@ -808,6 +809,7 @@ The proxy exposes standard Kubernetes-style probes:
     * At least one model is defined in cookbook.
   * Response body includes a `can_spawn` boolean field indicating whether the node has resources to spawn new instances.
   * Returns 503 if draining, no binary, or no models configured.
+  * A forwarding-only node needs neither models nor a binary: it returns 200 with `can_spawn: false` while it is not draining and has a peer it could forward a request to (one that is not stale, is ready, is not blocked by its circuit breaker, and advertises at least one model), and 503 otherwise.
 
 For full semantics (including drain/shutdown behavior), see **Health, Readiness, and Shutdown** below.
 
@@ -1359,6 +1361,7 @@ cluster:
     * At least one model is defined in cookbook, AND
     * `llama.cpp` binary exists.
   * Non-200 (503) otherwise.
+  * A forwarding-only node (`cluster.enabled` with an empty cookbook) needs neither and returns 200.
 
 * `/readyz`:
 
@@ -1369,6 +1372,7 @@ cluster:
     * At least one model is defined in cookbook.
   * Response includes `can_spawn` boolean field.
   * Returns 503 if any of these conditions are not met.
+  * A forwarding-only node is ready while it is not draining and has a peer it could forward a request to, and reports `can_spawn: false`.
 
 ### Version Information
 
