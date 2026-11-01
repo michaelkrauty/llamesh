@@ -113,11 +113,23 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // Initialize logging (after config load for file logging support)
+    // Initialize logging (after config load for file logging support). This
+    // follows validation, so an invalid configuration exits before logging
+    // prepares the log directory and files.
     logging::init(config.logging.as_ref())?;
 
     info!("Starting llamesh");
     info!("Version: {}", env!("CARGO_PKG_VERSION"));
+
+    // Validate again, now that logging is up, to record the warnings that
+    // validation logs: tracing discarded them during the first pass, which ran
+    // with no subscriber installed. Validation has no other side effects, and
+    // the first pass already succeeded.
+    if let Err(e) = config.validate().and_then(|()| cookbook.validate()) {
+        eprintln!("Invalid configuration: {e}");
+        std::process::exit(1);
+    }
+
     info!("Loaded config for node: {}", config.node_id);
     info!("Loaded cookbook with {} models", cookbook.models.len());
     if let Some(secrets_path) = &args.secrets {
