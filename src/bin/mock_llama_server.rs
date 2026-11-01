@@ -47,8 +47,16 @@ struct Args {
     fa: bool,
     #[arg(long)]
     kv_unified: bool,
-    #[arg(long)]
-    api_key: Option<String>,
+    /// Accepted API keys, as a comma-separated list (split on every comma;
+    /// unlike llama-server, quoted fields are not supported). Like
+    /// llama-server, the option may be repeated, and the keys of every
+    /// occurrence are accepted.
+    #[arg(long, action = clap::ArgAction::Append)]
+    api_key: Vec<String>,
+    /// A file of accepted API keys, one per line, skipping blank lines and
+    /// lines that start with `#`, like llama-server's `--api-key-file`.
+    #[arg(long, action = clap::ArgAction::Append)]
+    api_key_file: Vec<std::path::PathBuf>,
     /// Keep /health unready until this file exists, without delaying bind.
     #[arg(long)]
     startup_ready_file: Option<std::path::PathBuf>,
@@ -75,20 +83,21 @@ struct Slot {
 struct AppState {
     slots: Mutex<Vec<Slot>>,
     args: Args,
+    /// Every key from `--api-key` and `--api-key-file`; empty disables auth.
+    api_keys: Vec<String>,
     start_time: SystemTime,
     total_requests: Mutex<usize>,
 }
 
 async fn auth_middleware(State(state): State<Arc<AppState>>, req: Request, next: Next) -> Response {
-    if let Some(expected_key) = &state.args.api_key {
-        let auth_header = req
+    if !state.api_keys.is_empty() {
+        let presented = req
             .headers()
             .get("Authorization")
-            .and_then(|h| h.to_str().ok());
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "));
 
-        let expected_header = format!("Bearer {expected_key}");
-
-        if auth_header != Some(&expected_header) {
+        if !presented.is_some_and(|key| state.api_keys.iter().any(|k| k == key)) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({"error": "Unauthorized"})),
@@ -167,9 +176,30 @@ async fn main() {
         });
     }
 
+    let mut api_keys: Vec<String> = args
+        .api_key
+        .iter()
+        .flat_map(|keys| keys.split(','))
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect();
+    for path in &args.api_key_file {
+        let contents = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("error: failed to open file '{}': {e}", path.display());
+            std::process::exit(1);
+        });
+        api_keys.extend(
+            contents
+                .split('\n')
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .map(str::to_string),
+        );
+    }
+
     let state = Arc::new(AppState {
         slots: Mutex::new(slots),
         args: args.clone(),
+        api_keys,
         start_time: SystemTime::now(),
         total_requests: Mutex::new(0),
     });

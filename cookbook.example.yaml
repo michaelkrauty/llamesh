@@ -123,7 +123,10 @@ models:
         model_path: "./models/protected.gguf"
         idle_timeout_seconds: 300
         max_instances: 1
-        # proxy auto-includes api-key when forwarding requests
+        # The proxy sends the instance's key with every request it forwards.
+        # --api-key also takes a comma-separated list of keys, and
+        # --api-key-file reads them from a file, one per line, which keeps
+        # them out of the cookbook and the process list.
         llama_server_args: "--alias protected-model -c 4096 --api-key instance-secret-key"
 
   # ---------------------------------------------------------------------------

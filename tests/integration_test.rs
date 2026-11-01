@@ -834,7 +834,15 @@ http:
         .await
         .unwrap();
 
-    let cookbook_content = r#"
+    // `llama-server` also takes a comma-separated list of keys, and keys from
+    // a file, one per line, with blank lines and `#` comments skipped.
+    let key_dir = tempfile::tempdir().unwrap();
+    let key_file = key_dir.path().join("api-keys");
+    tokio::fs::write(&key_file, "# instance keys\n\nfilekey1\nfilekey2\n")
+        .await
+        .unwrap();
+    let cookbook_content = format!(
+        r#"
 models:
   - name: "auth-model"
     profiles:
@@ -844,7 +852,34 @@ models:
         startup_timeout_seconds: 5
         max_instances: 1
         llama_server_args: "--api-key mysecretkey"
-"#;
+  - name: "auth-list-model"
+    profiles:
+      - id: "default"
+        model_path: "./models/mock.gguf"
+        idle_timeout_seconds: 5
+        startup_timeout_seconds: 5
+        max_instances: 1
+        llama_server_args: "--kv-unified --api-key ,listkey1,listkey2"
+  - name: "auth-file-model"
+    profiles:
+      - id: "default"
+        model_path: "./models/mock.gguf"
+        idle_timeout_seconds: 5
+        startup_timeout_seconds: 5
+        max_instances: 1
+        llama_server_args: "--kv-unified --api-key-file '{}'"
+  - name: "auth-missing-file-model"
+    profiles:
+      - id: "default"
+        model_path: "./models/mock.gguf"
+        idle_timeout_seconds: 5
+        startup_timeout_seconds: 5
+        max_instances: 1
+        llama_server_args: "--api-key-file '{}'"
+"#,
+        key_file.display(),
+        key_dir.path().join("missing").display()
+    );
     tokio::fs::write(&cookbook_path, cookbook_content)
         .await
         .unwrap();
@@ -866,20 +901,49 @@ models:
     );
 
     let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "model": "auth-model:default",
-        "messages": [{"role": "user", "content": "Hello"}],
-        "stream": false
-    });
+    for model in ["auth-model", "auth-list-model", "auth-file-model"] {
+        let body = serde_json::json!({
+            "model": format!("{model}:default"),
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false
+        });
 
+        let resp = client
+            .post("http://127.0.0.1:9197/v1/chat/completions")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert_eq!(status, StatusCode::OK, "{model}: {text}");
+    }
+
+    // A key file that cannot be read fails the request at once, without
+    // starting an instance that could not be authenticated to.
+    let started = std::time::Instant::now();
     let resp = client
         .post("http://127.0.0.1:9197/v1/chat/completions")
-        .json(&body)
+        .json(&serde_json::json!({
+            "model": "auth-missing-file-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }))
         .send()
         .await
         .unwrap();
-
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let text = resp.text().await.unwrap_or_default();
+    assert!(text.contains("Invalid API key configuration"), "{text}");
+    assert!(
+        !text.contains("missing"),
+        "the path must not reach the client: {text}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
 
     // Clean up
     graceful_stop(&mut proxy_process).await;

@@ -1432,7 +1432,7 @@ pub async fn route_request(
 
                     // Send the key this instance was started with: after a
                     // cookbook reload, the profile this request resolved can
-                    // name a different `--api-key` than a running instance.
+                    // give a different key than a running instance has.
                     if let Some(api_key) = backend_api_key {
                         let value =
                             axum::http::HeaderValue::from_str(&format!("Bearer {api_key}"))

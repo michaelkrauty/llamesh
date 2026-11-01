@@ -613,16 +613,6 @@ fn build_local_upstream_client(read_timeout_ms: u64) -> reqwest::Result<reqwest:
     builder.build()
 }
 
-fn server_args_api_key(args: &[String]) -> Option<String> {
-    args.iter()
-        .position(|arg| arg == "--api-key")
-        .and_then(|idx| args.get(idx + 1).cloned())
-        .or_else(|| {
-            args.iter()
-                .find_map(|arg| arg.strip_prefix("--api-key=").map(|s| s.to_string()))
-        })
-}
-
 impl NodeState {
     pub async fn new(
         config: NodeConfig,
@@ -2705,9 +2695,34 @@ impl NodeState {
             // Retry loop for port allocation and spawn (handles TOCTOU race on ports)
             const MAX_SPAWN_RETRIES: usize = 3;
             let mut spawn_attempt = 0;
-            let (instance_id, port, inst_arc, is_cold_start, final_args) = loop {
+            let (instance_id, port, inst_arc, is_cold_start, backend_api_key) = loop {
                 spawn_attempt += 1;
                 let spawn_generation = self.build_manager.binary_generation();
+
+                // The key requests to the instance must carry, resolved right
+                // before the process starts and reads any `--api-key-file`
+                // itself. Reading the file can block, so it runs off the
+                // async workers.
+                let key_args = pre_args.clone();
+                let backend_api_key = match tokio::task::spawn_blocking(move || {
+                    crate::instance::backend_api_key(&key_args)
+                })
+                .await
+                {
+                    Ok(Ok(key)) => key,
+                    Ok(Err(e)) => {
+                        error!(
+                            model = %model_name,
+                            profile = %profile.id,
+                            error = %format!("{e:#}"),
+                            "Cannot start instance: its llama-server API key is unusable"
+                        );
+                        return Err(NodeError::Other(anyhow::anyhow!(
+                            "Invalid API key configuration for backend instance"
+                        )));
+                    }
+                    Err(e) => return Err(NodeError::Other(e.into())),
+                };
 
                 let instance_id = spawn_reservation.memory().id().to_string();
                 let port_overridden = port_override.is_some();
@@ -2769,7 +2784,7 @@ impl NodeState {
                 );
                 new_instance.memory_reservation = Some(spawn_reservation.memory());
                 new_instance.llama_cpp_version = llama_cpp_version;
-                new_instance.backend_api_key = profile.get_api_key();
+                new_instance.backend_api_key = backend_api_key.clone();
                 if reserve_slot {
                     // Claim the spawning request's slot before the instance
                     // is shared: once it is in the map, concurrent requests
@@ -2935,8 +2950,7 @@ impl NodeState {
                         // leaks the claimed slot on a mapped instance,
                         // permanently blocking idle eviction. update_peak_memory
                         // runs in the readiness task instead.
-                        // Success - break out of retry loop with args
-                        break (instance_id, port, inst_arc, is_cold_start, args);
+                        break (instance_id, port, inst_arc, is_cold_start, backend_api_key);
                     }
                     Err(e) => {
                         error!(
@@ -2972,7 +2986,7 @@ impl NodeState {
             let startup_timeout = profile.effective_startup_timeout_seconds();
             let eviction_tenure_secs =
                 profile.effective_min_eviction_tenure_secs(&self.config.model_defaults);
-            let api_key = server_args_api_key(&final_args);
+            let api_key = backend_api_key;
 
             let http_client = self.http_client.clone();
             let metrics = self.metrics.clone();
