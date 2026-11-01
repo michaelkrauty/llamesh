@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.53] - 2026-11-01
+
+### Fixed
+
+- Forward a request for a model's `default` profile spelled in another case, such as `model:DEFAULT`, to a peer that serves the model. Local model resolution ignores case, and so does matching a request against the models and profiles peers advertise, except that a peer advertises a `default` profile by the bare model name, and that match compared the profile name exactly. On a node without the model in its own cookbook, the request failed with `404` `model_not_found`.
+
 ## [1.21.52] - 2026-11-01
 
 ### Security

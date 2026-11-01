@@ -4308,11 +4308,15 @@ impl NodeState {
     }
 }
 
+/// Whether `peer` advertises `model_name:profile_id`. Like local model
+/// resolution, the match ignores case. A peer advertises a model's `default`
+/// profile by the bare model name.
 fn peer_supports_profile(peer: &PeerState, model_name: &str, profile_id: &str) -> bool {
     let requested = format!("{model_name}:{profile_id}");
     peer.supported_models.iter().any(|entry| {
         entry.eq_ignore_ascii_case(&requested)
-            || (entry.eq_ignore_ascii_case(model_name) && profile_id == "default")
+            || (entry.eq_ignore_ascii_case(model_name)
+                && profile_id.eq_ignore_ascii_case("default"))
     })
 }
 
@@ -4539,6 +4543,17 @@ mod tests {
     fn peer_matches_default_profile_with_base_name() {
         let peer = sample_peer(vec!["gpt"]);
         assert!(peer_supports_profile(&peer, "gpt", "default"));
+        assert!(!peer_supports_profile(&peer, "gpt", "quality"));
+    }
+
+    #[test]
+    fn peer_profile_match_ignores_case() {
+        // Local resolution accepts `GPT:DEFAULT` for the `default` profile, so
+        // a peer advertising it by the bare name must match too.
+        let peer = sample_peer(vec!["gpt", "gpt:fast"]);
+        assert!(peer_supports_profile(&peer, "GPT", "DEFAULT"));
+        assert!(peer_supports_profile(&peer, "gpt", "Default"));
+        assert!(peer_supports_profile(&peer, "Gpt", "FAST"));
         assert!(!peer_supports_profile(&peer, "gpt", "quality"));
     }
 
