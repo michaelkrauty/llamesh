@@ -956,6 +956,7 @@ impl Instance {
                         INSTANCES_CRASHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
                     warn!(
+                        event = "instance_exited",
                         instance_id = %self.id,
                         model = %self.model_name,
                         profile = %self.profile_id,

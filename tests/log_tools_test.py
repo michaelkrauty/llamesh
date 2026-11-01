@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import gzip
+import json
 import os
 import subprocess
 import tempfile
@@ -10,11 +11,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/log-tools/errors.sh"
+INSTANCES_SCRIPT = ROOT / "scripts/log-tools/instances.sh"
 DATE = "2026-01-02"
 LOG = f"proxy.log.{DATE}"
 
 
-class ErrorsScriptTest(unittest.TestCase):
+class LogScriptTestCase(unittest.TestCase):
+    """Runs a log-tools script against local and fake-SSH remote log files."""
+
+    script = SCRIPT
+    # Arguments after the node and date.
+    extra_args = ("2",)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -69,7 +77,7 @@ class ErrorsScriptTest(unittest.TestCase):
         if tz is not None:
             env["TZ"] = tz
         return subprocess.run(
-            ["bash", str(SCRIPT), node, date, "2"],
+            ["bash", str(self.script), node, date, *self.extra_args],
             env=env,
             text=True,
             capture_output=True,
@@ -77,6 +85,8 @@ class ErrorsScriptTest(unittest.TestCase):
             timeout=5,
         )
 
+
+class ErrorsScriptTest(LogScriptTestCase):
     def test_filters_warn_and_error_and_honors_limit(self):
         lines = [
             '{"timestamp":"2026-01-02T01:02:03.123Z","level":"INFO","target":"app","fields":{"message":"ignore"}}',
@@ -216,6 +226,137 @@ class ErrorsScriptTest(unittest.TestCase):
             self.skipTest("the UTC day changed during the test")
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("today", completed.stdout)
+
+
+def log_line(level, fields, span_model=None):
+    entry = {
+        "timestamp": "2026-01-02T01:02:03.123Z",
+        "level": level,
+        "target": "llamesh::node_state",
+        "fields": fields,
+    }
+    if span_model is not None:
+        entry["span"] = {"model": span_model, "name": "request"}
+    return json.dumps(entry)
+
+
+class InstancesScriptTest(LogScriptTestCase):
+    script = INSTANCES_SCRIPT
+    extra_args = ()
+
+    LIFECYCLE = "\n".join(
+        [
+            log_line("INFO", {"message": "Received request"}, "alpha"),
+            log_line(
+                "INFO",
+                {
+                    "message": "Started instance",
+                    "event": "instance_spawn",
+                    "model": "alpha",
+                    "profile": "default",
+                    "instance_id": "I1",
+                    "port": 8200,
+                    "reason": "demand",
+                },
+            ),
+            log_line(
+                "INFO",
+                {
+                    "message": "Instance ready",
+                    "event": "instance_ready",
+                    "model": "alpha",
+                    "profile": "default",
+                    "instance_id": "I1",
+                    "port": 8200,
+                    "startup_ms": 1500,
+                },
+            ),
+            log_line(
+                "INFO",
+                {
+                    "message": "Stopping instance",
+                    "event": "instance_terminate",
+                    "reason": "idle",
+                    "model": "alpha",
+                    "profile": "default",
+                    "instance_id": "I1",
+                    "freed_vram_mb": 900,
+                },
+            ),
+            log_line(
+                "ERROR",
+                {
+                    "message": "Failed to start new instance",
+                    "event": "instance_spawn_failed",
+                    "port": 8201,
+                    "error": "Failed to spawn llama-server",
+                },
+                "Beta:fast",
+            ),
+            log_line(
+                "WARN",
+                {
+                    "message": "Instance exited unexpectedly",
+                    "event": "instance_exited",
+                    "model": "beta",
+                    "profile": "fast",
+                    "instance_id": "I2",
+                    "exit_status": "signal: 9 (SIGKILL)",
+                },
+            ),
+        ]
+    )
+
+    def invoke_with(self, node="local", model=None, **options):
+        self.extra_args = () if model is None else (model,)
+        return self.invoke(node, **options)
+
+    def test_lists_every_instance_event_with_its_details(self):
+        completed = self.invoke_with(local_text=self.LIFECYCLE)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            completed.stdout,
+            "2026-01-02T01:02:03 instance_spawn (demand): model=alpha profile=default instance=I1 port=8200\n"
+            "2026-01-02T01:02:03 instance_ready: model=alpha profile=default instance=I1 port=8200 startup_ms=1500\n"
+            "2026-01-02T01:02:03 instance_terminate (idle): model=alpha profile=default instance=I1\n"
+            "2026-01-02T01:02:03 instance_spawn_failed: model=Beta:fast instance=? port=8201 (error: Failed to spawn llama-server)\n"
+            "2026-01-02T01:02:03 instance_exited: model=beta profile=fast instance=I2 exit_status=signal: 9 (SIGKILL)\n",
+        )
+
+    def test_filters_by_model_ignoring_case(self):
+        completed = self.invoke_with(model="BETA", local_text=self.LIFECYCLE)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertNotIn("alpha", completed.stdout)
+        self.assertIn("instance_spawn_failed: model=Beta:fast", completed.stdout)
+        self.assertIn("instance_exited: model=beta", completed.stdout)
+        # The filter is passed to jq as data, not spliced into the program.
+        completed = self.invoke_with(model='"', local_text=self.LIFECYCLE)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "")
+
+    def test_failures_are_visible_and_not_reported_as_empty(self):
+        cases = (
+            ("missing local log", "local", {}, "Log file not found"),
+            ("ssh failure", "remote", {"result": "fail"}, "simulated ssh failure"),
+            ("malformed JSON", "local", {"local_text": "not json"}, "parse error"),
+        )
+        for name, node, options, expected in cases:
+            with self.subTest(name=name):
+                completed = self.invoke_with(node, **options)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected, completed.stderr)
+                self.assertNotIn("(none)", completed.stdout)
+
+    def test_both_queries_each_node_and_fails_if_either_fails(self):
+        completed = self.invoke_with("both", result="fail", local_text=self.LIFECYCLE)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("instance_ready: model=alpha", completed.stdout)
+        self.assertIn("=== remote instances ===", completed.stdout)
+        self.assertIn("simulated ssh failure", completed.stderr)
+
+        completed = self.invoke_with("both", local_text=self.LIFECYCLE, remote_text=self.LIFECYCLE)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.count("instance_ready"), 2)
 
 
 if __name__ == "__main__":

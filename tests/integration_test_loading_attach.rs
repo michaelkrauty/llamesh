@@ -52,6 +52,17 @@ async fn count_events(log: &Path, key: &str, value: &str) -> usize {
         .count()
 }
 
+/// The logged `instance_ready` events.
+async fn ready_events(log: &Path) -> Vec<Value> {
+    tokio::fs::read_to_string(log)
+        .await
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["fields"]["event"] == "instance_ready")
+        .collect()
+}
+
 async fn wait_for_events(log: &Path, key: &str, value: &str, count: usize) {
     tokio::time::timeout(Duration::from_secs(15), async {
         while count_events(log, key, value).await < count {
@@ -255,6 +266,7 @@ async fn request_joining_a_loading_instance_does_not_block_the_node() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(!a.is_finished() && !b.is_finished());
+    assert_eq!(h.events("event", "instance_ready").await, 0);
 
     std::fs::write(&h.gate, []).unwrap();
     assert_ok(a).await;
@@ -264,6 +276,12 @@ async fn request_joining_a_loading_instance_does_not_block_the_node() {
         1,
         "both requests must be served by the one instance"
     );
+    // Readiness is logged once, with the load time, which spans the gated
+    // second and more this test held the instance unready.
+    let ready = ready_events(&h.output).await;
+    assert_eq!(ready.len(), 1, "{ready:?}");
+    let startup_ms = ready[0]["fields"]["startup_ms"].as_u64().unwrap();
+    assert!(startup_ms >= 1_000, "{ready:?}");
 }
 
 #[tokio::test]
@@ -316,5 +334,7 @@ async fn failed_load_is_handled_once_by_its_waiting_requests() {
         "only one request may run cold-start recovery for the failed load"
     );
     assert_eq!(h.events("event", "instance_spawn").await, 2);
+    assert_eq!(h.events("event", "instance_startup_failed").await, 1);
+    assert_eq!(h.events("event", "instance_ready").await, 1);
     drop(h.temp);
 }
