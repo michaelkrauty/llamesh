@@ -415,6 +415,46 @@ fn parse_csv_row(input: &str) -> Vec<String> {
     fields
 }
 
+/// `llama-server` options whose value is a secret: API keys and the Hugging
+/// Face access token.
+const SECRET_VALUE_OPTIONS: [&str; 3] = ["--api-key", "--hf-token", "-hft"];
+
+/// Placeholder logged in place of a secret option value.
+const REDACTED: &str = "<redacted>";
+
+/// `args` with the value of every option in [`SECRET_VALUE_OPTIONS`] replaced
+/// by [`REDACTED`], for logging. Both the `--option value` and the
+/// `--option=value` forms are covered, and like llama.cpp, a long option's
+/// name may spell `-` as `_`.
+fn redact_secret_args(args: &[String]) -> Vec<String> {
+    let is_secret_option = |name: &str| {
+        let name = if name.starts_with("--") {
+            name.replace('_', "-")
+        } else {
+            name.to_string()
+        };
+        SECRET_VALUE_OPTIONS.contains(&name.as_str())
+    };
+    let mut redacted = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if std::mem::take(&mut redact_next) {
+            redacted.push(REDACTED.to_string());
+        } else if is_secret_option(arg) {
+            redacted.push(arg.clone());
+            redact_next = true;
+        } else {
+            match arg.split_once('=') {
+                Some((name, _)) if is_secret_option(name) => {
+                    redacted.push(format!("{name}={REDACTED}"));
+                }
+                _ => redacted.push(arg.clone()),
+            }
+        }
+    }
+    redacted
+}
+
 /// Per-probe timeout for a single readiness health check (see [`probe_ready`]).
 /// Short enough that the readiness loop keeps its polling cadence and respects
 /// the overall startup timeout even when a probe stalls, yet generous enough to
@@ -643,7 +683,11 @@ impl Instance {
     pub fn spawn(&self, binary_path: &str, args: &[String]) -> Result<()> {
         info!(
             "Spawning instance {} for {} on {}:{} with args: {:?}",
-            self.id, self.model_name, self.host, self.port, args
+            self.id,
+            self.model_name,
+            self.host,
+            self.port,
+            redact_secret_args(args)
         );
 
         let mut cmd = Command::new(binary_path);
@@ -962,6 +1006,66 @@ mod tests {
             "{:#}",
             backend_api_key_with_env(&strings(args), |_| None).unwrap_err()
         )
+    }
+
+    #[test]
+    fn redact_secret_args_hides_keys_and_tokens() {
+        let args = strings(&[
+            "--api-key",
+            "k1,k2",
+            "-hft",
+            "hf_abc",
+            "--hf_token",
+            "hf_def",
+            "--api-key=inline",
+            "--api-key-file",
+            "/etc/keys",
+            "-c",
+            "4096",
+        ]);
+        assert_eq!(
+            redact_secret_args(&args),
+            strings(&[
+                "--api-key",
+                REDACTED,
+                "-hft",
+                REDACTED,
+                "--hf_token",
+                REDACTED,
+                "--api-key=<redacted>",
+                "--api-key-file",
+                "/etc/keys",
+                "-c",
+                "4096",
+            ])
+        );
+        // A secret option at the end, with no value, is kept as is.
+        assert_eq!(
+            redact_secret_args(&strings(&["-c", "0", "--api-key"])),
+            strings(&["-c", "0", "--api-key"])
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_log_leaves_out_secret_values() {
+        let capture = crate::test_support::capture_logs(tracing::Level::INFO);
+        let instance = Instance::new(
+            "redact-id".to_string(),
+            "redact-model".to_string(),
+            "default".to_string(),
+            "127.0.0.1".to_string(),
+            8080,
+            "abc123".to_string(),
+            false,
+        );
+        let args = strings(&["--api-key", "backend-secret", "-hft", "hf_secret_token"]);
+        instance.spawn("true", &args).unwrap();
+        let _ = instance.stop().await;
+
+        let logs = capture.contents();
+        assert!(logs.contains("Spawning instance redact-id"), "{logs}");
+        assert!(!logs.contains("backend-secret"), "{logs}");
+        assert!(!logs.contains("hf_secret_token"), "{logs}");
     }
 
     #[test]

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.52] - 2026-11-01
+
+### Security
+
+- Leave secret values out of the `Spawning instance` log line, which records an instance's full `llama-server` arguments at `info` level, so a backend API key or Hugging Face access token given in a profile's `llama_server_args` was written to the proxy's logs. The values of `--api-key` and `--hf-token` (`-hft`) are now logged as `<redacted>`.
+
 ## [1.21.51] - 2026-11-01
 
 ### Fixed
