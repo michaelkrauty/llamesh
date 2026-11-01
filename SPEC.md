@@ -1462,6 +1462,7 @@ See **Cluster / Mesh Design > Security** above for Noise Protocol and mTLS detai
 ### Configuration Safety
 
 * Backend API keys may be given to an instance in cookbook `llama_server_args` in the forms `llama-server` accepts: `--api-key` (or `--api-key=...`) with one key or a comma-separated list of keys, or `--api-key-file` naming a file with one key per line (blank lines and lines starting with `#` are skipped). The proxy sends one of the instance's keys as Bearer authorization on every request it forwards to the instance: the first key of the last `--api-key` or `--api-key-file` argument that has one or, when no argument does, a key the instance inherits from the proxy's environment through `LLAMA_API_KEY` or `LLAMA_ARG_API_KEY_FILE`. Keys in llama.cpp's own `config.ini` files are not read. A key file is read when the instance starts, as `llama-server` reads it, so a running instance keeps the key it started with. If a key file cannot be read, or the key cannot be sent in an HTTP header, as with a key file saved with Windows line endings (`llama-server` keeps the `\r` as part of the key), the instance is not started and the request fails with `500`.
+* The proxy logs each instance's `llama-server` arguments when it starts the instance, with the values of `--api-key` and `--hf-token` (`-hft`) replaced by `<redacted>`. `--api-key-file` keeps keys out of the cookbook and out of the process's command line, which other local users can read.
 * Sensitive values provided via:
 
   * Separate `secrets.yaml` with restricted permissions.
