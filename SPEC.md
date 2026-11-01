@@ -1459,6 +1459,7 @@ The other scripts share those requirements, environment variables, and failure h
 * `scripts/log-tools/trace-request.sh <id> [YYYY-MM-DD] [local|remote|both]` prints the entries logged for a request or session ID on each node (default: both), and `(no matches)` on stderr for a node whose log has none. The ID is matched exactly, as data.
 * `scripts/log-tools/cluster-health.sh [local|remote|both] [YYYY-MM-DD]` prints gossip, circuit breaker, peer discovery, and Noise events, the last 30 per node for both (the default) or the last 50 for one.
 * `scripts/log-tools/recent.sh [local|remote] [lines] [level]` prints the last entries (default: 20) of the current UTC day's log on one node (default: local), optionally only those at a level (`TRACE`, `DEBUG`, `INFO`, `WARN`, or `ERROR`, in any case).
+* `scripts/log-tools/fetch-logs.sh [local|remote|both] [YYYY-MM-DD]` prints a node's raw log for a UTC day (default: local, the current day); the other scripts read logs through it. For both nodes it prints each log it can read, and fails if either cannot be read.
 
 A successful query with no matching entries exits zero. Fetch or JSON parsing failures produce stderr diagnostics and a nonzero exit status. In `both` mode, both nodes are queried even if the first fails; failure on either node makes the overall command fail. Output may be partial when a query fails.
 

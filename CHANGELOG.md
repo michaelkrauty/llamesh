@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.4] - 2026-11-01
+
+### Fixed
+
+- Report a log that cannot be read from `scripts/log-tools/fetch-logs.sh both`. It noted a missing log file, an SSH failure, or an unset `LLAMESH_REMOTE_HOST` on stderr but exited `0`, unlike its `local` and `remote` modes and the other log scripts. It still prints the log it can read, then exits nonzero.
+
 ## [1.22.3] - 2026-11-01
 
 ### Fixed

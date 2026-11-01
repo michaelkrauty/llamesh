@@ -15,6 +15,7 @@ INSTANCES_SCRIPT = ROOT / "scripts/log-tools/instances.sh"
 TRACE_SCRIPT = ROOT / "scripts/log-tools/trace-request.sh"
 CLUSTER_SCRIPT = ROOT / "scripts/log-tools/cluster-health.sh"
 RECENT_SCRIPT = ROOT / "scripts/log-tools/recent.sh"
+FETCH_SCRIPT = ROOT / "scripts/log-tools/fetch-logs.sh"
 DATE = "2026-01-02"
 LOG = f"proxy.log.{DATE}"
 
@@ -604,6 +605,34 @@ class RecentScriptTest(LogScriptTestCase):
             with self.subTest(name=name):
                 completed = self.invoke(node, **options)
                 self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected, completed.stderr)
+
+
+class FetchLogsScriptTest(LogScriptTestCase):
+    script = FETCH_SCRIPT
+    extra_args = ()
+
+    LOCAL = entry({"message": "local line"})
+    REMOTE = entry({"message": "remote line"})
+
+    def test_both_prints_both_logs(self):
+        completed = self.invoke("both", local_text=self.LOCAL, remote_text=self.REMOTE)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("local line", completed.stdout)
+        self.assertIn("remote line", completed.stdout)
+
+    def test_both_fails_when_a_log_cannot_be_read(self):
+        cases = (
+            ("missing local log", {"remote_text": self.REMOTE}, "remote line", "Log file not found:"),
+            ("missing remote log", {"local_text": self.LOCAL, "result": "missing"}, "local line", "Log file not found on"),
+            ("ssh failure", {"local_text": self.LOCAL, "result": "fail"}, "local line", "simulated ssh failure"),
+            ("remote host absent", {"local_text": self.LOCAL, "host": ""}, "local line", "Set LLAMESH_REMOTE_HOST"),
+        )
+        for name, options, printed, expected in cases:
+            with self.subTest(name=name):
+                completed = self.invoke("both", **options)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(printed, completed.stdout)
                 self.assertIn(expected, completed.stderr)
 
 
