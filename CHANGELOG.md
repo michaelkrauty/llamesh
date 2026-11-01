@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.5] - 2026-11-01
+
+### Fixed
+
+- Set `KillMode=mixed` in the systemd unit `deploy/llamesh.service`, so that stopping or restarting the service lets in-flight requests to local instances finish. With systemd's default `KillMode=control-group`, the stop signal went to every process of the service at once: the `llama-server` instances shut down while the proxy was still draining, so a streaming response was cut off without its final event and a non-streaming request stalled until the client gave up. Now only the proxy receives the signal; it drains, then stops its instances itself, and systemd kills any process left when the proxy exits, including after a second signal and a llama.cpp build that was running when the service stopped. Existing installations pick this up by rerunning `deploy/install.sh` and reloading systemd. SPEC.md describes the requirement.
+
 ## [1.22.4] - 2026-11-01
 
 ### Fixed
