@@ -894,6 +894,30 @@ impl NodeState {
         })
     }
 
+    /// Whether some peer could take a forwarded request now: one that is not
+    /// stale, is ready, is not blocked by its circuit breaker, and advertises
+    /// at least one model, as [`Self::find_peer_for_model`] requires.
+    pub async fn has_forwarding_target(&self) -> bool {
+        let peers = self.peers.read().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let timeout = self
+            .config
+            .cluster
+            .gossip_interval_seconds
+            .saturating_mul(3)
+            .max(15);
+        peers.values().any(|peer| {
+            peer.node_id != self.config.node_id
+                && now.saturating_sub(peer.last_seen) <= timeout
+                && peer.ready
+                && !peer.supported_models.is_empty()
+                && self.circuit_breaker.should_allow_sync(&peer.node_id)
+        })
+    }
+
     /// Find a peer that supports a model (case-insensitive).
     /// Used when local cookbook doesn't have the model but a peer might.
     /// Returns the PeerState of the best candidate peer, if any.

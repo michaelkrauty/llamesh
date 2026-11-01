@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.54] - 2026-11-01
+
+### Fixed
+
+- Report a forwarding-only node, a cluster member with an empty cookbook as the example configuration describes, as healthy and ready. `/healthz` and `/readyz` required at least one local model and a `llama-server` binary, so such a node always answered `503`, and a load balancer or orchestrator probing it would keep it out of rotation or restart it, although it routes every request to its peers and never starts an instance. `/healthz` now passes without models or a binary. `/readyz` passes, reporting `can_spawn: false`, while the node is not draining and has a peer it could forward a request to: one that is not stale, is ready, is not blocked by its circuit breaker, and advertises at least one model. A standalone node with an empty cookbook still fails both.
+
 ## [1.21.53] - 2026-11-01
 
 ### Fixed

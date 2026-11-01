@@ -35,7 +35,9 @@ max_sysmem_mb: 64000  # ~62.5 GiB
 
 # Maximum number of llama-server instances this node can run (default: 100)
 # Must be at least 1: a zero cap means the node can never spawn an instance. A
-# forwarding-only node keeps an empty cookbook and leaves this at its default.
+# forwarding-only node keeps an empty cookbook and leaves this at its default;
+# with cluster.enabled, such a node passes /healthz without a llama-server
+# binary, and /readyz while it has a peer to forward requests to.
 max_instances_per_node: 100
 
 # -----------------------------------------------------------------------------

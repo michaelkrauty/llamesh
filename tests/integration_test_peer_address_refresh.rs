@@ -318,6 +318,18 @@ async fn relocation(noise: bool, loopback: bool) {
         initial.is_ok(),
         "initial inference through A must reach B: {initial:?}"
     );
+    // A has an empty cookbook: a forwarding-only node is ready while it has a
+    // peer to forward to.
+    let ready = client
+        .get(format!("http://{address}:{A_PORT}/readyz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        ready.json::<Value>().await.unwrap(),
+        json!({"status": "ready", "can_spawn": false})
+    );
     let key = noise.then(|| fs::read(directory.join("node-b-noise/node.key")).unwrap());
     b.stop().await;
     let mut b_new = Node::start(&directory, "node-b", NEW_PORT, noise, &token, loopback);
