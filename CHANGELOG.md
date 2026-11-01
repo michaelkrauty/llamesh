@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.3] - 2026-11-01
+
+### Fixed
+
+- Warn when a profile's `model_path`, `hf_repo`, or `hf_file` is ignored because its `llama_server_args` set the model source with `-m`/`--model` or `-hf`/`-hfr`/`--hf-repo`. The arguments take precedence, and the fields were dropped without notice: an `hf_file` next to `-hf` in the arguments, for example, had no effect, so `llama-server` loaded the repository's default file instead. Loading or reloading the cookbook now logs a warning naming the ignored fields of each enabled profile, and SPEC.md states the precedence.
+
 ## [1.22.2] - 2026-11-01
 
 ### Fixed

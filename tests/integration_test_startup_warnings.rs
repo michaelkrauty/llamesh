@@ -47,8 +47,8 @@ http:
   idle_timeout_seconds: 60
 "#
     );
-    // hf_file without a Hugging Face repository is ignored, which validation
-    // reports with a warning.
+    // Validation warns about an hf_file without a Hugging Face repository,
+    // and about profile fields that a model source in the args overrides.
     let cookbook = r#"
 models:
   - name: "warned-model"
@@ -57,6 +57,9 @@ models:
         model_path: "./model.gguf"
         hf_file: "model-q4_k_m.gguf"
         llama_server_args: ""
+      - id: "overridden"
+        model_path: "./model.gguf"
+        llama_server_args: "-m ./other.gguf"
 "#;
     std::fs::write(dir.path().join("config.yaml"), config).unwrap();
     std::fs::write(dir.path().join("cookbook.yaml"), cookbook).unwrap();
@@ -93,17 +96,22 @@ models:
 
     let log = std::fs::read_to_string(&output_path).unwrap();
     assert!(up, "proxy did not start: {log}");
-    let warning = log
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|entry| {
-            entry["level"] == "WARN"
-                && entry["fields"]["message"]
-                    .as_str()
-                    .is_some_and(|message| message.contains("'hf_file' will be ignored"))
-        });
+    let warned = |text: &str| {
+        log.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|entry| {
+                entry["level"] == "WARN"
+                    && entry["fields"]["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains(text))
+            })
+    };
     assert!(
-        warning.is_some(),
+        warned("'hf_file' will be ignored"),
+        "startup warning missing from the log: {log}"
+    );
+    assert!(
+        warned("Profile warned-model:overridden sets its model source in llama_server_args"),
         "startup warning missing from the log: {log}"
     );
 }
