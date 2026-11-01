@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.1] - 2026-11-01
+
+### Fixed
+
+- Report failed log queries in `scripts/log-tools/trace-request.sh`, `cluster-health.sh`, and `recent.sh`, as `errors.sh` and `instances.sh` already do. They discarded the error from fetching a log, so a missing log file, an SSH failure, a malformed log line, or an unset `LLAMESH_REMOTE_HOST` produced misleading output: `trace-request.sh` printed `(no matches)`, which it printed only on such failures and never when a log simply had no entry for the ID; `cluster-health.sh` printed `(none)` and exited `0`; and `recent.sh` printed nothing. Each now writes the failure to stderr and exits nonzero, after querying the other node when both are requested. `trace-request.sh` prints `(no matches)` on stderr when a node's log has no entry for the ID, and takes an optional node argument (`local`, `remote`, or `both`, the default).
+- Pass the request or session ID in `trace-request.sh` and the level in `recent.sh` to `jq` as data. Both were spliced into the filter program, so a caller-supplied request ID containing a quote broke the query. `recent.sh` now matches the level in any case. It also rejects a node other than `local` or `remote`: `both` printed the end of the two logs run together, and could not report that one of them was missing.
+- Include Noise handshake events in `cluster-health.sh`, and show the `error` field there and in `trace-request.sh`'s output, as `errors.sh` does.
+
 ## [1.22.0] - 2026-11-01
 
 ### Added
