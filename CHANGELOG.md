@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.2] - 2026-11-01
+
+### Fixed
+
+- Log the warnings that validating the configuration and the cookbook emits at startup. Startup validated both before it initialized logging, and an event logged while no subscriber is installed is discarded, so these warnings never appeared at startup: the notice that `cluster_tls` is deprecated while Noise is enabled was never shown at all, and cookbook warnings, such as the one for an `hf_file` that is ignored, appeared only when a cookbook reload validated again. Startup now validates the configuration and the cookbook again once logging is initialized, so their warnings are recorded. Validation still runs first, so an invalid configuration exits before logging prepares the log directory and files.
+
 ## [1.22.1] - 2026-11-01
 
 ### Fixed
