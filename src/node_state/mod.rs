@@ -3032,14 +3032,32 @@ impl NodeState {
                 let ready =
                     Instance::wait_for_ready(&inst_clone, startup_timeout, api_key, &http_client)
                         .await;
+                if ready.is_err() {
+                    // A process that exited can still have its last lines in
+                    // its pipes: let the readers collect them, so the failure
+                    // report below can name the server's reason.
+                    let (readers, exited) = {
+                        let inst = inst_clone.read().await;
+                        (inst.output_readers.clone(), inst.get_pid().is_none())
+                    };
+                    if exited {
+                        readers.drained(Duration::from_secs(1)).await;
+                    }
+                }
                 let inst = inst_clone.read().await;
                 if let Err(e) = ready {
+                    // Name the server's own reason, which otherwise appears
+                    // only among its startup output.
+                    let error = match inst.startup_failure_reason() {
+                        Some(reason) => format!("{e}; llama-server reported: {reason}"),
+                        None => e.to_string(),
+                    };
                     error!(
                         event = "instance_startup_failed",
                         instance_id = %inst.id,
                         model = %inst.model_name,
                         profile = %inst.profile_id,
-                        error = %e,
+                        error = %error,
                         "Instance failed to become ready"
                     );
                     inst.clear_startup_log();

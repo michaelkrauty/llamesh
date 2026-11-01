@@ -139,6 +139,92 @@ static N_CTX_TRAIN_CAP_REGEX: LazyLock<Regex> =
 /// Prevents unbounded memory growth if an instance floods stdout before becoming ready.
 const MAX_STARTUP_LOG_LINES: usize = 10_000;
 
+/// Most `llama-server` error lines a startup failure report includes.
+const MAX_STARTUP_ERROR_LINES: usize = 5;
+
+/// An error-level line in `llama-server`'s log, which llama.cpp marks with an
+/// `E` after the timestamp: `0.00.448.659 E srv    load_model: failed to load
+/// model`. Captures the message.
+static ERROR_LINE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:\d+(?:\.\d+)+\s+)?E\s+(\S.*)$").unwrap());
+
+/// An ANSI color sequence, which llama.cpp writes around the timestamp and
+/// level when a profile turns log colors on.
+static ANSI_COLOR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
+
+/// What a `llama-server` startup log says about why the server failed: its
+/// first error-level messages (the cause tends to come first, followed by its
+/// consequences), joined with `; `, with color codes removed and runs of
+/// whitespace collapsed. When the log has no error-level line, as with an
+/// older or differently configured llama.cpp, its last non-empty line stands
+/// in if `last_line_fallback` is set; that suits a server that exited, whose
+/// last words explain it, but not one that is still loading. `None` when
+/// there is nothing to report.
+fn startup_error_lines(lines: &[String], last_line_fallback: bool) -> Option<String> {
+    let clean = |line: &str| {
+        ANSI_COLOR_REGEX
+            .replace_all(line, "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let errors: Vec<String> = lines
+        .iter()
+        .map(|line| clean(line))
+        .filter_map(|line| ERROR_LINE_REGEX.captures(&line).map(|c| c[1].to_string()))
+        .take(MAX_STARTUP_ERROR_LINES)
+        .collect();
+    if !errors.is_empty() {
+        return Some(errors.join("; "));
+    }
+    if !last_line_fallback {
+        return None;
+    }
+    lines
+        .iter()
+        .rev()
+        .map(|line| clean(line))
+        .find(|line| !line.is_empty())
+}
+
+/// Tracks an instance's stdout and stderr readers, so that a startup failure
+/// can be reported once they have collected everything the process wrote: an
+/// exit can be noticed while its last lines are still in the pipes.
+#[derive(Debug, Default)]
+pub struct OutputReaders {
+    open: AtomicUsize,
+    closed: Notify,
+}
+
+impl OutputReaders {
+    fn opened(&self) {
+        self.open.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn closed(&self) {
+        self.open.fetch_sub(1, Ordering::SeqCst);
+        self.closed.notify_waiters();
+    }
+
+    /// Wait until every reader has reached the end of its stream, for at most
+    /// `limit`. Returns whether they all did.
+    pub async fn drained(&self, limit: Duration) -> bool {
+        tokio::time::timeout(limit, async {
+            loop {
+                let notified = self.closed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.open.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
 /// Parse llama-server startup log lines to extract model parameters.
 pub fn parse_llama_server_log(lines: &[String]) -> ParsedModelParams {
     let mut params = ParsedModelParams::default();
@@ -506,6 +592,8 @@ pub struct Instance {
     pub args_hash: String,
     /// Buffered startup log lines for parsing model parameters.
     pub startup_log: Arc<Mutex<Vec<String>>>,
+    /// The readers that copy the process's output into `startup_log`.
+    pub output_readers: Arc<OutputReaders>,
     /// Parsed model parameters from startup log (populated after ready).
     pub parsed_params: Mutex<Option<ParsedModelParams>>,
     /// Whether this is a cold start (no learned memory data for this args_hash).
@@ -655,6 +743,7 @@ impl Instance {
             ready_signal: Arc::new(Notify::new()),
             args_hash,
             startup_log: Arc::new(Mutex::new(Vec::new())),
+            output_readers: Arc::new(OutputReaders::default()),
             parsed_params: Mutex::new(None),
             is_cold_start,
             draining: AtomicBool::new(false),
@@ -722,6 +811,8 @@ impl Instance {
         if let Some(stdout) = child.stdout.take() {
             let id = self.id.clone();
             let startup_log = self.startup_log.clone();
+            let readers = self.output_readers.clone();
+            readers.opened();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
@@ -731,12 +822,15 @@ impl Instance {
                         log.push(line);
                     }
                 }
+                readers.closed();
             });
         }
 
         if let Some(stderr) = child.stderr.take() {
             let id = self.id.clone();
             let startup_log = self.startup_log.clone();
+            let readers = self.output_readers.clone();
+            readers.opened();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
@@ -746,6 +840,7 @@ impl Instance {
                         log.push(line);
                     }
                 }
+                readers.closed();
             });
         }
 
@@ -792,6 +887,15 @@ impl Instance {
                 lines.len()
             );
         }
+    }
+
+    /// The error messages `llama-server` logged while starting, for reporting
+    /// why the instance failed to become ready (see [`startup_error_lines`]).
+    /// For a process that has exited, its last line stands in when it logged
+    /// no error; for one that is still running, only errors are reported.
+    pub fn startup_failure_reason(&self) -> Option<String> {
+        let exited = self.get_pid().is_none();
+        startup_error_lines(&self.startup_log.lock(), exited)
     }
 
     /// Clear the startup log buffer to free memory.
@@ -1067,6 +1171,98 @@ mod tests {
         assert!(logs.contains("Spawning instance redact-id"), "{logs}");
         assert!(!logs.contains("backend-secret"), "{logs}");
         assert!(!logs.contains("hf_secret_token"), "{logs}");
+    }
+
+    #[test]
+    fn startup_error_lines_report_the_servers_errors() {
+        // A startup that failed on a Hugging Face repository without GGUF files.
+        let log = strings(&[
+            "0.00.001.331 I srv  llama_server: initializing ...",
+            "0.00.448.659 E common_download_get_hf_plan: no GGUF files found in repository org/model",
+            "0.00.448.667 I Available GGUF files:",
+            "0.00.449.049 W srv  server_setup: security: no API key is set",
+            "0.00.450.934 E llama_model_load_from_file_impl: exactly one out metadata, path_model, and file must be defined",
+            "0.00.450.936 E cmn  common_init_: failed to load model ''",
+            "0.00.450.938 E srv    load_model: failed to load model, ''",
+            "0.00.450.938 I srv    operator(): operator(): cleaning up before exit...",
+            "0.00.457.379 E srv  server_run_i: exiting due to model loading error",
+        ]);
+        assert_eq!(
+            startup_error_lines(&log, true).as_deref(),
+            Some(
+                "common_download_get_hf_plan: no GGUF files found in repository org/model; \
+                 llama_model_load_from_file_impl: exactly one out metadata, path_model, and file must be defined; \
+                 cmn common_init_: failed to load model ''; \
+                 srv load_model: failed to load model, ''; \
+                 srv server_run_i: exiting due to model loading error"
+            )
+        );
+
+        // At most the first MAX_STARTUP_ERROR_LINES errors.
+        let many: Vec<String> = (0..8)
+            .map(|i| format!("0.00.000.00{i} E error {i}"))
+            .collect();
+        assert_eq!(
+            startup_error_lines(&many, true).as_deref(),
+            Some("error 0; error 1; error 2; error 3; error 4")
+        );
+
+        // Color codes, which a profile can turn on with --log-colors, are removed.
+        let colored = strings(&["\x1b[34m0.00.450.938 \x1b[31mE srv    load_model: failed\x1b[0m"]);
+        assert_eq!(
+            startup_error_lines(&colored, true).as_deref(),
+            Some("srv load_model: failed")
+        );
+
+        // Without error-level lines, the last line logged stands in...
+        let unleveled = strings(&["loading", "error: unknown argument: --bogus", ""]);
+        assert_eq!(
+            startup_error_lines(&unleveled, true).as_deref(),
+            Some("error: unknown argument: --bogus")
+        );
+        // ...but not for a server that is still loading, whose last line is
+        // just progress.
+        assert_eq!(startup_error_lines(&unleveled, false), None);
+        // An "E" inside a message is not a level.
+        assert_eq!(
+            startup_error_lines(&strings(&["0.00.001.000 I E is a letter", "done"]), true)
+                .as_deref(),
+            Some("done")
+        );
+        assert_eq!(startup_error_lines(&[], true), None);
+    }
+
+    #[tokio::test]
+    async fn startup_failure_reason_waits_for_the_exited_process_output() {
+        // The process writes its error and exits at once, as a server that
+        // cannot open its model does. It exits with status 0 so the
+        // process-wide crash counter, which crash_counter_classifies_exits
+        // owns, is left alone.
+        let instance = Instance::new(
+            "fail-id".to_string(),
+            "fail-model".to_string(),
+            "default".to_string(),
+            "127.0.0.1".to_string(),
+            8080,
+            "abc123".to_string(),
+            false,
+        );
+        let script =
+            "printf '0.00.000.001 I loading\\n0.00.000.002 E load_model: no such file\\n' >&2; exit 0";
+        instance.spawn("sh", &strings(&["-c", script])).unwrap();
+        while instance.is_alive() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            instance
+                .output_readers
+                .drained(Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(
+            instance.startup_failure_reason().as_deref(),
+            Some("load_model: no such file")
+        );
     }
 
     #[test]

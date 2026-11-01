@@ -1426,7 +1426,7 @@ Examples of log events:
 
   * `event="instance_spawn"`, `model`, `profile`, `instance_id`, `port`, `reason` (`"demand"`, `"prewarm"`).
   * `event="instance_ready"`, `model`, `profile`, `instance_id`, `port`, `startup_ms` - The instance passed its readiness check; `startup_ms` is the time since it was started.
-  * `event="instance_startup_failed"`, `model`, `profile`, `instance_id`, `error` - The instance exited or timed out before it became ready.
+  * `event="instance_startup_failed"`, `model`, `profile`, `instance_id`, `error` - The instance exited or timed out before it became ready. `error` ends with the first error-level messages `llama-server` logged while starting, such as a model file it could not open; for a process that exited without logging an error, its last line stands in.
   * `event="instance_exited"`, `model`, `profile`, `instance_id`, `exit_status` - The process exited, with any status, while the proxy still considered it running, as after a crash or a signal from outside the proxy (including the stop signal a service manager sends to the whole service on shutdown). `exit_status` tells these apart; only a non-zero exit or a signal other than `SIGTERM` counts in `proxy_instances_crashed_total`.
   * `event="instance_spawn_failed"`, `model`, `profile`, `error` - The process could not be started, or its API key configuration is unusable. `instance_spawn_retry` follows when the start is retried on another port.
   * `event="instance_terminate"`, `instance_id`, `model`, `profile`, `reason` (`"idle"`, `"capacity"`, `"drained"`, `"wedged"`, `"manual"`, `"error"`, `"cold_oom_stage1"`, `"cold_oom_stage2"`), memory stats (`freed_vram_mb`, `freed_sysmem_mb`).

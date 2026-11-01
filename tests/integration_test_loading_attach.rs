@@ -335,6 +335,21 @@ async fn failed_load_is_handled_once_by_its_waiting_requests() {
     );
     assert_eq!(h.events("event", "instance_spawn").await, 2);
     assert_eq!(h.events("event", "instance_startup_failed").await, 1);
+    // The failure names the reason the server logged.
+    let failure = tokio::fs::read_to_string(&h.output)
+        .await
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["fields"]["event"] == "instance_startup_failed")
+        .unwrap();
+    assert!(
+        failure["fields"]["error"]
+            .as_str()
+            .unwrap()
+            .ends_with("llama-server reported: srv load_model: failed to load model (mock)"),
+        "{failure}"
+    );
     assert_eq!(h.events("event", "instance_ready").await, 1);
     drop(h.temp);
 }
