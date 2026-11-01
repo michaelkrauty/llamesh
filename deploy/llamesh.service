@@ -10,6 +10,11 @@ ExecStart=%REPO_PATH%/target/release/llamesh
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
+# Signal only llamesh, which drains in-flight requests and then stops its
+# llama-server instances itself. The default KillMode=control-group signals
+# every process of the service at once, so instances stop mid-request. Any
+# process left when llamesh exits is still stopped by systemd.
+KillMode=mixed
 TimeoutStopSec=3600
 StandardOutput=journal
 StandardError=journal

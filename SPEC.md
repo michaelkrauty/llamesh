@@ -526,7 +526,7 @@ All file locations are configurable, but the defaults are self-contained:
 * You can override these with CLI flags such as `--config PATH`, `--cookbook PATH`, `--secrets PATH`, and with config options like `llama_cpp.repo_path`, `metrics_path`, and `logging.directory`.
 * Paths such as `llama_cpp.repo_path`, `llama_cpp.build_path`, `llama_cpp.binary_path`, TLS cert/key paths, metrics file path, and log directory are resolved relative to the working directory when relative, and may be set to absolute paths for more advanced deployments.
 
-Recommended to run as a systemd service or under a supervisor.
+Recommended to run as a systemd service or under a supervisor. `deploy/install.sh` installs `deploy/llamesh.service` as a systemd user unit. The unit sets `KillMode=mixed`, so that stopping or restarting the service signals only the proxy, which drains (see **Graceful Shutdown**); a supervisor that signals every process of the service at once, as systemd does with its default `KillMode=control-group`, stops the `llama-server` instances mid-request.
 
 ---
 
@@ -1399,7 +1399,9 @@ cluster:
 
 * On a second signal (SIGTERM or Ctrl-C):
 
-  * Exit immediately (`process::exit(0)`) without stopping instances. A supervisor that stops every process of the service, such as systemd with its default `KillMode=control-group`, stops the `llama-server` processes; otherwise they keep running.
+  * Exit immediately (`process::exit(0)`) without stopping instances. A supervisor that stops the processes remaining when the service exits, such as systemd with `KillMode=mixed` (as in `deploy/llamesh.service`), stops the `llama-server` processes; otherwise they keep running.
+
+* The drain covers requests to local instances only while those instances keep running. A supervisor must therefore deliver the first signal to the proxy alone: systemd's default `KillMode=control-group` also signals every `llama-server` instance, which then stops mid-request, so in-flight local requests are cut off (a stream ends without its final event) instead of draining. Under `KillMode=mixed`, processes other than the proxy, including a llama.cpp build that is running when the service stops, keep running until the proxy exits, and systemd then kills them.
 
 ---
 
