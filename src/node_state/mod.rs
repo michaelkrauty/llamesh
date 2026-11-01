@@ -2736,6 +2736,7 @@ impl NodeState {
                     Ok(Ok(key)) => key,
                     Ok(Err(e)) => {
                         error!(
+                            event = "instance_spawn_failed",
                             model = %model_name,
                             profile = %profile.id,
                             error = %format!("{e:#}"),
@@ -2979,10 +2980,12 @@ impl NodeState {
                     Err(e) => {
                         error!(
                             event = "instance_spawn_failed",
+                            model = %model_name,
+                            profile = %profile.id,
                             attempt = spawn_attempt,
                             max_attempts = MAX_SPAWN_RETRIES,
                             port = port,
-                            error = %e,
+                            error = %format!("{e:#}"),
                             "Failed to start new instance"
                         );
 
@@ -2997,6 +3000,8 @@ impl NodeState {
                         // Otherwise retry with a new port
                         warn!(
                             event = "instance_spawn_retry",
+                            model = %model_name,
+                            profile = %profile.id,
                             attempt = spawn_attempt + 1,
                             "Retrying instance spawn with new port"
                         );
@@ -3029,7 +3034,14 @@ impl NodeState {
                         .await;
                 let inst = inst_clone.read().await;
                 if let Err(e) = ready {
-                    error!("Instance {} failed to become ready: {}", inst.id, e);
+                    error!(
+                        event = "instance_startup_failed",
+                        instance_id = %inst.id,
+                        model = %inst.model_name,
+                        profile = %inst.profile_id,
+                        error = %e,
+                        "Instance failed to become ready"
+                    );
                     inst.clear_startup_log();
                     let _ = inst.stop().await;
                     // LOCK_ORDER: release the instance lock (4) before the
@@ -3049,6 +3061,15 @@ impl NodeState {
                         error!("Eviction pass after failed startup failed: {}", e);
                     }
                 } else {
+                    info!(
+                        event = "instance_ready",
+                        instance_id = %inst.id,
+                        model = %inst.model_name,
+                        profile = %inst.profile_id,
+                        port = inst.port,
+                        startup_ms = inst.start_time.elapsed().as_millis() as u64,
+                        "Instance ready"
+                    );
                     // Parse model params from startup log now that instance is ready
                     inst.parse_and_store_startup_params();
                     inst.clear_startup_log();
@@ -3155,7 +3176,8 @@ impl NodeState {
                 profile = %profile.id,
                 instance_id = %instance_id,
                 port = port,
-                reason = %reason
+                reason = %reason,
+                "Started instance"
             );
             return Ok(inst_arc.clone());
         }

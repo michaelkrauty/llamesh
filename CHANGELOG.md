@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-11-01
+
+### Added
+
+- Log `instance_ready`, with the instance's load time in `startup_ms`, when an instance passes its readiness check. A ready instance was not logged at all, so neither when an instance became ready nor how long it took to load could be read from the logs. The failed-startup and unexpected-exit log lines now carry the events `instance_startup_failed` and `instance_exited`, with the instance, model, and profile; `instance_spawn_failed` and `instance_spawn_retry` now name the model and profile, and `instance_spawn_failed` includes the error's cause; and `instance_spawn` now has a message.
+
+### Fixed
+
+- `scripts/log-tools/instances.sh` showed each spawn twice and missed most other lifecycle events: it looked for `instance_ready`, `instance_evicted`, and `instance_killed` events that the proxy never logged, listed capacity evictions only because their message contains "evict", without the reason, and missed idle stops, crashed-instance removals, wedge kills, spawn failures, and unexpected exits. It now lists every `instance_*` event with its reason, profile, port, startup time, exit status, and error. Like `errors.sh`, it now reports a failed log query, such as a missing log file or an SSH error, on stderr with a nonzero exit status instead of printing `(none)`, and it passes the model filter to `jq` as data instead of splicing it into the filter program.
+
 ## [1.21.54] - 2026-11-01
 
 ### Fixed

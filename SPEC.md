@@ -1423,7 +1423,11 @@ Examples of log events:
 * Instance lifecycle:
 
   * `event="instance_spawn"`, `model`, `profile`, `instance_id`, `port`, `reason` (`"demand"`, `"prewarm"`).
-  * `event="instance_terminate"`, `reason` (`"idle"`, `"manual"`, `"error"`, `"cold_oom_stage1"`, `"cold_oom_stage2"`), memory stats (`freed_vram_mb`, `freed_sysmem_mb`).
+  * `event="instance_ready"`, `model`, `profile`, `instance_id`, `port`, `startup_ms` - The instance passed its readiness check; `startup_ms` is the time since it was started.
+  * `event="instance_startup_failed"`, `model`, `profile`, `instance_id`, `error` - The instance exited or timed out before it became ready.
+  * `event="instance_exited"`, `model`, `profile`, `instance_id`, `exit_status` - The process exited, with any status, while the proxy still considered it running, as after a crash or a signal from outside the proxy (including the stop signal a service manager sends to the whole service on shutdown). `exit_status` tells these apart; only a non-zero exit or a signal other than `SIGTERM` counts in `proxy_instances_crashed_total`.
+  * `event="instance_spawn_failed"`, `model`, `profile`, `error` - The process could not be started, or its API key configuration is unusable. `instance_spawn_retry` follows when the start is retried on another port.
+  * `event="instance_terminate"`, `instance_id`, `model`, `profile`, `reason` (`"idle"`, `"capacity"`, `"drained"`, `"wedged"`, `"manual"`, `"error"`, `"cold_oom_stage1"`, `"cold_oom_stage2"`), memory stats (`freed_vram_mb`, `freed_sysmem_mb`).
   * `event="cold_oom_evict_stage1"`, `count` - Evicting idle instances for cold-start OOM recovery.
   * `event="cold_oom_evict_stage2_start"`, `count` - Beginning graceful eviction of all instances.
   * `event="cold_oom_evict_stage2_drain_complete"` - All instances drained, proceeding with eviction.
@@ -1447,6 +1451,8 @@ Examples of log events:
 ### Querying Error Logs
 
 `scripts/log-tools/errors.sh [local|remote|both] [YYYY-MM-DD] [limit]` prints recent `WARN` and `ERROR` entries from daily log files, including rotated files compressed with `logging.compression` (defaults: both nodes, the current UTC day, 50 entries per node). Entries that carry an `error` field show it after the message. It requires Bash and `jq`, plus SSH for remote queries, and `gzip` on the queried node to read compressed files. Set `LLAMESH_LOCAL_LOG_DIR` to override the repository's `logs` directory. Remote queries require `LLAMESH_REMOTE_HOST`; set `LLAMESH_REMOTE_LOG_DIR` to the remote log directory (default: `./logs`, relative to the SSH login directory).
+
+`scripts/log-tools/instances.sh [local|remote|both] [YYYY-MM-DD] [model]` prints every instance lifecycle event (each event named `instance_*`, including those above) with its reason, model, profile, instance, port, startup time, exit status, and error. The optional model argument is a case-insensitive regular expression matched against the model name. It has the same requirements, defaults, and environment variables as `errors.sh`, and likewise exits nonzero when a log query fails.
 
 A successful query with no matching entries exits zero. Fetch or JSON parsing failures produce stderr diagnostics and a nonzero exit status. In `both` mode, both nodes are queried even if the first fails; failure on either node makes the overall command fail. Output may be partial when a query fails.
 

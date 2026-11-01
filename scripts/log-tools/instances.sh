@@ -1,9 +1,13 @@
 #!/bin/bash
-# Show instance lifecycle events (spawn, ready, evict, kill)
+# Show instance lifecycle events: every event named instance_*, such as
+# instance_spawn, instance_ready, instance_startup_failed, instance_exited,
+# instance_wedged, and instance_terminate (with its reason: idle, capacity,
+# error, drained, wedged, manual, cold_oom_stage1, or cold_oom_stage2).
 # Usage: instances.sh [node] [date] [model]
 #   node: local, remote, both (default: both)
 #   date: YYYY-MM-DD, a UTC day (default: today in UTC)
-#   model: filter by model name (optional, partial match)
+#   model: filter by model name (optional, partial match, case-insensitive regex)
+# Exits nonzero if either log query fails; diagnostics are written to stderr.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,30 +18,33 @@ MODEL="${3:-}"
 
 filter_instances() {
     local node="$1"
-    local jq_filter='select(
-        .fields.event == "instance_spawn" or
-        .fields.event == "instance_ready" or
-        .fields.event == "instance_evicted" or
-        .fields.event == "instance_killed" or
-        (.fields.message | test("Spawning instance"; "i") // false) or
-        (.fields.message | test("Instance .* ready"; "i") // false) or
-        (.fields.message | test("evict"; "i") // false)
-    )'
-
-    if [[ -n "$MODEL" ]]; then
-        jq_filter="$jq_filter | select(.fields.model // .span.model // \"\" | test(\"$MODEL\"; \"i\"))"
-    fi
-
-    "$SCRIPT_DIR/fetch-logs.sh" "$node" "$DATE" 2>/dev/null | \
-        jq -r "$jq_filter | \"\(.timestamp | split(\".\")[0]) \(.fields.event // \"info\"): model=\(.fields.model // .span.model // \"?\") instance=\(.fields.instance_id // \"?\") port=\(.fields.port // \"?\")\"" 2>/dev/null
+    "$SCRIPT_DIR/fetch-logs.sh" "$node" "$DATE" | \
+        jq -r --arg model "$MODEL" '
+            select(.fields.event // "" | startswith("instance_")) |
+            (.fields.model // .span.model // "?") as $name |
+            select($model == "" or ($name | test($model; "i"))) |
+            [
+                (.timestamp | split(".")[0]),
+                " \(.fields.event)",
+                (if .fields.reason then " (\(.fields.reason))" else "" end),
+                ": model=\($name)",
+                (if .fields.profile then " profile=\(.fields.profile)" else "" end),
+                " instance=\(.fields.instance_id // "?")",
+                (if .fields.port then " port=\(.fields.port)" else "" end),
+                (if .fields.startup_ms then " startup_ms=\(.fields.startup_ms)" else "" end),
+                (if .fields.exit_status then " exit_status=\(.fields.exit_status)" else "" end),
+                (if .fields.error then " (error: \(.fields.error))" else "" end)
+            ] | add'
 }
 
 if [[ "$NODE" == "both" ]]; then
+    status=0
     echo "=== local instances ==="
-    filter_instances "local" || echo "(none)"
+    filter_instances "local" || status=1
     echo ""
     echo "=== remote instances ==="
-    filter_instances "remote" || echo "(none)"
+    filter_instances "remote" || status=1
+    exit "$status"
 else
     filter_instances "$NODE"
 fi
