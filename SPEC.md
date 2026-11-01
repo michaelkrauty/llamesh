@@ -1454,6 +1454,12 @@ Examples of log events:
 
 `scripts/log-tools/instances.sh [local|remote|both] [YYYY-MM-DD] [model]` prints every instance lifecycle event (each event named `instance_*`, including those above) with its reason, model, profile, instance, port, startup time, exit status, and error. The optional model argument is a case-insensitive regular expression matched against the model name. It has the same requirements, defaults, and environment variables as `errors.sh`, and likewise exits nonzero when a log query fails.
 
+The other scripts share those requirements, environment variables, and failure handling: each reports a failed log query (a missing log file, an SSH error, a malformed log line, or `LLAMESH_REMOTE_HOST` unset for a remote query) on stderr and exits nonzero, after querying the other node when both are requested.
+
+* `scripts/log-tools/trace-request.sh <id> [YYYY-MM-DD] [local|remote|both]` prints the entries logged for a request or session ID on each node (default: both), and `(no matches)` on stderr for a node whose log has none. The ID is matched exactly, as data.
+* `scripts/log-tools/cluster-health.sh [local|remote|both] [YYYY-MM-DD]` prints gossip, circuit breaker, peer discovery, and Noise events, the last 30 per node for both (the default) or the last 50 for one.
+* `scripts/log-tools/recent.sh [local|remote] [lines] [level]` prints the last entries (default: 20) of the current UTC day's log on one node (default: local), optionally only those at a level (`TRACE`, `DEBUG`, `INFO`, `WARN`, or `ERROR`, in any case).
+
 A successful query with no matching entries exits zero. Fetch or JSON parsing failures produce stderr diagnostics and a nonzero exit status. In `both` mode, both nodes are queried even if the first fails; failure on either node makes the overall command fail. Output may be partial when a query fails.
 
 ---
