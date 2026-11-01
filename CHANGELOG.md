@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.6] - 2026-11-01
+
+### Fixed
+
+- Name the reason in `instance_startup_failed`. When an instance exited before it became ready, the event said only `Instance process exited unexpectedly while waiting for readiness`, and the cause, such as a model file that cannot be opened or a Hugging Face repository without GGUF files, could be found only among the instance's raw output lines. The `error` field now also carries the first error-level messages `llama-server` logged while starting, or, for a process that exited without logging an error, its last line, so `errors.sh` and `instances.sh` show the cause. The report waits briefly for the output of a process that exited, which can still be in transit when the exit is noticed.
+
 ## [1.22.5] - 2026-11-01
 
 ### Fixed

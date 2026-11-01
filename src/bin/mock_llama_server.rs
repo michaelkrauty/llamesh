@@ -168,7 +168,8 @@ async fn main() {
                     return;
                 }
                 if std::fs::remove_file(&fail_file).is_ok() {
-                    eprintln!("Mock load failed");
+                    // In llama.cpp's log format, with an error-level line.
+                    eprintln!("0.00.100.000 E srv    load_model: failed to load model (mock)");
                     std::process::exit(1);
                 }
                 sleep(Duration::from_millis(50)).await;
