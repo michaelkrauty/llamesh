@@ -3,6 +3,8 @@
 # Usage: fetch-logs.sh [node] [date]
 #   node: "local", "node-a", "node-b", "remote", "both" (default: local)
 #   date: YYYY-MM-DD, a UTC day (default: today in UTC)
+# Exits nonzero if a requested node's log cannot be read; for "both", after
+# printing the other node's log.
 #
 # Configure via environment variables:
 #   LLAMESH_LOCAL_LOG_DIR  - local log directory (default: logs under the repo root)
@@ -63,15 +65,25 @@ case "$NODE" in
         }
         ;;
     both)
+        # Print what can be read, but fail if either node's log could not be.
+        status=0
         echo "=== LOCAL (node-a) ===" >&2
-        read_local_log || echo "No local logs for ${DATE}" >&2
+        read_local_log || {
+            echo "Log file not found: ${LOCAL_LOG_DIR}/${LOG_FILE}[.gz]" >&2
+            status=1
+        }
         echo "" >&2
         if [[ -z "$REMOTE_HOST" ]]; then
             echo "Set LLAMESH_REMOTE_HOST to include remote logs" >&2
+            status=1
         else
             echo "=== REMOTE (node-b) ===" >&2
-            read_remote_log || echo "No remote logs for ${DATE}" >&2
+            read_remote_log || {
+                echo "Log file not found on ${REMOTE_HOST}: ${REMOTE_LOG_DIR}/${LOG_FILE}[.gz]" >&2
+                status=1
+            }
         fi
+        exit "$status"
         ;;
     *)
         echo "Unknown node: $NODE (use: local, node-a, node-b, remote, both)" >&2
