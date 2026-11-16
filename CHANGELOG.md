@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.7] - 2026-11-16
+
+### Fixed
+
+- Name the reason in `instance_exited`. When a running instance crashed, the event's `exit_status` read like `ExitStatus(unix_wait_status(134))`, and the cause, such as a CUDA error or a failed `GGML_ASSERT`, could be found only among the instance's raw output lines. `exit_status` now reads like `signal: 6 (SIGABRT) (core dumped)` or `exit status: 1`, and a new `error` field carries the last error messages `llama-server` logged (up to five), so `errors.sh` and `instances.sh` show the cause; as for a failed startup, the report waits briefly for output still in transit when the exit is noticed. The line llama.cpp writes when it aborts, which has no log level, now counts as an error message, here and in `instance_startup_failed`.
+- Stop collecting a ready instance's output. The buffer that holds an instance's startup output, for parsing its model parameters, was emptied when the instance became ready but went on collecting its output, up to 10,000 lines that nothing read. It is no longer filled once the startup has ended.
+
 ## [1.22.6] - 2026-11-01
 
 ### Fixed

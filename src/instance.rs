@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
@@ -10,9 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -142,36 +144,64 @@ const MAX_STARTUP_LOG_LINES: usize = 10_000;
 /// Most `llama-server` error lines a startup failure report includes.
 const MAX_STARTUP_ERROR_LINES: usize = 5;
 
+/// Most `llama-server` error messages an instance keeps for explaining an
+/// unexpected exit.
+const MAX_RECENT_ERRORS: usize = 5;
+
+/// How long to wait, once a process is seen to have exited, for its output
+/// readers to collect what is still in its pipes before reporting the exit.
+pub const EXITED_OUTPUT_WAIT: Duration = Duration::from_secs(1);
+
 /// An error-level line in `llama-server`'s log, which llama.cpp marks with an
 /// `E` after the timestamp: `0.00.448.659 E srv    load_model: failed to load
 /// model`. Captures the message.
 static ERROR_LINE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(?:\d+(?:\.\d+)+\s+)?E\s+(\S.*)$").unwrap());
 
+/// The line llama.cpp writes when it aborts, as on a failed `GGML_ASSERT`: the
+/// source location, then the message, without a timestamp or level, as in
+/// `/src/ggml/src/ggml.c:1234: GGML_ASSERT(x) failed`. Captures it without the
+/// source file's directory.
+static ABORT_LINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\S*/)?(\S+\.(?:c|cc|cpp|cu|cuh|h|hpp|m|mm):\d+: \S.*)$").unwrap()
+});
+
 /// An ANSI color sequence, which llama.cpp writes around the timestamp and
 /// level when a profile turns log colors on.
 static ANSI_COLOR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
 
+/// A line of `llama-server` output with color codes removed and runs of
+/// whitespace collapsed.
+fn clean_output_line(line: &str) -> String {
+    ANSI_COLOR_REGEX
+        .replace_all(line, "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The error a line of `llama-server` output reports, if any: the message of
+/// an error-level line, or the line llama.cpp writes when it aborts.
+fn error_message(line: &str) -> Option<String> {
+    let line = clean_output_line(line);
+    ERROR_LINE_REGEX
+        .captures(&line)
+        .or_else(|| ABORT_LINE_REGEX.captures(&line))
+        .map(|c| c[1].to_string())
+}
+
 /// What a `llama-server` startup log says about why the server failed: its
-/// first error-level messages (the cause tends to come first, followed by its
-/// consequences), joined with `; `, with color codes removed and runs of
-/// whitespace collapsed. When the log has no error-level line, as with an
+/// first error messages (see [`error_message`]; the cause tends to come first,
+/// followed by its consequences), joined with `; `, with color codes removed
+/// and runs of whitespace collapsed. When the log has no error, as with an
 /// older or differently configured llama.cpp, its last non-empty line stands
 /// in if `last_line_fallback` is set; that suits a server that exited, whose
 /// last words explain it, but not one that is still loading. `None` when
 /// there is nothing to report.
 fn startup_error_lines(lines: &[String], last_line_fallback: bool) -> Option<String> {
-    let clean = |line: &str| {
-        ANSI_COLOR_REGEX
-            .replace_all(line, "")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
     let errors: Vec<String> = lines
         .iter()
-        .map(|line| clean(line))
-        .filter_map(|line| ERROR_LINE_REGEX.captures(&line).map(|c| c[1].to_string()))
+        .filter_map(|line| error_message(line))
         .take(MAX_STARTUP_ERROR_LINES)
         .collect();
     if !errors.is_empty() {
@@ -183,8 +213,46 @@ fn startup_error_lines(lines: &[String], last_line_fallback: bool) -> Option<Str
     lines
         .iter()
         .rev()
-        .map(|line| clean(line))
+        .map(|line| clean_output_line(line))
         .find(|line| !line.is_empty())
+}
+
+/// What an instance keeps of its process's output, collected by the readers
+/// that copy the output to the proxy's log.
+#[derive(Debug, Default)]
+pub struct OutputLog {
+    /// The output from the start, for parsing the model's parameters and
+    /// explaining a failed startup: at most [`MAX_STARTUP_LOG_LINES`] lines,
+    /// emptied and no longer collected once the startup has ended.
+    startup: Vec<String>,
+    startup_ended: bool,
+    /// The latest error messages (see [`error_message`]), oldest first, for
+    /// explaining an unexpected exit.
+    recent_errors: VecDeque<String>,
+}
+
+impl OutputLog {
+    fn push(&mut self, line: String) {
+        if let Some(error) = error_message(&line) {
+            if self.recent_errors.len() == MAX_RECENT_ERRORS {
+                self.recent_errors.pop_front();
+            }
+            self.recent_errors.push_back(error);
+        }
+        if !self.startup_ended && self.startup.len() < MAX_STARTUP_LOG_LINES {
+            self.startup.push(line);
+        }
+    }
+
+    /// The latest error messages, up to [`MAX_RECENT_ERRORS`], joined with
+    /// `; `.
+    fn recent_errors(&self) -> Option<String> {
+        if self.recent_errors.is_empty() {
+            return None;
+        }
+        let errors: Vec<&str> = self.recent_errors.iter().map(String::as_str).collect();
+        Some(errors.join("; "))
+    }
 }
 
 /// Tracks an instance's stdout and stderr readers, so that a startup failure
@@ -206,6 +274,11 @@ impl OutputReaders {
         self.closed.notify_waiters();
     }
 
+    /// Whether every reader has reached the end of its stream.
+    fn all_closed(&self) -> bool {
+        self.open.load(Ordering::SeqCst) == 0
+    }
+
     /// Wait until every reader has reached the end of its stream, for at most
     /// `limit`. Returns whether they all did.
     pub async fn drained(&self, limit: Duration) -> bool {
@@ -214,7 +287,7 @@ impl OutputReaders {
                 let notified = self.closed.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.open.load(Ordering::SeqCst) == 0 {
+                if self.all_closed() {
                     return;
                 }
                 notified.await;
@@ -590,9 +663,9 @@ pub struct Instance {
     pub ready_signal: Arc<Notify>,
     /// Hash of launch args (excluding --host/--port) for learned memory lookup.
     pub args_hash: String,
-    /// Buffered startup log lines for parsing model parameters.
-    pub startup_log: Arc<Mutex<Vec<String>>>,
-    /// The readers that copy the process's output into `startup_log`.
+    /// What the instance keeps of its process's output.
+    pub output_log: Arc<Mutex<OutputLog>>,
+    /// The readers that copy the process's output into `output_log`.
     pub output_readers: Arc<OutputReaders>,
     /// Parsed model parameters from startup log (populated after ready).
     pub parsed_params: Mutex<Option<ParsedModelParams>>,
@@ -742,7 +815,7 @@ impl Instance {
             status: Mutex::new(InstanceStatus::Starting),
             ready_signal: Arc::new(Notify::new()),
             args_hash,
-            startup_log: Arc::new(Mutex::new(Vec::new())),
+            output_log: Arc::new(Mutex::new(OutputLog::default())),
             output_readers: Arc::new(OutputReaders::default()),
             parsed_params: Mutex::new(None),
             is_cold_start,
@@ -807,41 +880,12 @@ impl Instance {
 
         let mut child = cmd.spawn().context("Failed to spawn llama-server")?;
 
-        // Spawn tasks to stream stdout/stderr to tracing and buffer for parsing
+        // Copy stdout and stderr to the log, keeping what output_log needs.
         if let Some(stdout) = child.stdout.take() {
-            let id = self.id.clone();
-            let startup_log = self.startup_log.clone();
-            let readers = self.output_readers.clone();
-            readers.opened();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    info!(instance_id = %id, "stdout: {}", line);
-                    let mut log = startup_log.lock();
-                    if log.len() < MAX_STARTUP_LOG_LINES {
-                        log.push(line);
-                    }
-                }
-                readers.closed();
-            });
+            self.read_output(stdout, "stdout");
         }
-
         if let Some(stderr) = child.stderr.take() {
-            let id = self.id.clone();
-            let startup_log = self.startup_log.clone();
-            let readers = self.output_readers.clone();
-            readers.opened();
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = reader.next_line().await {
-                    info!(instance_id = %id, "stderr: {}", line);
-                    let mut log = startup_log.lock();
-                    if log.len() < MAX_STARTUP_LOG_LINES {
-                        log.push(line);
-                    }
-                }
-                readers.closed();
-            });
+            self.read_output(stderr, "stderr");
         }
 
         {
@@ -855,11 +899,29 @@ impl Instance {
         Ok(())
     }
 
+    /// Copy the lines of one of the process's output streams to the log as
+    /// they arrive, prefixed with `name`, and into `output_log`.
+    fn read_output(&self, stream: impl AsyncRead + Unpin + Send + 'static, name: &'static str) {
+        let id = self.id.clone();
+        let output_log = self.output_log.clone();
+        let readers = self.output_readers.clone();
+        readers.opened();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(instance_id = %id, "{}: {}", name, line);
+                output_log.lock().push(line);
+            }
+            readers.closed();
+        });
+    }
+
     /// Parse the buffered startup log and store the result.
     /// Call this after wait_for_ready() succeeds.
     pub fn parse_and_store_startup_params(&self) {
-        let lines = self.startup_log.lock();
-        let params = parse_llama_server_log(&lines);
+        let log = self.output_log.lock();
+        let lines = &log.startup;
+        let params = parse_llama_server_log(lines);
 
         // Check if we got any meaningful data. Both `n_ctx` and `n_slots` are
         // present in every healthy startup log regardless of verbosity, so a
@@ -895,12 +957,15 @@ impl Instance {
     /// no error; for one that is still running, only errors are reported.
     pub fn startup_failure_reason(&self) -> Option<String> {
         let exited = self.get_pid().is_none();
-        startup_error_lines(&self.startup_log.lock(), exited)
+        startup_error_lines(&self.output_log.lock().startup, exited)
     }
 
-    /// Clear the startup log buffer to free memory.
-    pub fn clear_startup_log(&self) {
-        self.startup_log.lock().clear();
+    /// Free the startup log and stop collecting it, once the startup has
+    /// ended and the log has been used.
+    pub fn end_startup_log(&self) {
+        let mut log = self.output_log.lock();
+        log.startup = Vec::new();
+        log.startup_ended = true;
     }
 
     /// Get parsed model parameters, if available.
@@ -1039,6 +1104,45 @@ impl Instance {
         !self.startup_failure_claimed.swap(true, Ordering::AcqRel)
     }
 
+    /// Log an exit the proxy did not cause, with the last error messages the
+    /// process wrote (see [`error_message`]). Its last lines can still be in
+    /// its pipes when the exit is noticed, so unless the output readers have
+    /// finished, the report waits for them, for at most
+    /// [`EXITED_OUTPUT_WAIT`].
+    fn report_exit(&self, status: std::process::ExitStatus) {
+        let output_log = self.output_log.clone();
+        let readers = self.output_readers.clone();
+        let (id, model, profile) = (
+            self.id.clone(),
+            self.model_name.clone(),
+            self.profile_id.clone(),
+        );
+        let report = move || {
+            let errors = output_log.lock().recent_errors();
+            warn!(
+                event = "instance_exited",
+                instance_id = %id,
+                model = %model,
+                profile = %profile,
+                exit_status = %status,
+                error = errors.as_deref(),
+                "Instance exited unexpectedly"
+            );
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) if !readers.all_closed() => {
+                runtime.spawn(
+                    async move {
+                        readers.drained(EXITED_OUTPUT_WAIT).await;
+                        report();
+                    }
+                    .instrument(tracing::Span::current()),
+                );
+            }
+            _ => report(),
+        }
+    }
+
     pub fn is_alive(&self) -> bool {
         let mut guard = self.child.lock();
 
@@ -1059,14 +1163,7 @@ impl Instance {
                     if !status.success() && status.signal() != Some(libc::SIGTERM) {
                         INSTANCES_CRASHED_TOTAL.fetch_add(1, Ordering::Relaxed);
                     }
-                    warn!(
-                        event = "instance_exited",
-                        instance_id = %self.id,
-                        model = %self.model_name,
-                        profile = %self.profile_id,
-                        exit_status = ?status,
-                        "Instance exited unexpectedly"
-                    );
+                    self.report_exit(status);
                     *guard = None;
                     if let Some(reservation) = &self.memory_reservation {
                         reservation.finish();
@@ -1223,6 +1320,17 @@ mod tests {
         // ...but not for a server that is still loading, whose last line is
         // just progress.
         assert_eq!(startup_error_lines(&unleveled, false), None);
+        // The line llama.cpp writes when it aborts counts as an error, ahead
+        // of a debugger's backtrace that follows it.
+        let aborted = strings(&[
+            "0.00.001.000 I srv load_model: loading model",
+            "/src/ggml/src/ggml.c:1234: GGML_ASSERT(x) failed",
+            "[Inferior 1 (process 42) detached]",
+        ]);
+        assert_eq!(
+            startup_error_lines(&aborted, true).as_deref(),
+            Some("ggml.c:1234: GGML_ASSERT(x) failed")
+        );
         // An "E" inside a message is not a level.
         assert_eq!(
             startup_error_lines(&strings(&["0.00.001.000 I E is a letter", "done"]), true)
@@ -1815,7 +1923,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clear_startup_log() {
+    fn end_startup_log_stops_collecting_the_startup_output() {
         let instance = Instance::new(
             "test-id".to_string(),
             "test-model".to_string(),
@@ -1825,17 +1933,127 @@ mod tests {
             "hash123".to_string(),
             false,
         );
+        let push = |line: &str| instance.output_log.lock().push(line.to_string());
 
-        // Add some data to the startup log
-        instance
-            .startup_log
-            .lock()
-            .push("test log data".to_string());
-        assert!(!instance.startup_log.lock().is_empty());
+        push("0.00.000.001 I srv load_model: loading model");
+        assert_eq!(instance.output_log.lock().startup.len(), 1);
 
-        // Clear it
-        instance.clear_startup_log();
-        assert!(instance.startup_log.lock().is_empty());
+        instance.end_startup_log();
+        assert!(instance.output_log.lock().startup.is_empty());
+        // A ready instance's output is no longer collected; its errors still are.
+        push("0.10.000.001 I slot release: id 0 | task 7 | stop processing");
+        push("0.10.000.002 E CUDA error: out of memory");
+        assert!(instance.output_log.lock().startup.is_empty());
+        assert_eq!(
+            instance.output_log.lock().recent_errors().as_deref(),
+            Some("CUDA error: out of memory")
+        );
+
+        // Only the latest MAX_RECENT_ERRORS errors are kept, oldest first.
+        for i in 0..7 {
+            push(&format!("0.20.000.00{i} E error {i}"));
+        }
+        assert_eq!(
+            instance.output_log.lock().recent_errors().as_deref(),
+            Some("error 2; error 3; error 4; error 5; error 6")
+        );
+    }
+
+    #[test]
+    fn error_message_recognizes_errors_and_aborts() {
+        assert_eq!(
+            error_message("0.52.946.845 E CUDA error: an illegal memory access was encountered")
+                .as_deref(),
+            Some("CUDA error: an illegal memory access was encountered")
+        );
+        // The line llama.cpp writes when it aborts, without the directory.
+        assert_eq!(
+            error_message("/src/llama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu:111: CUDA error")
+                .as_deref(),
+            Some("ggml-cuda.cu:111: CUDA error")
+        );
+        assert_eq!(
+            error_message("ggml/src/ggml.c:1234: GGML_ASSERT(a->ne[2] == b->ne[2]) failed")
+                .as_deref(),
+            Some("ggml.c:1234: GGML_ASSERT(a->ne[2] == b->ne[2]) failed")
+        );
+        // Other output, including what a debugger writes for the backtrace
+        // that follows an abort.
+        for line in [
+            "0.52.402.355 I slot launch_slot_: id  0 | task 402 | processing task",
+            "/home/user/.gdbinit:10: Error in sourced command file:",
+            "#3  0x00007f9db7533d2e in ggml_abort () from /lib/libggml-base.so.0",
+            "#4  ggml_abort (file=0x1 \"x\", line=111) at /src/ggml/src/ggml.c:250",
+            "[Inferior 1 (process 719246) detached]",
+        ] {
+            assert_eq!(error_message(line), None, "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_exit_reports_the_status_and_the_last_errors() {
+        // The processes exit with status 0 so the process-wide crash counter,
+        // which crash_counter_classifies_exits owns, is left alone.
+        async fn exit_event(id: &str, script: &str) -> serde_json::Value {
+            let capture = crate::test_support::capture_logs(tracing::Level::WARN);
+            let instance = Instance::new(
+                id.to_string(),
+                "exit-model".to_string(),
+                "default".to_string(),
+                "127.0.0.1".to_string(),
+                8080,
+                "abc123".to_string(),
+                false,
+            );
+            instance.spawn("sh", &strings(&["-c", script])).unwrap();
+            instance.end_startup_log();
+            while instance.is_alive() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            for _ in 0..500 {
+                let event = capture
+                    .contents()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .find(|event| event["fields"]["event"] == "instance_exited");
+                if let Some(event) = event {
+                    return event;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("no instance_exited event in {}", capture.contents());
+        }
+
+        // A server that reports a CUDA error and aborts, as llama.cpp does,
+        // followed by a debugger's backtrace.
+        let crashed = exit_event(
+            "crashed-id",
+            "printf '0.10.000.001 I slot launch_slot_: id 0 | task 9\\n\
+             0.10.000.002 E CUDA error: an illegal memory access was encountered\\n\
+             /src/ggml/src/ggml-cuda/ggml-cuda.cu:111: CUDA error\\n\
+             [Inferior 1 (process 42) detached]\\n' >&2; exit 0",
+        )
+        .await;
+        assert_eq!(crashed["fields"]["exit_status"], "exit status: 0");
+        assert_eq!(
+            crashed["fields"]["error"],
+            "CUDA error: an illegal memory access was encountered; ggml-cuda.cu:111: CUDA error"
+        );
+
+        // Output still in transit when the exit is noticed: a process the
+        // server started keeps its stderr open and writes the error after the
+        // server has exited, so the report waits for the readers.
+        let late = exit_event(
+            "late-id",
+            "(sleep 0.2; printf '0.10.000.002 E late error\\n' >&2) & exit 0",
+        )
+        .await;
+        assert_eq!(late["fields"]["error"], "late error");
+
+        // Without errors, the event has no error field.
+        let quiet = exit_event("quiet-id", "echo done; exit 0").await;
+        assert_eq!(quiet["fields"]["exit_status"], "exit status: 0");
+        assert!(quiet["fields"].get("error").is_none(), "{quiet}");
     }
 
     #[test]
@@ -1870,7 +2088,7 @@ mod tests {
             false,
         );
         instance
-            .startup_log
+            .output_log
             .lock()
             .push("5.09.925.994 I srv    load_model: initializing slots, n_slots = 4".to_string());
         instance.parse_and_store_startup_params();
