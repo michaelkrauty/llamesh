@@ -166,6 +166,12 @@ static ABORT_LINE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:\S*/)?(\S+\.(?:c|cc|cpp|cu|cuh|h|hpp|m|mm):\d+: \S.*)$").unwrap()
 });
 
+/// A line of `llama-server`'s log of a level other than error: debug, info or
+/// warning. Errors this follows were not the last thing the server reported,
+/// as with the error it logs for a rejected request and then carries on.
+static OTHER_LOG_LINE_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:\d+(?:\.\d+)+\s+)?[DIW]\s+\S").unwrap());
+
 /// An ANSI color sequence, which llama.cpp writes around the timestamp and
 /// level when a profile turns log colors on.
 static ANSI_COLOR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
@@ -180,13 +186,13 @@ fn clean_output_line(line: &str) -> String {
         .join(" ")
 }
 
-/// The error a line of `llama-server` output reports, if any: the message of
-/// an error-level line, or the line llama.cpp writes when it aborts.
+/// The error a line of `llama-server` output, cleaned by
+/// [`clean_output_line`], reports, if any: the message of an error-level line,
+/// or the line llama.cpp writes when it aborts.
 fn error_message(line: &str) -> Option<String> {
-    let line = clean_output_line(line);
     ERROR_LINE_REGEX
-        .captures(&line)
-        .or_else(|| ABORT_LINE_REGEX.captures(&line))
+        .captures(line)
+        .or_else(|| ABORT_LINE_REGEX.captures(line))
         .map(|c| c[1].to_string())
 }
 
@@ -201,7 +207,8 @@ fn error_message(line: &str) -> Option<String> {
 fn startup_error_lines(lines: &[String], last_line_fallback: bool) -> Option<String> {
     let errors: Vec<String> = lines
         .iter()
-        .filter_map(|line| error_message(line))
+        .map(|line| clean_output_line(line))
+        .filter_map(|line| error_message(&line))
         .take(MAX_STARTUP_ERROR_LINES)
         .collect();
     if !errors.is_empty() {
@@ -226,26 +233,29 @@ pub struct OutputLog {
     /// emptied and no longer collected once the startup has ended.
     startup: Vec<String>,
     startup_ended: bool,
-    /// The latest error messages (see [`error_message`]), oldest first, for
-    /// explaining an unexpected exit.
+    /// The error messages (see [`error_message`]) written since the last
+    /// other log line, oldest first, for explaining an unexpected exit.
     recent_errors: VecDeque<String>,
 }
 
 impl OutputLog {
     fn push(&mut self, line: String) {
-        if let Some(error) = error_message(&line) {
+        let clean = clean_output_line(&line);
+        if let Some(error) = error_message(&clean) {
             if self.recent_errors.len() == MAX_RECENT_ERRORS {
                 self.recent_errors.pop_front();
             }
             self.recent_errors.push_back(error);
+        } else if OTHER_LOG_LINE_REGEX.is_match(&clean) {
+            self.recent_errors.clear();
         }
         if !self.startup_ended && self.startup.len() < MAX_STARTUP_LOG_LINES {
             self.startup.push(line);
         }
     }
 
-    /// The latest error messages, up to [`MAX_RECENT_ERRORS`], joined with
-    /// `; `.
+    /// The last [`MAX_RECENT_ERRORS`] of the error messages written since the
+    /// last other log line, joined with `; `.
     fn recent_errors(&self) -> Option<String> {
         if self.recent_errors.is_empty() {
             return None;
@@ -1957,6 +1967,17 @@ mod tests {
             instance.output_log.lock().recent_errors().as_deref(),
             Some("error 2; error 3; error 4; error 5; error 6")
         );
+
+        // Output other than a llama.cpp log line, such as a debugger's
+        // backtrace after an abort, leaves them; another log line, after
+        // which the server carried on, clears them.
+        push("#0 0x00007f9daa2a08f2 in ?? () from /usr/lib/libc.so.6");
+        assert_eq!(
+            instance.output_log.lock().recent_errors().as_deref(),
+            Some("error 2; error 3; error 4; error 5; error 6")
+        );
+        push("0.30.000.001 I slot release: id 0 | task 8 | stop processing");
+        assert_eq!(instance.output_log.lock().recent_errors(), None);
     }
 
     #[test]
@@ -1980,10 +2001,10 @@ mod tests {
         // Other output, including what a debugger writes for the backtrace
         // that follows an abort.
         for line in [
-            "0.52.402.355 I slot launch_slot_: id  0 | task 402 | processing task",
+            "0.52.402.355 I slot launch_slot_: id 0 | task 402 | processing task",
             "/home/user/.gdbinit:10: Error in sourced command file:",
-            "#3  0x00007f9db7533d2e in ggml_abort () from /lib/libggml-base.so.0",
-            "#4  ggml_abort (file=0x1 \"x\", line=111) at /src/ggml/src/ggml.c:250",
+            "#3 0x00007f9db7533d2e in ggml_abort () from /lib/libggml-base.so.0",
+            "#4 ggml_abort (file=0x1 \"x\", line=111) at /src/ggml/src/ggml.c:250",
             "[Inferior 1 (process 719246) detached]",
         ] {
             assert_eq!(error_message(line), None, "{line}");
@@ -2050,8 +2071,14 @@ mod tests {
         .await;
         assert_eq!(late["fields"]["error"], "late error");
 
-        // Without errors, the event has no error field.
-        let quiet = exit_event("quiet-id", "echo done; exit 0").await;
+        // Without errors since the last other log line, as after a rejected
+        // request the server carried on from, the event has no error field.
+        let quiet = exit_event(
+            "quiet-id",
+            "printf '0.10.000.001 E srv send_error: task id = 3, error: request too large\\n\
+             0.10.000.002 I slot release: id 0 | task 3\\n' >&2; exit 0",
+        )
+        .await;
         assert_eq!(quiet["fields"]["exit_status"], "exit status: 0");
         assert!(quiet["fields"].get("error").is_none(), "{quiet}");
     }
