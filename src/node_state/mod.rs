@@ -22,7 +22,7 @@ pub use spawn_reservations::{MemoryReservation, SpawnReservations};
 use crate::build_manager::BuildManager;
 use crate::config::{Cookbook, ModelDefaults, NodeConfig, Profile};
 use crate::discovery::Discovery;
-use crate::instance::{compute_args_hash, Instance, InstanceStatus};
+use crate::instance::{compute_args_hash, Instance, InstanceStatus, EXITED_OUTPUT_WAIT};
 use crate::memory_sampler::{GpuMemorySnapshot, MemorySampler};
 use crate::metrics::{Metrics, NodeResourceMetricsSnapshot};
 use crate::noise::NoiseContext;
@@ -3041,7 +3041,7 @@ impl NodeState {
                         (inst.output_readers.clone(), inst.get_pid().is_none())
                     };
                     if exited {
-                        readers.drained(Duration::from_secs(1)).await;
+                        readers.drained(EXITED_OUTPUT_WAIT).await;
                     }
                 }
                 let inst = inst_clone.read().await;
@@ -3060,7 +3060,7 @@ impl NodeState {
                         error = %error,
                         "Instance failed to become ready"
                     );
-                    inst.clear_startup_log();
+                    inst.end_startup_log();
                     let _ = inst.stop().await;
                     // LOCK_ORDER: release the instance lock (4) before the
                     // eviction pass acquires `instances` (1).
@@ -3090,7 +3090,7 @@ impl NodeState {
                     );
                     // Parse model params from startup log now that instance is ready
                     inst.parse_and_store_startup_params();
-                    inst.clear_startup_log();
+                    inst.end_startup_log();
 
                     // Persist the parsed params on the hash's metrics entry so
                     // /v1/models can report them after this instance is gone
