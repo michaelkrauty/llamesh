@@ -12,6 +12,7 @@ This document describes the actual behavior of llamesh as implemented. It serves
 * Accepts the same OpenAI-compatible HTTP endpoints that `llama-server` exposes (e.g. `/v1/completions`, `/v1/chat/completions`, `/v1/embeddings`) so a client can talk to the proxy exactly as it would talk to `llama-server`, plus the additional proxy/cluster/admin endpoints documented below ([reference](https://github.com/ggml-org/llama.cpp/tree/master/tools/server)).
 * Resolves the requested `model` into a configured model/profile via a YAML "cookbook".
 * Starts, stops, and routes to local `llama-server` instances, with multiple instances allowed per `(model, profile)` configuration up to its configured limit.
+* Optionally serves a profile from an **external upstream**, an OpenAI-compatible endpoint it does not start, and falls back to a local instance or a peer while that endpoint is unavailable.
 * Optionally participates in a **mesh** of peers (multi-node). Any node can receive traffic and forward requests to a peer node based on capacity and performance.
 
 The system is a drop-in replacement for a direct `llama-server` endpoint, but adds:
@@ -49,6 +50,12 @@ Each `(model, profile)` pair corresponds to a specific `llama-server` command li
 * Multiple instances of the same `(model, profile)` can be running simultaneously on one node.
 * Instances are created on-demand, shared across concurrent requests, and evicted after an idle timeout.
 
+### External Upstreams
+
+* An **external upstream** is an OpenAI-compatible endpoint that the proxy does not start: an inference server on another machine, or a hosted API.
+* A profile can name one. While the upstream is healthy it serves every request for the profile, and the node starts no instance of the profile.
+* While the upstream is unhealthy, or when it fails a request before the client has been sent anything, the request is served as if the profile had no upstream: by a local instance when the profile also defines a model, or by a peer.
+
 ---
 
 ## Rust Project Layout
@@ -66,6 +73,7 @@ src/
 │  ├─ port_pool.rs    — Port allocation for llama-server instances
 │  └─ spawn_reservations.rs — Memory reservations for instances that are spawning or loading
 ├─ instance.rs        — llama-server process lifecycle, health polling, startup log parsing
+├─ upstream.rs        — External upstreams: health checks, turn-taking, reconciliation with the cookbook
 ├─ cluster.rs         — Mesh gossip loop, peer metadata exchange, mDNS integration
 ├─ build_manager.rs   — llama.cpp clone, build, smoke test, atomic symlink swap, version signaling
 ├─ circuit_breaker.rs — Per-peer circuit breaker (Closed/Open/HalfOpen with exponential backoff)
@@ -329,7 +337,7 @@ cluster:
 
 ### 2. Cookbook (Model & Profile Definitions)
 
-**Hot Reloading:** The cookbook file is watched for changes using filesystem events. When you modify `cookbook.yaml`, the proxy automatically reloads the configuration without requiring a restart. This allows you to add new models, modify profiles, or disable models on-the-fly. A running instance whose launch arguments changed, or whose model or profile was removed or disabled, is marked draining at once: it takes no new requests and stops when its in-flight requests finish, and new requests start an instance with the new configuration. Other running instances are unaffected. Launch arguments are compared through the profile's args hash, which leaves out `--host` and `--port` and sorts option groups while keeping each option with its values (including negative numbers). Reordering independent options does not drain the instance; swapping values between options does. A request still queued when the cookbook reloads uses the reloaded definition; a request whose profile was removed or disabled while it waited gets `404` `model_not_found`.
+**Hot Reloading:** The cookbook file is watched for changes using filesystem events. When you modify `cookbook.yaml`, the proxy automatically reloads the configuration without requiring a restart. This allows you to add new models, modify profiles, or disable models on-the-fly. A running instance whose launch arguments changed, or whose model or profile was removed or disabled, is marked draining at once: it takes no new requests and stops when its in-flight requests finish, and new requests start an instance with the new configuration. Other running instances are unaffected. Launch arguments are compared through the profile's args hash, which leaves out `--host` and `--port` and sorts option groups while keeping each option with its values (including negative numbers). Reordering independent options does not drain the instance; swapping values between options does. A request still queued when the cookbook reloads uses the reloaded definition; a request whose profile was removed or disabled while it waited gets `404` `model_not_found`. An external upstream that a reload leaves unchanged keeps its health and its waiting requests; one that is removed or changed is replaced as described under **External Upstreams** below.
 
 Example `cookbook.yaml`:
 
@@ -387,7 +395,7 @@ models:
 
 **Model Source Options:**
 
-Each profile must specify a model source using one of these approaches:
+Each profile must specify a model source using one of these approaches, unless it names an external upstream (see **External Upstreams** below):
 
 * **`model_path`**: Path to a local GGUF model file.
 * **`hf_repo`** + **`hf_file`** (optional): Hugging Face repository and file. The model will be automatically downloaded when needed.
@@ -402,9 +410,64 @@ You can also specify model source directly in `llama_server_args` using `-m`/`--
 * **`startup_timeout_seconds`**: Maximum time to wait for a local model to load and become ready. Default: 60 seconds. Used for local sources, including `model_path` and `-m`/`--model` launch args, when no Hugging Face source is specified.
 * **`download_timeout_seconds`**: Maximum time to wait for a Hugging Face model to download and become ready. Default: 3600 seconds (1 hour). Used when `hf_repo` or `-hf`/`-hfr`/`--hf-repo` launch args specify a Hugging Face source. This timeout covers both the download time and the model loading time.
 
+**External Upstreams:**
+
+A profile can name an `upstream`: an OpenAI-compatible endpoint that the proxy does not start, such as an inference server on another machine or a hosted API.
+
+```yaml
+models:
+  - name: "embedder"
+    profiles:
+      - id: "default"
+        model_path: "./models/embedder.Q8_0.gguf"   # optional: the profile's own model
+        llama_server_args: "--embedding -c 8192"
+        upstream:
+          url: "http://embedder.example:8081"
+          model: "embedder-v1"             # optional
+          api_key: "upstream-key"          # optional
+          max_concurrent_requests: 1       # optional
+          fallback_after_ms: 30000         # optional
+          health_check:                    # optional; these are the defaults
+            path: "/v1/models"
+            interval_ms: 10000
+            timeout_ms: 5000
+            failure_threshold: 3
+```
+
+* `url`: The upstream's base URL, `http` or `https`, without credentials, query, or fragment. The path and query of the client's request are appended, so here a request for `/v1/embeddings` goes to `http://embedder.example:8081/v1/embeddings`.
+* `model`: The model name sent to the upstream. Without it the upstream gets the body a local instance would get: the client's bytes, unchanged except that a `stream` field is taken out of an embedding or reranking request, whose response is never streamed. With it the JSON body is re-encoded with its `model` replaced, unless the request already names that model.
+* `api_key`: Sent as `Authorization: Bearer <api_key>` with requests and health checks, in place of any `Authorization` header the client sent. It is not logged.
+* `max_concurrent_requests`: How many requests the upstream is given at once. Default: `model_defaults.max_concurrent_requests_per_instance`; `0` means unlimited.
+* `fallback_after_ms`: How long a request waits for its turn before it is served without the upstream; see below. `0` means it does not wait. Default: unset, which keeps it waiting.
+* `health_check`: The proxy sends `GET <url><path>` every `interval_ms`, and a `2xx` response within `timeout_ms` passes. The upstream is healthy from the first check that passes until `failure_threshold` checks in a row fail, and healthy again from the next that passes. Only these checks decide its health, so the path must keep answering while the upstream is busy with requests. A new or changed upstream is unhealthy until its first check, which is made at once, passes.
+
+An unknown setting in the `upstream` block is an error, as are a zero `interval_ms`, `timeout_ms`, or `failure_threshold`.
+
+While the upstream is healthy, it serves every request for the profile:
+
+* The request is sent with the client's method, path, query, and body, and with the client's headers except the hop-by-hop fields, `Host`, `Content-Length` (set again from the body that is sent), the mesh's hop count, and, when API auth is enabled, the header that carries this node's API key. Redirects are not followed.
+* Any response is relayed as it is, whatever its status, with `x-llamesh-backend: upstream` added to its headers. A response from a `llama-server` instance does not carry that header. An error status is the upstream's answer: the request is not tried elsewhere.
+* Requests beyond `max_concurrent_requests` wait their turn, in arrival order. A busy upstream is not an unhealthy one, so a waiting request is not given to a local instance. The wait counts toward `max_wait_in_queue_ms`, and at most `max_queue_size` requests wait; a request beyond either fails with `503` `queue_timeout` or `queue_full`, as it would in the queue for a local instance. Waiting requests do not count toward `max_total_queue_entries` or in the queue length the node reports to its peers. With `fallback_after_ms` set, a request that has waited that long is served without the upstream instead.
+* `max_request_duration_ms` bounds a request once it is sent. A request that reaches it fails with `502` `upstream_error` and is not tried elsewhere.
+* The node starts no instance of the profile. An instance left from a time when the upstream was unavailable stops after its idle timeout.
+* When the client disconnects, the proxy closes its connection to the upstream.
+
+A request is served without the upstream when the upstream is unhealthy, or gives it no response: the connection cannot be made, or closes before the response is complete (for a streamed response, before its head arrives). When the upstream becomes unhealthy, the requests waiting their turn and the requests it has not yet answered are also served without it, and the proxy closes its connections for the latter. The client has been sent nothing of the upstream's response in any of these cases. A streamed response that breaks off after its head has been relayed ends early for the client. Without the upstream:
+
+* A profile that defines a model is served as it would be with no `upstream` setting: by a local instance or a peer, through the routing described under **Request Lifecycle**.
+* A profile with only an `upstream` is served by a peer that advertises the same model and profile, if there is one. Otherwise the request fails with `503` `upstream_unavailable`.
+
+A request already queued for a local instance stays there when the upstream becomes healthy again; later requests go to the upstream.
+
+An upstream belongs to the node whose cookbook names it, and peers are not told of it. A profile with only an upstream is not advertised to peers, so they do not forward requests for it; a profile that also defines a model is advertised as before. To use an upstream from several nodes, name it in the cookbook of each. Each node then applies `max_concurrent_requests` on its own.
+
+When a cookbook reload removes or changes an upstream, requests waiting for a turn at it are served without it, and requests it has not yet answered are left to finish. A changed upstream starts again as a new one.
+
 **Default Arguments:**
 
-`llama_server_args` is merged with proxy-managed connection settings. By default the proxy appends `--host 127.0.0.1`, an auto-chosen `--port`, `-c 0` (max context size), and `--fit off` (disable auto-optimization) for each instance; if you explicitly include `--host`, `--port`, `-c`/`--ctx-size`, or `-fit`/`--fit` in `llama_server_args`, those values override the defaults. The `-c 0` default tells llama-server to use the model's maximum trained context length. The `--fit off` default ensures your hand-crafted cookbook settings are not overridden by llama-server's automatic optimization feature.
+`llama_server_args` may be omitted, which is the same as an empty string. It is merged with proxy-managed connection settings. By default the proxy appends `--host 127.0.0.1`, an auto-chosen `--port`, `-c 0` (max context size), and `--fit off` (disable auto-optimization) for each instance; if you explicitly include `--host`, `--port`, `-c`/`--ctx-size`, or `-fit`/`--fit` in `llama_server_args`, those values override the defaults. The `-c 0` default tells llama-server to use the model's maximum trained context length. The `--fit off` default ensures your hand-crafted cookbook settings are not overridden by llama-server's automatic optimization feature.
+
+A profile with only an `upstream` has no instance to start, so none of the settings that govern instances apply to it.
 
 Model and profile `enabled` fields are independent. A profile is available only
 when both its parent model and the profile are enabled. `enabled: false` on a
@@ -429,7 +492,7 @@ To mirror upstream `llama-server` behaviors ([docs](https://github.com/ggml-org/
 
 **Endpoint-Type Enforcement:**
 
-Profiles must match the request type. An embedding request (`/v1/embeddings`) is routed only to profiles configured with `--embedding`. A reranking request (`/v1/rerank`) is routed only to reranking-capable profiles. A text completion request is routed only to non-embedding, non-reranking profiles. This prevents misrouting requests to incompatible instances.
+Profiles must match the request type. An embedding request (`/v1/embeddings`) is routed only to profiles configured with `--embedding`. A reranking request (`/v1/rerank`) is routed only to reranking-capable profiles. A text completion request is routed only to non-embedding, non-reranking profiles. This prevents misrouting requests to incompatible instances. The profile's `llama_server_args` decide this whether a local instance or the profile's external upstream answers. A profile with only an upstream accepts every request type and leaves the answer to the upstream.
 
 **Model name syntax:**
 
@@ -625,6 +688,7 @@ Implementation notes:
 * `owned_by` is set to the `node_id` of the node that hosts the model.
 * `created` is a stable Unix timestamp (seconds), not the request time, so a given model reports the same value across requests. For locally served models it is this node's start time; for models advertised by cluster peers it is the owning peer's start time (carried in gossip), so the value is consistent across every front-end node that serves the model. Peers that do not advertise a start time (older versions) fall back to the querying node's start time.
 * Metadata includes `model`, `profile_id`, `profile_description`, `idle_timeout_seconds`, `estimated_tokens_per_second` (from learned metrics), and `parsed_model_params` (an object extracted from the instance startup log). Parsed params are persisted per `args_hash` in the metrics snapshot when an instance becomes ready, so they remain available after the instance is evicted and across proxy restarts; a running instance's values take precedence. The llama.cpp version is recorded alongside, and persisted params observed under a different binary than the one currently live are withheld until the next instance startup refreshes them. The field is `null` only for profiles that have never had a ready instance on this node (or whose launch args — and therefore hash — changed since, or whose params predate a llama.cpp upgrade). At default llama.cpp log verbosity it carries the effective context window (`n_ctx`) and the resolved slot count (`n_slots`), both read from the instance's slot-init line. The trained context length (`n_ctx_train`) is present only when the requested context exceeds it, since that is the only case llama.cpp reports it at this verbosity (in a capacity warning); the opposite case is reported at a level this verbosity hides. The model-metadata fields (architecture, layer/head counts, etc.) are additionally populated on older builds or when the instance is launched at raised verbosity, and are `null` otherwise.
+* A profile with an external upstream also has `metadata.upstream`: `{ "url": "<upstream url>", "healthy": true }`, where `healthy` is the outcome of its health checks. A profile with only an upstream has no instance to measure, so its `estimated_tokens_per_second` is `0` and its `parsed_model_params` is `null`.
 * For models advertised by cluster peers, metadata is `{ "source": "cluster", "advertised_by": "<peer_node_id>", "cluster_url": "<peer_url>" }`.
 * When in cluster mode, returns the union of models supported by the cluster.
 
@@ -713,7 +777,7 @@ The proxy follows the same general error envelope and HTTP semantics as OpenAI's
 
 #### Error JSON Envelope
 
-Errors that the proxy's request handlers generate on the OpenAI-compatible endpoints, and its API-key authentication, body-read timeout, and draining errors on every endpoint, use a JSON body of the form below. An error response from a `llama-server` instance or a cluster peer is relayed with its own status and body, except recognized peer saturation 5xx errors and attributed peer drain rejections, which are consumed and retried or waited on. A request the HTTP router rejects before any handler runs, such as one with the wrong method, gets the router's plain response; relayed errors and router rejections need not follow this form.
+Errors that the proxy's request handlers generate on the OpenAI-compatible endpoints, and its API-key authentication, body-read timeout, and draining errors on every endpoint, use a JSON body of the form below. An error response from a `llama-server` instance, an external upstream, or a cluster peer is relayed with its own status and body, except recognized peer saturation 5xx errors and attributed peer drain rejections, which are consumed and retried or waited on. A request the HTTP router rejects before any handler runs, such as one with the wrong method, gets the router's plain response; relayed errors and router rejections need not follow this form.
 
 ```json
 {
@@ -774,18 +838,19 @@ The proxy uses standard HTTP status codes with the following canonical mappings:
   * `type`: `"peer_forward_failed"` or `"upstream_error"`.
   * Conditions:
     * `peer_forward_failed`: A request to a cluster peer failed before the peer responded (connection, handshake, or transport error).
-    * `upstream_error`: A request to a local `llama-server` instance failed before its response was complete (for example, the connection was refused or reset, or `upstream_read_timeout_ms` elapsed), or a peer's response body could not be read. Error responses from an instance are relayed with their own status.
+    * `upstream_error`: A request to a local `llama-server` instance failed before its response was complete (for example, the connection was refused or reset, or `upstream_read_timeout_ms` elapsed), or a peer's response body could not be read. Error responses from an instance are relayed with their own status. A request to an external upstream gets this error only when it runs for `max_request_duration_ms`; any other failure there is served without the upstream.
   * The `message` names the step that failed followed by its underlying causes, for example `Upstream error: error sending request for url (...): operation timed out`.
 * `503 Service Unavailable`:
-  * `type`: `"no_capacity"`, `"queue_full"`, `"queue_timeout"`, `"spawn_failures_exhausted"`, or `"draining"`.
+  * `type`: `"no_capacity"`, `"queue_full"`, `"queue_timeout"`, `"spawn_failures_exhausted"`, `"upstream_unavailable"`, or `"draining"`.
   * Conditions:
     * `no_capacity`: No node or instance has capacity to serve the request.
     * `queue_full`: Per-model or global queue is full (always 503, not configurable).
     * `queue_timeout`: Request waited in queue longer than `max_wait_in_queue_ms`.
     * `spawn_failures_exhausted`: Local instance spawn failed repeatedly and no peer could serve the request.
+    * `upstream_unavailable`: Only an external upstream serves the profile on this node, the request is served without it (see **External Upstreams**), and no peer advertises the profile.
     * `draining`: Node is shutting down and not accepting new requests.
 
-For inference `503` responses it generates and draining rejections, the proxy includes a `Retry-After` header hinting how long to wait before retrying: `5` seconds for transient conditions (`queue_full`, `queue_timeout`, `draining`) and `30` seconds for capacity-bound conditions (`no_capacity`, `spawn_failures_exhausted`). Prewarm spawn/admission failures and health/readiness `503` responses do not include this header.
+For inference `503` responses it generates and draining rejections, the proxy includes a `Retry-After` header hinting how long to wait before retrying: `5` seconds for transient conditions (`queue_full`, `queue_timeout`, `draining`), `10` seconds for `upstream_unavailable`, and `30` seconds for capacity-bound conditions (`no_capacity`, `spawn_failures_exhausted`). Prewarm spawn/admission failures and health/readiness `503` responses do not include this header.
 
 ### Health and Readiness
 
@@ -818,13 +883,14 @@ For full semantics (including drain/shutdown behavior), see **Health, Readiness,
 * `GET /metrics` -> Prometheus-style metrics (canonical source for real-time scraping).
 * `GET /metrics/json` -> JSON-encoded metrics for ad-hoc inspection or tooling.
 
-Key `proxy_*` series exposed. Gauges reflect the current moment; most counters are cumulative and persist across restarts via the metrics snapshot. Several are per-process and reset on restart instead: the **Streaming** group, `proxy_instances_crashed_total`, and the `proxy_queue_wait_*` counters.
+Key `proxy_*` series exposed. Gauges reflect the current moment; most counters are cumulative and persist across restarts via the metrics snapshot. Several are per-process and reset on restart instead: the **Streaming** and **External upstreams** groups, `proxy_instances_crashed_total`, and the `proxy_queue_wait_*` counters.
 
-* **Request handling** — `proxy_requests_total`, `proxy_errors_total`, and `proxy_current_requests` count inference requests admitted into routing, their errors, and those still in flight, respectively. They exclude failures before routing admission, such as authentication, body/JSON parsing, invalid model values, and local endpoint incompatibility.
+* **Request handling** — `proxy_requests_total`, `proxy_errors_total`, and `proxy_current_requests` count inference requests admitted into routing, their errors, and those still in flight, respectively. They exclude failures before routing admission, such as authentication, body/JSON parsing, invalid model values, and local endpoint incompatibility. A request held for an external upstream, waiting its turn or sent and not yet answered in full, is in flight.
 * **Queueing** — `proxy_queue_length` (waiting now), `proxy_queue_drops_total{reason}` (`full` / `timeout` / `global_limit`), `proxy_queue_wait_total_ms` and `proxy_queue_wait_count` (cumulative wait time and count), `proxy_queue_pending_tokens`.
 * **Node resources** — `proxy_node_active_instances`; `proxy_node_effective_vram_mb` / `proxy_node_max_vram_mb` (VRAM used for admission vs the configured guardrail) and the `_sysmem_` equivalents; `proxy_node_llamesh_vram_mb`, `proxy_node_llamesh_sysmem_mb` (VRAM and system memory attributed to llamesh-managed instances), `proxy_node_external_vram_mb`, `proxy_node_device_vram_used_mb`, `proxy_node_device_vram_total_mb`; `proxy_node_gpu_telemetry_available` (1/0).
 * **Cluster health & recovery** — `proxy_circuit_breaker_state{peer}` (0=closed, 1=open, 2=half-open), `proxy_wedged_instances_killed_total` (local instances stopped by the wedged-instance watchdog), `proxy_instances_crashed_total` (local instances that exited abnormally — a fault signal or non-zero exit, excluding a graceful `SIGTERM` — observed by the liveness check; per-process, resets on restart).
 * **Streaming** (per-process, reset on restart) — `proxy_peer_stream_body_aborts_total` (forwarded peer streams whose body aborted mid-stream), `proxy_skipped_stream_cleanups_total` (cleanups skipped during shutdown), `proxy_token_counting_disabled_total`.
+* **External upstreams** (per-process, reset on restart; present when the cookbook names an upstream) — `proxy_upstream_healthy{model}` (1/0), `proxy_upstream_requests_total{model}` (responses relayed from the upstream, whatever their status), `proxy_upstream_failures_total{model}` (requests sent to the upstream that got no response and were served without it). `model` is the profile's `model:profile`. Requests an upstream serves are not counted in the `proxy_hash_*` family.
 * **Per model:profile** — the `proxy_hash_*` family (`requests_total`, `errors_total`, `tokens_generated_total`, `total_latency_ms`, `p95_latency_ms`, `peak_vram_mb`, `peak_sysmem_mb`), labeled by `hash` (the profile's args hash) and `names` (comma-separated display names). `proxy_hash_p95_latency_ms` is a gauge over the last 100 locally served request latency samples. Names are sorted lexically so an unchanged name set retains the same label value across restarts.
 * **Build** — `proxy_build_info{version=...,llama_cpp_version=...}` (info series, value `1`; aggregate with `count by (version) (proxy_build_info)`).
 
@@ -832,7 +898,7 @@ Key `proxy_*` series exposed. Gauges reflect the current moment; most counters a
 
 * `GET /cluster/nodes` -> current view of nodes and their capacities.
 * `POST /cluster/gossip` -> internal peer gossip endpoint (used by nodes to exchange state). When Noise is enabled without cluster mTLS, plain HTTP gossip is rejected.
-* `POST /admin/prewarm` -> request pre-warming with JSON `{"model":"name:profile"}`, resolved only against the local cookbook. Success returns 200 `{"status":"ok","message":"Model prewarmed"}`; a missing or non-string `model` returns 400 `{"status":"error","message":"Missing model field"}`, an unresolved model returns 404 `{"status":"error","message":"Model not found"}`, and a spawn/admission failure returns 503 `{"status":"error","message":"..."}`. A cold prewarm starts loading without waiting for readiness.
+* `POST /admin/prewarm` -> request pre-warming with JSON `{"model":"name:profile"}`, resolved only against the local cookbook. Success returns 200 `{"status":"ok","message":"Model prewarmed"}`; a missing or non-string `model` returns 400 `{"status":"error","message":"Missing model field"}`, an unresolved model returns 404 `{"status":"error","message":"Model not found"}`, a profile with only an external upstream returns 400 `{"status":"error","message":"..."}` because it has no instance to start, and a spawn/admission failure returns 503 `{"status":"error","message":"..."}`. A cold prewarm starts loading without waiting for readiness.
 * `POST /admin/rebuild-llama` -> trigger on-demand `llama.cpp` rebuild.
 
 While draining, both administrative POST handlers reject new authorized requests with 503, error type `draining`, and `Retry-After: 5`, including over existing connections. Authentication and drain admission are checked before reading a prewarm body; its configured body deadline and byte limit still apply to admitted requests. Prewarm rechecks draining after body extraction before starting work.
@@ -858,6 +924,7 @@ While draining, both administrative POST handlers reject new authorized requests
 * Look up in cookbook:
 
   * If `<profile>` omitted, use profile with `id == "default"` if present.
+* If the profile has an external upstream that is healthy, the request is sent there, as described under **External Upstreams** in the cookbook reference, and the steps below are skipped. They apply when the profile has no upstream, and when the request is served without it. A profile with only an upstream is then treated as not found locally, except that the error when no peer supports it is `503` `upstream_unavailable`.
 * If not found locally:
 
   * If cluster is enabled, check whether any cluster peer supports the model. If a peer supports it, forward the request to that peer.
@@ -901,7 +968,7 @@ performance_bonus = min(tps, 200) * 5 + min(remaining_slots, 4) * 50
 
 `effective_current_requests` adjusts the gossip-based in-flight count to close the staleness window between gossip ticks:
   * For peers: `peer.current_requests + pending_forwards_to_peer`, where `pending_forwards_to_peer` is the number of requests this node has forwarded to that peer that have not yet completed. This makes bursts visible to the scorer immediately instead of after the next gossip tick.
-  * For self: `self.current_requests - sum(pending_forwards_to_all_peers)`. The edge counter includes forwarded-out requests that don't consume local GPU, so we subtract them to reflect true local processing load.
+  * For self: `self.current_requests - sum(pending_forwards_to_all_peers) - requests_held_for_external_upstreams`. The edge counter includes forwarded-out requests and requests held for external upstreams, which don't consume local GPU, so we subtract them to reflect true local processing load.
 
 Lowest score wins.
 
@@ -1284,6 +1351,8 @@ Outbound peer connections, on both the Noise and the HTTP cluster transports, al
 * TCP keepalive probes a connection after 15 seconds of silence, every 15 seconds, and fails it after 3 unanswered probes. A peer host that disappears without closing its connections (power loss, network partition) therefore fails an in-flight forward within about a minute instead of holding the forwarding node's slot indefinitely. A live peer's kernel answers the probes while a long generation sends no response bytes, so slow requests are unaffected.
 * Silence from a live peer, such as one whose own `llama-server` instance has stalled, is bounded on the node that runs the instance, by its `upstream_read_timeout_ms` and wedged-instance watchdog; the resulting error is returned to the forwarding node. `max_request_duration_ms` remains the end-to-end bound.
 
+Connections to external upstreams have fixed bounds of the same kind. Connecting, TLS handshake included, must complete within 10 seconds, and TCP keepalive probes a connection as it does a peer's, so an upstream host that disappears while a request waits for its response fails that request within about a minute. Either failure leaves the request to be served without the upstream. Silence from a live upstream is bounded by its health checks and by `max_request_duration_ms`; `upstream_read_timeout_ms` does not apply.
+
 Configuration tips:
 
 * Set the node-wide default via `model_defaults.max_wait_in_queue_ms` in `config.yaml`.
@@ -1438,6 +1507,15 @@ Examples of log events:
 
   * `event="route_decision"`, `chosen_node`, and either `candidate_nodes` (prefer-local routing) or `scores` (scored routing).
 
+* External upstreams:
+
+  * `event="upstream_healthy"`, `model`, `url` - A health check passed for an upstream that was unhealthy.
+  * `event="upstream_unhealthy"`, `model`, `url`, `error`, `failed_checks` - Logged at `WARN`, once, when `failure_threshold` health checks in a row have failed; `error` is the last check's status or failure. Later failed checks of the same outage are logged at `DEBUG`.
+  * `event="forward_upstream"`, `url` - A request was sent to an upstream.
+  * `event="upstream_request_failed"`, `url`, `error` - Logged at `WARN` when the upstream gave a request no response and the request is served without it.
+  * `event="upstream_wait_exceeded"`, `url` - A request waited `fallback_after_ms` for its turn and is served without the upstream.
+  * `event="upstream_stream_failed"`, `url`, `error` - Logged at `WARN` when a streamed response broke off after its head had been relayed. The client's response ends early, and the failure counts in `proxy_errors_total`.
+
 * Build manager:
 
   * `event="llama_build_start"`, `branch`, `commit`.
@@ -1482,6 +1560,7 @@ See **Cluster / Mesh Design > Security** above for Noise Protocol and mTLS detai
 
 * Backend API keys may be given to an instance in cookbook `llama_server_args` in the forms `llama-server` accepts: `--api-key` (or `--api-key=...`) with one key or a comma-separated list of keys, or `--api-key-file` naming a file with one key per line (blank lines and lines starting with `#` are skipped). The proxy sends one of the instance's keys as Bearer authorization on every request it forwards to the instance: the first key of the last `--api-key` or `--api-key-file` argument that has one or, when no argument does, a key the instance inherits from the proxy's environment through `LLAMA_API_KEY` or `LLAMA_ARG_API_KEY_FILE`. Keys in llama.cpp's own `config.ini` files are not read. A key file is read when the instance starts, as `llama-server` reads it, so a running instance keeps the key it started with. If a key file cannot be read, or the key cannot be sent in an HTTP header, as with a key file saved with Windows line endings (`llama-server` keeps the `\r` as part of the key), the instance is not started and the request fails with `500`.
 * The proxy logs each instance's `llama-server` arguments when it starts the instance, with the values of `--api-key` and `--hf-token` (`-hft`) replaced by `<redacted>`. `--api-key-file` keeps keys out of the cookbook and out of the process's command line, which other local users can read.
+* A request sent to an external upstream does not carry the API key that admitted it to the node: with API auth enabled, the `auth.required_header` header is removed. An upstream's own `api_key` is kept in the cookbook, so restrict that file's permissions when it holds one.
 * Sensitive values provided via:
 
   * Separate `secrets.yaml` with restricted permissions.

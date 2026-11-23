@@ -211,6 +211,7 @@ mod tests {
                             download_timeout_seconds: None,
                             max_queue_size: None,
                             min_eviction_tenure_secs: None,
+                            upstream: None,
                         },
                         Profile {
                             id: "fast".to_string(),
@@ -230,6 +231,7 @@ mod tests {
                             download_timeout_seconds: None,
                             max_queue_size: None,
                             min_eviction_tenure_secs: None,
+                            upstream: None,
                         },
                         Profile {
                             id: "disabled-profile".to_string(),
@@ -249,6 +251,7 @@ mod tests {
                             download_timeout_seconds: None,
                             max_queue_size: None,
                             min_eviction_tenure_secs: None,
+                            upstream: None,
                         },
                     ],
                 },
@@ -350,6 +353,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, model_present, hf_present) = build_pre_args(&profile);
@@ -380,6 +384,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, model_present, hf_present) = build_pre_args(&profile);
@@ -428,6 +433,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -456,6 +462,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, model_present, _) = build_pre_args(&profile);
@@ -485,6 +492,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -513,6 +521,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -542,6 +551,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -571,6 +581,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -600,6 +611,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -629,6 +641,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -657,6 +670,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -687,6 +701,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
 
         let (args, _, _) = build_pre_args(&profile);
@@ -716,6 +731,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         }
     }
 

@@ -240,6 +240,9 @@ pub struct NodeState {
     /// Synchronous leaf mutex, only touched by the single detector task and
     /// never held across an `.await`, so it is outside the async lock ordering.
     wedge_state: Arc<std::sync::Mutex<WedgeDetectorState>>,
+    /// The external upstreams the cookbook names. Its lock is a synchronous
+    /// leaf, never held across an `.await`.
+    pub upstreams: Arc<crate::upstream::Upstreams>,
     #[cfg(test)]
     test_hooks: Arc<guardrail_tests::TestHooks>,
 }
@@ -678,6 +681,9 @@ impl NodeState {
         // Initialize port pool
         let port_pool = Arc::new(PortPool::new(config.llama_cpp_ports.clone()));
 
+        let upstreams = Arc::new(crate::upstream::Upstreams::new(&config)?);
+        upstreams.reconcile(&cookbook);
+
         Ok(Self {
             config: Arc::new(config),
             gossip_epoch: rand::random_range(1..=u64::MAX),
@@ -717,6 +723,7 @@ impl NodeState {
             peer_pending_forwards: Arc::new(RwLock::new(HashMap::new())),
             logged_peer_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             wedge_state: Arc::new(std::sync::Mutex::new(WedgeDetectorState::default())),
+            upstreams,
         })
     }
 
@@ -732,6 +739,7 @@ impl NodeState {
         // Update model index
         self.model_index.rebuild(&new_cookbook).await;
         self.metrics.migrate_args_hashes(&new_cookbook).await;
+        self.upstreams.reconcile(&new_cookbook);
 
         // Update cookbook
         let mut cookbook = self.cookbook.write().await;
@@ -2496,6 +2504,15 @@ impl NodeState {
         has_priority_token: bool,
         resolved_cookbook_version: u64,
     ) -> Result<Arc<RwLock<Instance>>, NodeError> {
+        // A profile served only by its upstream has no model to load. The
+        // router sends no request for one here; this covers a prewarm, and a
+        // request that was queued when a reload removed the model source.
+        if profile.is_upstream_only() {
+            return Err(NodeError::ModelNotFound(format!(
+                "{model_name}:{}",
+                profile.id
+            )));
+        }
         // Defer retirement wakes across all retries until admission or failure.
         // Dropping the future at any await releases already-completed wakes;
         // in-progress retirements retain theirs until all victims are reaped.
@@ -3359,6 +3376,11 @@ impl NodeState {
                         if profile.effective_max_instances(model_defaults) == 0 {
                             return None;
                         }
+                        // Only its upstream serves this profile, and an
+                        // upstream is used by the node that names it alone.
+                        if profile.is_upstream_only() {
+                            return None;
+                        }
                         // Use bare model name for default profile
                         if profile.id == "default" {
                             Some(model.name.clone())
@@ -3540,7 +3562,9 @@ impl NodeState {
                 .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
                 .collect()
         };
-        let total_pending: usize = pending_snapshot.values().sum();
+        // Requests this node only relays, to peers or to external upstreams.
+        let total_relayed: usize =
+            pending_snapshot.values().sum::<usize>() + self.upstreams.active_requests();
         let self_node_id = self.config.node_id.as_str();
 
         // Intelligent Routing Formula:
@@ -3552,7 +3576,8 @@ impl NodeState {
         // effective_current_requests adjusts the gossip-based count for staleness:
         //   - For peers: peer.current_requests + pending_forwards_from_self_to_peer
         //   - For self:  current_requests - sum(pending_forwards_to_peers)
-        //                (subtract out requests we're forwarding — those don't
+        //                - requests_held_for_external_upstreams
+        //                (subtract out requests we're relaying — those don't
         //                 use our GPU, they just keep our edge counter busy)
         //
         // cold_start_cost: Penalizes nodes that need to start/evict instances
@@ -3570,7 +3595,7 @@ impl NodeState {
             .map(|c| {
                 let is_self = c.node_id == self_node_id;
                 let effective_current = if is_self {
-                    c.current_requests.saturating_sub(total_pending as u64)
+                    c.current_requests.saturating_sub(total_relayed as u64)
                 } else {
                     let pending = pending_snapshot.get(&c.node_id).copied().unwrap_or(0) as u64;
                     c.current_requests.saturating_add(pending)
@@ -4646,6 +4671,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         }
     }
 
@@ -5620,6 +5646,88 @@ mod tests {
         // yields the "unknown" sentinel, which is what gossip and
         // /cluster/nodes will carry for this node.
         assert_eq!(self_peer.llama_cpp_version, "unknown");
+    }
+
+    #[tokio::test]
+    async fn a_profile_served_only_by_its_upstream_is_neither_advertised_nor_started() {
+        let mut config = minimal_node_config();
+        config.cluster.enabled = false;
+        let upstream: crate::config::UpstreamConfig =
+            serde_yaml::from_str("{url: 'http://127.0.0.1:9'}").unwrap();
+
+        let mut with_local_model = sample_profile();
+        with_local_model.id = "with-local-model".into();
+        with_local_model.upstream = Some(upstream.clone());
+
+        let mut upstream_only = sample_profile();
+        upstream_only.id = "upstream-only".into();
+        upstream_only.model_path = None;
+        upstream_only.upstream = Some(upstream);
+
+        let cookbook = Cookbook {
+            models: vec![Model {
+                name: "local-model".into(),
+                description: None,
+                enabled: true,
+                profiles: vec![with_local_model, upstream_only.clone()],
+            }],
+        };
+        let build_manager = BuildManager::new(config.llama_cpp.clone());
+        let state = NodeState::new(config, cookbook, build_manager)
+            .await
+            .unwrap();
+
+        // Peers hear only of what this node can run itself.
+        assert_eq!(
+            state.get_self_peer_state().await.supported_models,
+            ["local-model:with-local-model"]
+        );
+
+        // Neither a request nor a prewarm starts an instance with no model.
+        for reserve_slot in [true, false] {
+            match state
+                .try_get_or_spawn("local-model", &upstream_only, reserve_slot, "test", false)
+                .await
+            {
+                Err(NodeError::ModelNotFound(key)) => {
+                    assert_eq!(key, "local-model:upstream-only")
+                }
+                other => panic!("unexpected outcome: {:?}", other.err()),
+            }
+        }
+        assert!(state.instances.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn requests_held_for_upstreams_do_not_count_as_this_nodes_load() {
+        let state = exclusion_test_state(Cookbook {
+            models: vec![Model {
+                name: "remote-model".into(),
+                description: None,
+                enabled: true,
+                profiles: vec![sample_profile()],
+            }],
+        })
+        .await;
+        let mut peer = fresh_selection_peer("peer");
+        peer.current_requests = 20;
+        state.peers.write().await.insert(peer.node_id.clone(), peer);
+        let chosen = || async {
+            state
+                .select_best_node("remote-model", &sample_profile(), false, &HashSet::new())
+                .await
+                .unwrap()
+                .node_id
+        };
+
+        // A hundred requests in flight make this node the worse choice...
+        state.metrics.current_requests.store(100, Ordering::Relaxed);
+        assert_eq!(chosen().await, "peer");
+        // ...unless it is only relaying them to an upstream.
+        for _ in 0..100 {
+            state.upstreams.request_started();
+        }
+        assert_eq!(chosen().await, state.config.node_id);
     }
 
     #[tokio::test]

@@ -107,6 +107,16 @@ impl AppError {
         Self::new(StatusCode::BAD_GATEWAY, message, "upstream_error")
     }
 
+    /// `503` for a profile that only an external upstream serves, while that
+    /// upstream is unavailable and no peer serves the profile either.
+    pub fn upstream_unavailable(model: &str) -> Self {
+        Self::service_unavailable(
+            format!("The upstream that serves model '{model}' is unavailable"),
+            "upstream_unavailable",
+        )
+        .with_header(RETRY_AFTER, HeaderValue::from_static("10"))
+    }
+
     pub fn request_timeout(message: impl Into<String>) -> Self {
         Self::new(StatusCode::REQUEST_TIMEOUT, message, "request_timeout")
     }

@@ -907,8 +907,9 @@ pub struct Profile {
     pub idle_timeout_seconds: u64,
     #[serde(default)]
     pub max_instances: Option<usize>,
-    /// llama-server arguments as a shell-style string (e.g., "-fa on --no-kv-offload")
-    #[serde(deserialize_with = "deserialize_llama_server_args")]
+    /// llama-server arguments as a shell-style string (e.g., "-fa on --no-kv-offload").
+    /// Omitting it is the same as an empty string.
+    #[serde(default, deserialize_with = "deserialize_llama_server_args")]
     pub llama_server_args: Vec<String>,
     /// Optional static VRAM estimate in MiB. Used only until runtime sampling
     /// learns memory for this profile's launch args.
@@ -936,6 +937,154 @@ pub struct Profile {
     /// Override the global min_eviction_tenure_secs for this profile.
     #[serde(default)]
     pub min_eviction_tenure_secs: Option<u64>,
+    /// An OpenAI-compatible endpoint that serves this profile's requests in
+    /// place of a local instance while it is healthy.
+    #[serde(default)]
+    pub upstream: Option<UpstreamConfig>,
+}
+
+/// An OpenAI-compatible endpoint that llamesh does not start: an inference
+/// server on another machine, or a hosted API.
+#[derive(Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamConfig {
+    /// Base URL. The path and query of the client's request are appended.
+    pub url: String,
+    /// Model name sent to the upstream in place of the one the client sent.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Sent to the upstream as `Authorization: Bearer <api_key>`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Requests the upstream is given at once; further requests wait their
+    /// turn. Defaults to `model_defaults.max_concurrent_requests_per_instance`.
+    /// 0 = unlimited.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    /// How long a request waits for its turn before it is routed as if the
+    /// profile had no upstream. 0 = no wait. Unset, a request waits for the
+    /// upstream as long as it may wait in a queue.
+    #[serde(default)]
+    pub fallback_after_ms: Option<u64>,
+    #[serde(default)]
+    pub health_check: UpstreamHealthCheck,
+}
+
+impl std::fmt::Debug for UpstreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamConfig")
+            .field("url", &self.url)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("fallback_after_ms", &self.fallback_after_ms)
+            .field("health_check", &self.health_check)
+            .finish()
+    }
+}
+
+/// How an upstream's health is checked: `GET <url><path>` every `interval_ms`.
+/// A 2xx response within `timeout_ms` passes.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamHealthCheck {
+    #[serde(default = "default_upstream_health_path")]
+    pub path: String,
+    #[serde(default = "default_upstream_health_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default = "default_upstream_health_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Consecutive failed checks after which the upstream is unhealthy. One
+    /// passed check makes it healthy again.
+    #[serde(default = "default_upstream_health_failure_threshold")]
+    pub failure_threshold: u32,
+}
+
+impl Default for UpstreamHealthCheck {
+    fn default() -> Self {
+        Self {
+            path: default_upstream_health_path(),
+            interval_ms: default_upstream_health_interval_ms(),
+            timeout_ms: default_upstream_health_timeout_ms(),
+            failure_threshold: default_upstream_health_failure_threshold(),
+        }
+    }
+}
+
+fn default_upstream_health_path() -> String {
+    "/v1/models".to_string()
+}
+
+fn default_upstream_health_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_upstream_health_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_upstream_health_failure_threshold() -> u32 {
+    3
+}
+
+impl UpstreamConfig {
+    /// The upstream's URL for `path_and_query`, which starts with `/`.
+    pub fn endpoint(&self, path_and_query: &str) -> String {
+        format!("{}{path_and_query}", self.url.trim_end_matches('/'))
+    }
+
+    fn validate(&self, model_name: &str, profile_id: &str) -> anyhow::Result<()> {
+        let invalid = |problem: &str| {
+            anyhow::anyhow!("Profile {model_name}:{profile_id} has an invalid upstream: {problem}")
+        };
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|e| invalid(&format!("url '{}' does not parse: {e}", self.url)))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(invalid(&format!(
+                "url '{}' must be an http or https URL with a host",
+                self.url
+            )));
+        }
+        // The URL is logged and listed by /v1/models.
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(invalid(
+                "url must not carry credentials; set 'api_key' instead",
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(invalid(&format!(
+                "url '{}' must not have a query or fragment, because the request path is appended to it",
+                self.url
+            )));
+        }
+        if self.model.as_deref().is_some_and(|model| model.is_empty()) {
+            return Err(invalid(
+                "'model' is empty; omit it to send the request's own model",
+            ));
+        }
+        if let Some(key) = &self.api_key {
+            if key.is_empty()
+                || axum::http::HeaderValue::from_str(&format!("Bearer {key}")).is_err()
+            {
+                return Err(invalid(
+                    "'api_key' is empty or has characters an HTTP header cannot carry",
+                ));
+            }
+        }
+        let check = &self.health_check;
+        if !check.path.starts_with('/') {
+            return Err(invalid(&format!(
+                "health_check.path '{}' must start with '/'",
+                check.path
+            )));
+        }
+        if check.interval_ms == 0 || check.timeout_ms == 0 || check.failure_threshold == 0 {
+            return Err(invalid(
+                "health_check interval_ms, timeout_ms and failure_threshold must be at least 1",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Profile {
@@ -984,16 +1133,34 @@ impl Profile {
         !self.supports_embeddings() && !self.supports_rerank()
     }
 
+    /// Whether the profile names a model for a local instance to load: a
+    /// `model_path`, an `hf_repo`, or a model flag in `llama_server_args`.
+    /// Only a profile with an `upstream` can be without one; this node then
+    /// never starts an instance of it.
+    pub fn has_model_source(&self) -> bool {
+        self.model_path.is_some()
+            || self.hf_repo.is_some()
+            || self.has_flag(&["-m", "--model", "-hf", "-hfr", "--hf-repo"])
+    }
+
+    /// Whether only the profile's upstream can serve it.
+    pub fn is_upstream_only(&self) -> bool {
+        self.upstream.is_some() && !self.has_model_source()
+    }
+
     pub fn validate(&self, model_name: &str) -> anyhow::Result<()> {
-        // Validate model source: model_path, hf_repo, or a model flag in the args
+        // A profile needs something to serve it: a model source (model_path,
+        // hf_repo, or a model flag in the args) for a local instance, an
+        // upstream, or both.
         let has_model_path = self.model_path.is_some();
         let has_hf_repo = self.hf_repo.is_some();
-        let has_model_in_args = self.has_flag(&["-m", "--model"]);
         let has_hf_in_args = self.has_flag(&["-hf", "-hfr", "--hf-repo"]);
 
-        if !has_model_path && !has_hf_repo && !has_model_in_args && !has_hf_in_args {
+        if let Some(upstream) = &self.upstream {
+            upstream.validate(model_name, &self.id)?;
+        } else if !self.has_model_source() {
             return Err(anyhow::anyhow!(
-                "Profile {}:{} must specify either 'model_path', 'hf_repo', or include -m/--model/-hf/-hfr/--hf-repo in llama_server_args",
+                "Profile {}:{} must specify either 'model_path', 'hf_repo', or include -m/--model/-hf/-hfr/--hf-repo in llama_server_args, or name an 'upstream'",
                 model_name, self.id
             ));
         }
@@ -1281,6 +1448,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         }
     }
 
@@ -1968,6 +2136,7 @@ models:
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
         assert!(profile.validate("test_model").is_err());
     }
@@ -1992,6 +2161,7 @@ models:
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
         assert!(profile.validate("test_model").is_err());
     }
@@ -2016,6 +2186,7 @@ models:
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
         assert!(profile.validate("test_model").is_ok());
     }
@@ -2040,6 +2211,7 @@ models:
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         };
         assert!(profile.validate("test_model").is_ok());
     }
@@ -2574,6 +2746,129 @@ models:
 "#;
             let cookbook = parse_cookbook(yaml).unwrap();
             assert!(!cookbook.models[0].profiles[0].enabled);
+        }
+    }
+
+    mod upstream_profiles {
+        use super::*;
+
+        /// A profile from YAML, which may fail to parse or to validate.
+        fn profile(yaml: &str) -> anyhow::Result<Profile> {
+            let profile: Profile = serde_yaml::from_str(yaml)?;
+            profile.validate("model")?;
+            Ok(profile)
+        }
+
+        fn with_upstream(upstream: &str) -> anyhow::Result<Profile> {
+            profile(&format!("id: default\nupstream: {upstream}"))
+        }
+
+        #[test]
+        fn an_upstream_serves_a_profile_with_no_model_of_its_own() {
+            let profile = with_upstream("{url: 'http://embedder.example:8081'}").unwrap();
+            assert!(profile.is_upstream_only());
+            assert!(profile.llama_server_args.is_empty());
+
+            let upstream = profile.upstream.unwrap();
+            assert_eq!(upstream.model, None);
+            assert_eq!(upstream.max_concurrent_requests, None);
+            assert_eq!(upstream.fallback_after_ms, None);
+            assert_eq!(
+                upstream.health_check,
+                UpstreamHealthCheck {
+                    path: "/v1/models".into(),
+                    interval_ms: 10_000,
+                    timeout_ms: 5_000,
+                    failure_threshold: 3,
+                }
+            );
+        }
+
+        #[test]
+        fn a_profile_can_have_both_an_upstream_and_a_local_model() {
+            let profile = profile(
+                "{id: default, model_path: /models/m.gguf, llama_server_args: '--embedding', \
+                 upstream: {url: 'https://api.example/base/', model: other, api_key: key, \
+                 max_concurrent_requests: 1, fallback_after_ms: 2000, \
+                 health_check: {path: /health, interval_ms: 500, \
+                 timeout_ms: 250, failure_threshold: 1}}}",
+            )
+            .unwrap();
+            assert!(!profile.is_upstream_only());
+            let upstream = profile.upstream.unwrap();
+            assert_eq!(upstream.max_concurrent_requests, Some(1));
+            assert_eq!(upstream.fallback_after_ms, Some(2000));
+            // The request path is appended to the URL, whatever its trailing slash.
+            assert_eq!(
+                upstream.endpoint("/v1/embeddings?x=1"),
+                "https://api.example/base/v1/embeddings?x=1"
+            );
+            assert_eq!(
+                upstream.endpoint("/health"),
+                "https://api.example/base/health"
+            );
+        }
+
+        #[test]
+        fn a_profile_needs_a_model_source_or_an_upstream() {
+            let error = profile("id: default").unwrap_err().to_string();
+            assert!(error.contains("or name an 'upstream'"), "{error}");
+            // A model flag in the args is a model source, as it is without an upstream.
+            assert!(!profile(
+                "{id: default, llama_server_args: '-m /models/m.gguf', upstream: {url: 'http://h'}}"
+            )
+            .unwrap()
+            .is_upstream_only());
+        }
+
+        #[test]
+        fn invalid_upstreams_are_rejected() {
+            for upstream in [
+                // Not an http(s) URL with a host.
+                "{url: 'embedder.example:8081'}",
+                "{url: 'ftp://embedder.example'}",
+                "{url: '/v1'}",
+                // The request path could not be appended.
+                "{url: 'http://h/v1?key=1'}",
+                "{url: 'http://h/v1#top'}",
+                // The URL is logged, so it must not carry credentials.
+                "{url: 'http://user:secret@h'}",
+                "{url: 'http://h', model: ''}",
+                "{url: 'http://h', api_key: ''}",
+                "{url: 'http://h', api_key: \"two\\nlines\"}",
+                "{url: 'http://h', health_check: {path: health}}",
+                "{url: 'http://h', health_check: {interval_ms: 0}}",
+                "{url: 'http://h', health_check: {timeout_ms: 0}}",
+                "{url: 'http://h', health_check: {failure_threshold: 0}}",
+                // A misspelled setting must not be silently ignored.
+                "{url: 'http://h', max_concurrency: 1}",
+                "{url: 'http://h', health_check: {interval: 5}}",
+                "{model: other}",
+            ] {
+                assert!(with_upstream(upstream).is_err(), "accepted {upstream}");
+            }
+        }
+
+        #[test]
+        fn an_invalid_upstream_fails_the_whole_cookbook() {
+            let cookbook: Cookbook = serde_yaml::from_str(
+                "models: [{name: m, profiles: [{id: default, model_path: /m.gguf, \
+                 upstream: {url: 'http://h', health_check: {timeout_ms: 0}}}]}]",
+            )
+            .unwrap();
+            let error = cookbook.validate().unwrap_err().to_string();
+            assert!(
+                error.starts_with("Profile m:default has an invalid upstream:"),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn debug_output_leaves_out_the_api_key() {
+            let profile = with_upstream("{url: 'http://h', api_key: hunter2}").unwrap();
+            let printed = format!("{profile:?}");
+            assert!(!printed.contains("hunter2"), "{printed}");
+            assert!(printed.contains("<redacted>"), "{printed}");
         }
     }
 }

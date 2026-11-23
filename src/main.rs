@@ -19,6 +19,7 @@ mod router;
 mod security;
 #[cfg(test)]
 mod test_support;
+mod upstream;
 mod util;
 mod wedge_detector;
 

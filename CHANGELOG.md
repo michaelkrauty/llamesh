@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.0] - 2026-11-23
+
+### Added
+
+- Serve a profile from an external upstream. A cookbook profile can name an `upstream`: an OpenAI-compatible endpoint that the proxy does not start, such as an inference server on another machine or a hosted API. While the upstream passes its health check (`GET` on a configurable path, at a configurable interval, with a failure threshold) it serves every request for the profile, and the node starts no instance of it. Requests beyond `max_concurrent_requests` wait their turn in arrival order rather than going to a local instance, unless `fallback_after_ms` bounds that wait. Any response is relayed as it is, with `x-llamesh-backend: upstream` added, and a client that disconnects has its upstream request cancelled. While the upstream is unhealthy, and for a request it gives no response to, the profile's own model or a peer serves instead; a profile may also have an upstream and no model of its own. `model` and `api_key` set the model name and the bearer key the upstream is sent, and the header carrying the node's own API key is never forwarded. `/v1/models` shows each upstream's URL and health, `/metrics` has `proxy_upstream_healthy`, `proxy_upstream_requests_total`, and `proxy_upstream_failures_total`, and health changes are logged as `upstream_healthy` and `upstream_unhealthy`. An upstream belongs to the node whose cookbook names it and is not advertised to peers. SPEC.md describes the settings and the behavior under **External Upstreams**.
+
+### Changed
+
+- `llama_server_args` may be omitted from a profile, which is the same as an empty string. It was a required field, so a cookbook without it failed to load.
+- Requests a node holds for external upstreams do not count as its load when it scores itself against its peers for routing, as requests it forwards to peers already do not.
+
 ## [1.22.7] - 2026-11-16
 
 ### Fixed

@@ -1159,7 +1159,7 @@ pub async fn render_prometheus_with_circuit_breaker(
     out
 }
 
-fn escape_label_value(s: &str) -> String {
+pub(crate) fn escape_label_value(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
