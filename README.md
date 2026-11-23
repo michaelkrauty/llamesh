@@ -14,6 +14,7 @@ Point any OpenAI-compatible client at llamesh and it handles the rest: spinning 
 - **Hot-reload cookbook** — add/modify models without restarting
 - **Auto-build llama.cpp** — clones, builds, smoke tests, and atomically swaps binaries
 - **Hugging Face integration** — download models automatically via `hf_repo`/`hf_file`
+- **External upstreams** — serve a model from any OpenAI-compatible endpoint, with health checks and fallback to a local instance
 - **Streaming** — SSE streaming with backpressure, forwarded verbatim
 - **Metrics & health** — Prometheus metrics, JSON snapshots, `/healthz` and `/readyz` probes
 - **Security** — TLS, API key auth, Noise Protocol encryption for inter-node traffic
@@ -177,6 +178,26 @@ models:
         hf_file: "qwen2.5-0.5b-instruct-q4_k_m.gguf"
         llama_server_args: "-c 32768 -fa on"
 ```
+
+## External Upstreams
+
+A profile can be served by an OpenAI-compatible endpoint that llamesh does not start, such as an inference server on another machine or a hosted API:
+
+```yaml
+models:
+  - name: "embedder"
+    profiles:
+      - id: "default"
+        model_path: "./models/embedder.Q8_0.gguf"  # optional: the local fallback
+        llama_server_args: "--embedding"
+        upstream:
+          url: "http://embedder.example:8081"
+          max_concurrent_requests: 1
+          health_check:
+            path: "/health"
+```
+
+While the upstream's health check passes, it serves every request for the profile and no local instance is started; requests beyond its concurrency limit wait their turn. While it is unhealthy or cannot be reached, the profile's own model, or a peer, serves the requests instead. A response from an upstream carries the header `x-llamesh-backend: upstream`. See [SPEC.md](SPEC.md) for the settings and the exact behavior.
 
 ## Environment Variable Overrides
 

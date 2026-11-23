@@ -44,13 +44,15 @@ async fn metrics_handler(
         .metrics
         .set_queue_length(state.total_queue_length().await);
     let llama_cpp_version = state.build_manager.get_version().await;
-    Ok(metrics::render_prometheus_with_circuit_breaker(
+    let mut rendered = metrics::render_prometheus_with_circuit_breaker(
         &state.metrics,
         Some(&state.circuit_breaker),
         &llama_cpp_version,
         state.started_at_unix,
     )
-    .await)
+    .await;
+    rendered.push_str(&state.upstreams.render_prometheus());
+    Ok(rendered)
 }
 
 /// Build the `/version` response body. The proxy `version` is always present;
@@ -323,6 +325,13 @@ async fn prewarm_handler(
             .cookbook_version
             .load(std::sync::atomic::Ordering::SeqCst);
         if let Some((model_name, profile)) = state.resolve_model(model_str).await {
+            if profile.is_upstream_only() {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"status": "error", "message": "Model is served by an external upstream only; there is no instance to prewarm"})),
+                )
+                    .into_response();
+            }
             match state
                 .get_instance_for_model(
                     &model_name,

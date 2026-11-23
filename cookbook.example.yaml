@@ -10,7 +10,6 @@
 # Minimal profile (only required fields):
 #   - id: "default"
 #     model_path: "./models/my-model.gguf"
-#     llama_server_args: ""
 #
 # Profile defaults:
 #   enabled: true                    # set false to hide/disable one profile
@@ -22,6 +21,8 @@
 #   estimated_vram_mb: unset         # optional cold-start admission hint
 #   estimated_sysmem_mb: unset       # optional cold-start admission hint
 #   min_eviction_tenure_secs: (from model_defaults, default 15)  # per-profile override
+#   llama_server_args: ""            # no arguments beyond those the proxy adds
+#   upstream: unset                  # see "Model served by an external upstream" below
 #
 # NOTE: The proxy parses context_size, batch size, etc. from llama-server's
 # startup log. Use llama_server_args to configure -c, -b, -n if needed.
@@ -128,6 +129,46 @@ models:
         # --api-key-file reads them from a file, one per line, which keeps
         # them out of the cookbook and the process list.
         llama_server_args: "--alias protected-model -c 4096 --api-key instance-secret-key"
+
+  # ---------------------------------------------------------------------------
+  # Model served by an external upstream
+  # ---------------------------------------------------------------------------
+  # An upstream is an OpenAI-compatible endpoint that llamesh does not start:
+  # an inference server on another machine, or a hosted API. While its health
+  # check passes it serves every request for the profile, and this node starts
+  # no instance of it. The profile's own model, when it has one as here, takes
+  # over while the upstream is unhealthy or cannot be reached.
+  - name: "embedder"
+    description: "Embeddings from another machine, with a local fallback"
+    profiles:
+      - id: "default"
+        model_path: "./models/embedder.Q8_0.gguf"
+        llama_server_args: "--alias embedder -c 8192 --embedding"
+        max_wait_in_queue_ms: 600000    # also bounds the wait for a turn at the upstream
+        max_request_duration_ms: 900000 # also bounds a request sent to the upstream
+        upstream:
+          url: "http://embedder.example:8081"  # the request's path is appended
+          # model: "embedder-v1"       # model name to send (default: the request's own)
+          # api_key: "upstream-key"    # sent as "Authorization: Bearer upstream-key"
+          max_concurrent_requests: 1   # further requests wait their turn; 0=unlimited
+                                       # (default: model_defaults.max_concurrent_requests_per_instance)
+          # fallback_after_ms: 30000   # serve a request locally once it has waited this
+                                       # long for its turn; 0=never wait (default: keep waiting)
+          health_check:                # GET <url><path>, any 2xx passes
+            path: "/health"            # default: "/v1/models"
+            interval_ms: 10000         # default: 10000
+            timeout_ms: 5000           # default: 5000
+            failure_threshold: 3       # failed checks in a row that make it unhealthy (default: 3)
+
+  # Without a model of its own, only its upstream serves a profile.
+  - name: "hosted-model"
+    description: "Served by a hosted API"
+    profiles:
+      - id: "default"
+        upstream:
+          url: "https://api.example.com"
+          model: "provider-model-name"
+          api_key: "upstream-key"
 
   # ---------------------------------------------------------------------------
   # Disabled model (kept for reference)

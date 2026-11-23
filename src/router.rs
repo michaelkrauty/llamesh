@@ -4,12 +4,13 @@ use crate::errors::AppError;
 use crate::instance::Instance;
 use crate::metrics::{HashMetrics, Metrics};
 use crate::node_state::{NodeError, NodeState};
+use crate::upstream::Upstream;
 use crate::util::error_chain;
 use axum::{
     body::Body,
     extract::{Path, State},
     http::{
-        header::{CONNECTION, CONTENT_LENGTH, HOST, RETRY_AFTER},
+        header::{AUTHORIZATION, CONNECTION, CONTENT_LENGTH, HOST, RETRY_AFTER},
         HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode,
     },
     response::IntoResponse,
@@ -32,6 +33,11 @@ use tokio::time::timeout;
 use tracing::{error, info, warn, Instrument};
 
 const DISCONNECT_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Response header naming the kind of backend a relayed response came from.
+/// Set to `upstream` on a response from an external upstream; a response from
+/// a `llama-server` instance does not carry it.
+const BACKEND_HEADER: HeaderName = HeaderName::from_static("x-llamesh-backend");
 
 fn node_error_to_app_error(error: NodeError, node_id: &str) -> AppError {
     match error {
@@ -588,6 +594,52 @@ pub(crate) fn build_local_upstream_headers(
     headers
 }
 
+/// Build the headers of a request forwarded to an external upstream: the
+/// client's end-to-end fields, without the hop count, which means nothing
+/// outside the mesh, and without the credential that admitted the request to
+/// this node, which must not leave it. When the upstream has a key of its own,
+/// that replaces any `Authorization` the client sent.
+fn build_external_upstream_headers(
+    source: &HeaderMap,
+    auth: Option<&crate::config::AuthConfig>,
+    api_key: Option<&str>,
+) -> HeaderMap {
+    let mut headers = build_local_upstream_headers(source, false);
+    headers.remove("x-llama-mesh-hops");
+    if let Some(auth) = auth.filter(|auth| auth.enabled) {
+        if let Ok(name) = HeaderName::from_bytes(auth.required_header.as_bytes()) {
+            headers.remove(name);
+        }
+    }
+    // Cookbook validation rejects a key that is not a valid header value.
+    if let Some(Ok(mut value)) = api_key.map(|key| HeaderValue::from_str(&format!("Bearer {key}")))
+    {
+        value.set_sensitive(true);
+        headers.insert(AUTHORIZATION, value);
+    }
+    headers
+}
+
+/// The body of a request forwarded to an external upstream: the bytes a local
+/// instance would get or, when the upstream knows the model by another name,
+/// the same JSON re-encoded with that name as its `model`.
+fn external_upstream_body(body: &Bytes, model: Option<&str>) -> Bytes {
+    let Some(model) = model else {
+        return body.clone();
+    };
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Object(mut object))
+            if object.get("model").and_then(Value::as_str) != Some(model) =>
+        {
+            object.insert("model".to_owned(), Value::String(model.to_owned()));
+            serde_json::to_vec(&object)
+                .map(Bytes::from)
+                .unwrap_or_else(|_| body.clone())
+        }
+        _ => body.clone(),
+    }
+}
+
 fn build_forward_headers(source: &HeaderMap, current_hops: usize, request_id: &str) -> HeaderMap {
     // A clone keeps every value of a repeated header (e.g. multiple Cookie
     // lines), which a per-pair `insert` would collapse to the last one.
@@ -708,6 +760,273 @@ async fn send_peer_request(
     }
 }
 
+/// A request held for an external upstream. Until dropped it counts as in
+/// flight on this node, and among the requests the node only relays.
+struct UpstreamRequestGuard {
+    state: Arc<NodeState>,
+}
+
+impl UpstreamRequestGuard {
+    fn new(state: Arc<NodeState>) -> Self {
+        state.metrics.inc_requests();
+        state.upstreams.request_started();
+        Self { state }
+    }
+}
+
+impl Drop for UpstreamRequestGuard {
+    fn drop(&mut self) {
+        self.state.metrics.dec_current_requests();
+        self.state.upstreams.request_finished();
+    }
+}
+
+struct UpstreamRequest<'a> {
+    conn: &'a Option<ConnectionHandle>,
+    queue_deadline: Option<tokio::time::Instant>,
+    model_name: &'a str,
+    /// Requests that may wait for a turn at the upstream; 0 is no limit.
+    max_queue_size: usize,
+    method: Method,
+    path_and_query: &'a str,
+    headers: &'a HeaderMap,
+    body: &'a Bytes,
+    /// `max_request_duration_ms`; 0 is no limit.
+    timeout_ms: u64,
+    response_streaming: bool,
+}
+
+enum UpstreamExchange {
+    /// A whole response. Nothing of it has been sent to the client.
+    Complete {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+    /// The head of a streamed response, relayed as its body arrives.
+    Streaming(reqwest::Response),
+}
+
+/// Offer a request to its profile's external upstream. `Ok(Some(_))` is the
+/// upstream's response, of any status, to relay. `Ok(None)` means the upstream
+/// is unavailable, or failed before the client was sent anything; the request
+/// is then routed as if its profile had no upstream.
+async fn try_external_upstream(
+    state: &Arc<NodeState>,
+    upstream: &Upstream,
+    request: UpstreamRequest<'_>,
+) -> Result<Option<Response<Body>>, AppError> {
+    if !upstream.is_healthy() {
+        return Ok(None);
+    }
+    let guard = UpstreamRequestGuard::new(state.clone());
+    let response = send_to_external_upstream(state, upstream, request, guard).await?;
+    if response.is_none() {
+        // The route the request takes from here counts it again.
+        state.metrics.requests_total.fetch_sub(1, Ordering::Relaxed);
+    }
+    Ok(response)
+}
+
+async fn send_to_external_upstream(
+    state: &Arc<NodeState>,
+    upstream: &Upstream,
+    request: UpstreamRequest<'_>,
+    guard: UpstreamRequestGuard,
+) -> Result<Option<Response<Body>>, AppError> {
+    let conn = request.conn;
+    let turn = match upstream.try_turn() {
+        Some(turn) => turn,
+        None => {
+            // The profile may bound the wait for a turn. When that passes,
+            // its other targets take the request.
+            let fallback_at = match upstream.config.fallback_after_ms {
+                Some(0) => return Ok(None),
+                wait => wait.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms)),
+            };
+            let Some(_waiting) = upstream.wait_in_line(request.max_queue_size) else {
+                info!(event = "queue_drop", reason = "full", model = %request.model_name);
+                state
+                    .metrics
+                    .record_queue_drop(crate::metrics::QueueDropReason::Full);
+                state.metrics.inc_errors();
+                return Err(node_error_to_app_error(
+                    NodeError::QueueFull,
+                    &state.config.node_id,
+                ));
+            };
+            // Kept across the wakes below: a request that asked again would
+            // lose its place in line.
+            let next_turn = upstream.turn();
+            tokio::pin!(next_turn);
+            loop {
+                // A drain wakes capacity waiters once, so subscribe before
+                // the preflight checks for it.
+                let capacity = state.capacity_notify.notified();
+                routing_preflight(
+                    state,
+                    conn,
+                    request.queue_deadline,
+                    request.model_name,
+                    None,
+                )
+                .map_err(|error| *error)?;
+                tokio::select! {
+                    biased;
+                    turn = &mut next_turn => break turn,
+                    _ = upstream.unavailable() => return Ok(None),
+                    _ = async {
+                        match fallback_at {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        info!(
+                            event = "upstream_wait_exceeded",
+                            url = %upstream.config.url,
+                            "No turn at the external upstream in time, routing the request elsewhere"
+                        );
+                        return Ok(None);
+                    }
+                    woken = wait_for_capacity_or_disconnect(
+                        capacity,
+                        conn,
+                        request.queue_deadline,
+                        state,
+                        request.model_name,
+                        None,
+                    ) => woken?,
+                }
+            }
+        }
+    };
+    // Checked with the turn in hand, whether or not the request waited for
+    // it: a drain can begin while the request's body is still being read,
+    // and a wait can outlast the client's patience and the upstream's health.
+    if state.draining.load(Ordering::Relaxed) {
+        state.metrics.inc_errors();
+        return Err(AppError::node_draining(&state.config.node_id));
+    }
+    if conn.as_ref().is_some_and(ConnectionHandle::is_client_gone) {
+        return Err(AppError::client_disconnected());
+    }
+    if !upstream.is_healthy() {
+        return Ok(None);
+    }
+
+    let url = upstream.config.endpoint(request.path_and_query);
+    info!(event = "forward_upstream", url = %url, "Forwarding to external upstream");
+    let mut outbound = state
+        .upstreams
+        .client()
+        .request(request.method, &url)
+        .headers(build_external_upstream_headers(
+            request.headers,
+            state.config.auth.as_ref(),
+            upstream.config.api_key.as_deref(),
+        ))
+        .body(external_upstream_body(
+            request.body,
+            upstream.config.model.as_deref(),
+        ));
+    if request.timeout_ms > 0 {
+        outbound = outbound.timeout(Duration::from_millis(request.timeout_ms));
+    }
+    let streaming = request.response_streaming;
+    let exchange = async {
+        let response = outbound.send().await?;
+        if streaming {
+            return Ok(UpstreamExchange::Streaming(response));
+        }
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.bytes().await?;
+        Ok::<_, reqwest::Error>(UpstreamExchange::Complete {
+            status,
+            headers,
+            body,
+        })
+    };
+    // Until the client has been sent something, the request can still be
+    // served elsewhere, so it does not wait on an upstream found unhealthy.
+    // Dropping the exchange closes its connection, which tells the upstream
+    // to stop working on the request.
+    let exchange =
+        await_unless_client_gone(conn, DISCONNECT_POLL_INTERVAL, "external_upstream", async {
+            tokio::select! {
+                biased;
+                exchange = exchange => Some(exchange),
+                _ = upstream.unhealthy() => None,
+            }
+        })
+        .await?;
+
+    let failure = match exchange {
+        Some(Ok(exchange)) => {
+            upstream.requests_total.fetch_add(1, Ordering::Relaxed);
+            let mut response = match exchange {
+                UpstreamExchange::Complete {
+                    status,
+                    headers,
+                    body,
+                } => relayed_response(status, headers, Body::from(body)),
+                UpstreamExchange::Streaming(response) => {
+                    // The stream keeps the request's turn, and its place in
+                    // the in-flight count, until it ends.
+                    let cleanup: BoxFuture<'static, ()> =
+                        Box::pin(async move { drop((guard, turn)) });
+                    // The client has the head by now, so a stream that
+                    // breaks off can only be reported.
+                    let metrics = state.metrics.clone();
+                    let status = response.status();
+                    let headers = response.headers().clone();
+                    let body = response.bytes_stream().inspect_err(move |e| {
+                        metrics.inc_errors();
+                        warn!(
+                            event = "upstream_stream_failed",
+                            url = %url,
+                            error = %error_chain(e),
+                            "External upstream's streamed response broke off"
+                        );
+                    });
+                    build_streaming_response_from_parts(
+                        status,
+                        headers,
+                        body,
+                        cleanup,
+                        Arc::new(AtomicU64::new(0)),
+                        false,
+                    )
+                }
+            };
+            response
+                .headers_mut()
+                .insert(BACKEND_HEADER, HeaderValue::from_static("upstream"));
+            return Ok(Some(response));
+        }
+        // The request ran for its `max_request_duration_ms`. That limit is
+        // the request's own, so it is not started again elsewhere.
+        Some(Err(e)) if e.is_timeout() && !e.is_connect() => {
+            let detail = error_chain(&e);
+            error!("Upstream error: {}", detail);
+            state.metrics.inc_errors();
+            return Err(AppError::upstream_error(format!(
+                "Upstream error: {detail}"
+            )));
+        }
+        Some(Err(e)) => error_chain(&e),
+        None => "the upstream became unhealthy before it responded".to_owned(),
+    };
+    upstream.failures_total.fetch_add(1, Ordering::Relaxed);
+    warn!(
+        event = "upstream_request_failed",
+        url = %url,
+        error = %failure,
+        "External upstream gave no response, routing the request elsewhere"
+    );
+    Ok(None)
+}
+
 /// Build the OpenAI-style model objects this node advertises: every enabled
 /// local `model:profile`, plus any models advertised by cluster peers. Shared by
 /// `list_models` (`GET /v1/models`) and `get_model` (`GET /v1/models/:model`) so
@@ -739,7 +1058,9 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
         profile_id: String,
         profile_description: Option<String>,
         idle_timeout_seconds: u64,
-        args_hash: String,
+        /// `None` for a profile that only an upstream serves: it has no
+        /// launch args, and so no metrics of its own.
+        args_hash: Option<String>,
     }
     let local_profiles: Vec<LocalProfile> = {
         let cookbook = state.cookbook.read().await;
@@ -766,7 +1087,8 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
                     profile_id: profile.id.clone(),
                     profile_description: profile.description.clone(),
                     idle_timeout_seconds: profile.idle_timeout_seconds,
-                    args_hash: crate::node_state::args_hash_for_profile(profile),
+                    args_hash: (!profile.is_upstream_only())
+                        .then(|| crate::node_state::args_hash_for_profile(profile)),
                 });
             }
         }
@@ -776,24 +1098,29 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
     // Phase 2: the cookbook guard is released, so it is safe to take the metric
     // and instance locks without risking the nested-read deadlock above.
     for row in local_profiles {
-        // Look up metrics by args_hash
-        let hash_metrics = state.metrics.get_hash_metrics(&row.args_hash).await;
-        let tps = hash_metrics.tokens_per_second();
-        let persisted_params = hash_metrics.get_parsed_params(llama_cpp_version.as_deref());
+        let (tps, parsed_params) = match &row.args_hash {
+            Some(args_hash) => {
+                // Look up metrics by args_hash
+                let hash_metrics = state.metrics.get_hash_metrics(args_hash).await;
+                let persisted_params = hash_metrics.get_parsed_params(llama_cpp_version.as_deref());
 
-        // Parsed model params: prefer a running, still-current instance
-        // (freshest), fall back to the params persisted from the last
-        // instance startup.
-        let parsed_params = state
-            .get_parsed_params_for_model(
-                &row.model_name,
-                &row.profile_id,
-                llama_cpp_version.as_deref(),
-            )
-            .await
-            .or(persisted_params);
+                // Parsed model params: prefer a running, still-current instance
+                // (freshest), fall back to the params persisted from the last
+                // instance startup.
+                let parsed_params = state
+                    .get_parsed_params_for_model(
+                        &row.model_name,
+                        &row.profile_id,
+                        llama_cpp_version.as_deref(),
+                    )
+                    .await
+                    .or(persisted_params);
+                (hash_metrics.tokens_per_second(), parsed_params)
+            }
+            None => (0.0, None),
+        };
 
-        let metadata = json!({
+        let mut metadata = json!({
             "model": row.model_name.clone(),
             "model_description": row.model_description,
             "profile_id": row.profile_id,
@@ -802,6 +1129,12 @@ async fn collect_models(state: &NodeState) -> Vec<Value> {
             "estimated_tokens_per_second": tps,
             "parsed_model_params": parsed_params,
         });
+        if let Some(upstream) = state.upstreams.get(&row.model_name, &row.profile_id) {
+            metadata["upstream"] = json!({
+                "url": upstream.config.url,
+                "healthy": upstream.is_healthy(),
+            });
+        }
 
         data.push(json!({
             "id": row.id.clone(),
@@ -1020,8 +1353,62 @@ pub async fn route_request(
         let queue_deadline = (queue_timeout_ms != 0).then(|| {
             tokio::time::Instant::now() + Duration::from_millis(queue_timeout_ms)
         });
+        // A request's duration limit is its profile's, whichever target
+        // serves it.
+        let request_timeout_ms = local_resolution
+            .as_ref()
+            .and_then(|(_, profile)| profile.max_request_duration_ms)
+            .unwrap_or(state.config.model_defaults.max_request_duration_ms);
 
         let mut drained_peers = HashSet::new();
+
+        // A profile whose external upstream is healthy is served by it. When
+        // the upstream is unavailable, or fails before the client has been
+        // sent anything, the request is routed below as if the profile had
+        // no upstream.
+        if let Some((model_name, profile)) = &local_resolution {
+            let upstream = profile
+                .upstream
+                .as_ref()
+                .and_then(|_| state.upstreams.get(model_name, &profile.id));
+            if let Some(upstream) = upstream {
+                // The profile's local definition decides what it serves,
+                // whichever target answers. A profile without one leaves that
+                // to its upstream.
+                if profile.has_model_source() {
+                    ensure_profile_supports_endpoint(profile, endpoint_kind, &model_to_use)
+                        .map_err(|error| *error)?;
+                }
+                let response = try_external_upstream(
+                    &state,
+                    &upstream,
+                    UpstreamRequest {
+                        conn: &conn_handle,
+                        queue_deadline,
+                        model_name,
+                        max_queue_size: profile
+                            .effective_max_queue_size(&state.config.model_defaults),
+                        method: parts.method.clone(),
+                        path_and_query: &path_and_query,
+                        headers: &parts.headers,
+                        body: &forward_body,
+                        timeout_ms: request_timeout_ms,
+                        response_streaming,
+                    },
+                )
+                .await?;
+                if let Some(response) = response {
+                    return Ok(response);
+                }
+            }
+        }
+        // Only its upstream serves a profile that names no model of its own.
+        // Without the upstream, the request is routed like one for a model
+        // this node does not have: to a peer that serves it, if there is one.
+        let upstream_only = local_resolution
+            .as_ref()
+            .is_some_and(|(_, profile)| profile.is_upstream_only());
+        let local_resolution = local_resolution.filter(|_| !upstream_only);
 
         // If local resolution fails, check if any peer supports this model.
         // The forwarder is patient: a peer that responds with a healable 503
@@ -1041,7 +1428,9 @@ pub async fn route_request(
 
             let forward_headers =
                 build_forward_headers(&parts.headers, current_hops, &request_id);
-            let timeout_ms = state.config.model_defaults.max_request_duration_ms;
+            // The node default for a model this node does not have; the
+            // profile's own limit for one that only its upstream serves here.
+            let timeout_ms = request_timeout_ms;
 
             // Set when a dispatch was probe-denied: the immediate retry
             // excludes that peer so a healthy alternative is reached without
@@ -1074,9 +1463,13 @@ pub async fn route_request(
                     // none does, fail fast with model_not_found. Otherwise wait.
                     if !model_was_found && !state.any_peer_advertises_model(&model_to_use).await {
                         state.metrics.inc_errors();
-                        return Err(AppError::model_not_found(format!(
-                            "Model '{model_to_use}' not found in local cookbook or any peer"
-                        )));
+                        return Err(if upstream_only {
+                            AppError::upstream_unavailable(&model_to_use)
+                        } else {
+                            AppError::model_not_found(format!(
+                                "Model '{model_to_use}' not found in local cookbook or any peer"
+                            ))
+                        });
                     }
                     info!(
                         event = "forward_waiting_for_peer",
@@ -2795,6 +3188,7 @@ mod tests {
             download_timeout_seconds: None,
             max_queue_size: None,
             min_eviction_tenure_secs: None,
+            upstream: None,
         }
     }
 
@@ -3676,6 +4070,178 @@ mod tests {
             Duration::from_millis(300),
         )
         .await;
+    }
+
+    fn client_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("content-type", "application/json"),
+            ("content-length", "17"),
+            ("host", "proxy.example"),
+            ("connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("x-llama-mesh-hops", "1"),
+            ("x-api-key", "node-key"),
+            ("authorization", "Bearer client-token"),
+            ("x-request-id", "req-1"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    fn names(headers: &HeaderMap) -> Vec<&str> {
+        let mut names: Vec<&str> = headers.keys().map(HeaderName::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[test]
+    fn external_upstream_headers_keep_this_nodes_credential_in() {
+        let auth = |enabled| crate::config::AuthConfig {
+            enabled,
+            required_header: "X-Api-Key".into(),
+            allowed_keys: vec!["node-key".into()],
+        };
+
+        // The connection's own fields and the mesh's hop count never go out,
+        // and the request is framed by the length of the body that is sent.
+        let open = build_external_upstream_headers(&client_headers(), None, None);
+        assert_eq!(
+            names(&open),
+            ["authorization", "content-type", "x-api-key", "x-request-id"]
+        );
+        assert_eq!(open[AUTHORIZATION], "Bearer client-token");
+
+        // The header that admits requests to this node is its credential.
+        let guarded = build_external_upstream_headers(&client_headers(), Some(&auth(true)), None);
+        assert_eq!(
+            names(&guarded),
+            ["authorization", "content-type", "x-request-id"]
+        );
+        // With auth off, the same header is only the client's.
+        let unguarded =
+            build_external_upstream_headers(&client_headers(), Some(&auth(false)), None);
+        assert!(unguarded.contains_key("x-api-key"));
+
+        // The upstream's key replaces whatever the client sent.
+        let keyed =
+            build_external_upstream_headers(&client_headers(), Some(&auth(true)), Some("up-key"));
+        assert_eq!(keyed[AUTHORIZATION], "Bearer up-key");
+        assert!(keyed[AUTHORIZATION].is_sensitive());
+        assert_eq!(keyed.get_all(AUTHORIZATION).iter().count(), 1);
+    }
+
+    #[test]
+    fn external_upstream_body_changes_only_the_model_name() {
+        let body = Bytes::from_static(
+            br#"{"model": "local:fast", "input": [[1, 2], [3]], "encoding_format": "base64"}"#,
+        );
+
+        // Without a name to substitute, and when the name already matches,
+        // the client's bytes go out as they came in.
+        assert_eq!(external_upstream_body(&body, None), body);
+        assert_eq!(external_upstream_body(&body, Some("local:fast")), body);
+
+        let renamed: Value =
+            serde_json::from_slice(&external_upstream_body(&body, Some("remote"))).unwrap();
+        assert_eq!(
+            renamed,
+            json!({"model": "remote", "input": [[1, 2], [3]], "encoding_format": "base64"})
+        );
+
+        // A request that named no model gets the upstream's name too.
+        let unnamed = Bytes::from_static(br#"{"input": "text"}"#);
+        let named: Value =
+            serde_json::from_slice(&external_upstream_body(&unnamed, Some("remote"))).unwrap();
+        assert_eq!(named, json!({"model": "remote", "input": "text"}));
+
+        // Only an object has a model to replace.
+        let array = Bytes::from_static(b"[1, 2]");
+        assert_eq!(external_upstream_body(&array, Some("remote")), array);
+    }
+
+    /// A server that answers every request with an empty 200 and counts the
+    /// `POST`s it is sent.
+    async fn upstream_counting_posts() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counted = posts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let posts = counted.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    if request[..read].starts_with(b"POST") {
+                        posts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, posts)
+    }
+
+    #[tokio::test]
+    async fn a_drain_begun_during_the_body_read_keeps_the_request_from_the_upstream() {
+        let (addr, posts) = upstream_counting_posts().await;
+        let config: crate::config::NodeConfig = serde_json::from_value(json!({
+            "node_id": "draining", "listen_addr": "127.0.0.1:0",
+            "max_vram_mb": 1, "max_sysmem_mb": 1, "default_model": "m",
+            "metrics_path": "/dev/null",
+            "model_defaults": {"max_instances_per_model": 1,
+                "max_concurrent_requests_per_instance": 1, "max_queue_size_per_model": 1},
+            "llama_cpp": {"enabled": false, "repo_url": "", "branch": "master",
+                "auto_update_interval_seconds": 0},
+            "cluster": {"enabled": false, "gossip_interval_seconds": 5},
+            "http": {"request_body_limit_bytes": 1024, "idle_timeout_seconds": 60}
+        }))
+        .unwrap();
+        let cookbook: crate::config::Cookbook = serde_yaml::from_str(&format!(
+            "models: [{{name: m, profiles: [{{id: default, upstream: \
+             {{url: 'http://{addr}', health_check: {{interval_ms: 20}}}}}}]}}]"
+        ))
+        .unwrap();
+        let manager = crate::build_manager::BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(NodeState::new(config, cookbook, manager).await.unwrap());
+        let upstream = state.upstreams.get("m", "default").unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !upstream.is_healthy() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the upstream did not become healthy");
+
+        // The request passes the drain check on arrival. Shutdown begins
+        // while its body is still being read.
+        let draining = state.draining.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            assert!(!draining.swap(true, Ordering::Relaxed));
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(br#"{"model":"m","messages":[]}"#))
+        }));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .body(body)
+            .unwrap();
+
+        let refused = route_request(State(state.clone()), None, request)
+            .await
+            .err()
+            .expect("a draining node took the request");
+        assert_eq!(refused.error.type_, "draining");
+        assert_eq!(posts.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.current_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.upstreams.active_requests(), 0);
     }
 }
 

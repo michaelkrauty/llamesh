@@ -141,6 +141,7 @@ fn profile(id: &str, vram: u64, sysmem: u64) -> Profile {
         download_timeout_seconds: None,
         max_queue_size: Some(4),
         min_eviction_tenure_secs: Some(0),
+        upstream: None,
     }
 }
 
