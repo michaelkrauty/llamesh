@@ -309,6 +309,10 @@ struct Spec {
     port_start: u16,
     port_pattern: &'static str,
     auth_key: Option<&'static str>,
+    /// Another node's listen address, to form a cluster with.
+    peer: Option<&'static str>,
+    /// The node's default `max_request_duration_ms`.
+    max_request_duration_ms: Option<u64>,
 }
 
 /// What a test body gets: the node's URL and process, a client and the
@@ -371,6 +375,17 @@ fn config_yaml(spec: &Spec, mock_script: &std::path::Path) -> String {
         ),
         None => String::new(),
     };
+    let duration = match spec.max_request_duration_ms {
+        Some(ms) => format!("  max_request_duration_ms: {ms}\n"),
+        None => String::new(),
+    };
+    let cluster = match spec.peer {
+        Some(peer) => format!(
+            "  enabled: true\n  peers: [\"http://{peer}\"]\n  gossip_interval_seconds: 1\n  \
+             discovery:\n    mdns: false\n  noise:\n    enabled: false\n"
+        ),
+        None => "  enabled: false\n  peers: []\n  gossip_interval_seconds: 5\n".to_string(),
+    };
     format!(
         r#"
 node_id: "test-{suffix}"
@@ -385,7 +400,7 @@ model_defaults:
   max_queue_size_per_model: 10
   max_instances_per_model: 1
   max_wait_in_queue_ms: 20000
-llama_cpp_ports:
+{duration}llama_cpp_ports:
   ranges:
     - start: {port_start}
       end: {port_end}
@@ -400,10 +415,7 @@ llama_cpp:
   auto_update_interval_seconds: 0
   enabled: false
 cluster:
-  enabled: false
-  peers: []
-  gossip_interval_seconds: 5
-http:
+{cluster}http:
   request_body_limit_bytes: 1048576
   idle_timeout_seconds: 60
 {auth}"#,
@@ -644,6 +656,8 @@ fn spec(
         port_start,
         port_pattern: pattern,
         auth_key: None,
+        peer: None,
+        max_request_duration_ms: None,
     }
 }
 
@@ -1203,6 +1217,55 @@ async fn broken_stream_is_reported_and_frees_the_turn() {
         stub.set_mode(Mode::ok());
         ctx.chat().await.assert_upstream();
         assert_eq!(ctx.get_json("/metrics/json").await["current_requests"], 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn upstream_only_profile_falls_back_to_a_peer() {
+    // The upstream never passes a health check.
+    let stub = Stub::start(503, Mode::ok()).await;
+    let mut peer = spec("ext_up_peer_b", "127.0.0.1:9287", 13570, "1357[0-9]");
+    peer.peer = Some("127.0.0.1:9286");
+    let mut node = spec("ext_up_peer_a", "127.0.0.1:9286", 13560, "1356[0-9]");
+    node.peer = Some("127.0.0.1:9287");
+    // Shorter than the mock server's answer takes. The profile's own limit
+    // must apply to the request, whichever target serves it.
+    node.max_request_duration_ms = Some(100);
+    let book = cookbook_with(
+        "        max_request_duration_ms: 20000\n",
+        false,
+        Some(upstream_yaml(&stub.url, "")),
+    );
+    with_node(peer, cookbook(true, None), |peer| async move {
+        with_node(node, book, |ctx| async move {
+            wait_until(
+                "the peer's advertisement",
+                Duration::from_secs(15),
+                || async {
+                    let nodes = ctx.get_json("/cluster/nodes").await;
+                    nodes["nodes"][&peer.node_id]["supported_models"]
+                        .as_array()
+                        .is_some_and(|models| models.iter().any(|m| m == "mock-model"))
+                },
+            )
+            .await;
+
+            // The peer that runs the same profile serves the request.
+            ctx.chat().await.assert_local();
+            assert!(stub.posts().is_empty());
+            assert_eq!(ctx.active_instances().await, 0);
+            assert_eq!(peer.active_instances().await, 1);
+
+            // The node does not advertise a profile it cannot run itself.
+            let nodes = peer.get_json("/cluster/nodes").await;
+            assert_eq!(
+                nodes["nodes"][&ctx.node_id]["supported_models"],
+                json!([]),
+                "{nodes}"
+            );
+        })
+        .await;
     })
     .await;
 }

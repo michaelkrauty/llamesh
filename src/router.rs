@@ -900,12 +900,18 @@ async fn send_to_external_upstream(
             }
         }
     };
-    // The wait can outlast the upstream's health and the client's patience.
-    if !upstream.is_healthy() {
-        return Ok(None);
+    // Checked with the turn in hand, whether or not the request waited for
+    // it: a drain can begin while the request's body is still being read,
+    // and a wait can outlast the client's patience and the upstream's health.
+    if state.draining.load(Ordering::Relaxed) {
+        state.metrics.inc_errors();
+        return Err(AppError::node_draining(&state.config.node_id));
     }
     if conn.as_ref().is_some_and(ConnectionHandle::is_client_gone) {
         return Err(AppError::client_disconnected());
+    }
+    if !upstream.is_healthy() {
+        return Ok(None);
     }
 
     let url = upstream.config.endpoint(request.path_and_query);
@@ -1347,6 +1353,12 @@ pub async fn route_request(
         let queue_deadline = (queue_timeout_ms != 0).then(|| {
             tokio::time::Instant::now() + Duration::from_millis(queue_timeout_ms)
         });
+        // A request's duration limit is its profile's, whichever target
+        // serves it.
+        let request_timeout_ms = local_resolution
+            .as_ref()
+            .and_then(|(_, profile)| profile.max_request_duration_ms)
+            .unwrap_or(state.config.model_defaults.max_request_duration_ms);
 
         let mut drained_peers = HashSet::new();
 
@@ -1380,9 +1392,7 @@ pub async fn route_request(
                         path_and_query: &path_and_query,
                         headers: &parts.headers,
                         body: &forward_body,
-                        timeout_ms: profile
-                            .max_request_duration_ms
-                            .unwrap_or(state.config.model_defaults.max_request_duration_ms),
+                        timeout_ms: request_timeout_ms,
                         response_streaming,
                     },
                 )
@@ -1418,7 +1428,9 @@ pub async fn route_request(
 
             let forward_headers =
                 build_forward_headers(&parts.headers, current_hops, &request_id);
-            let timeout_ms = state.config.model_defaults.max_request_duration_ms;
+            // The node default for a model this node does not have; the
+            // profile's own limit for one that only its upstream serves here.
+            let timeout_ms = request_timeout_ms;
 
             // Set when a dispatch was probe-denied: the immediate retry
             // excludes that peer so a healthy alternative is reached without
@@ -4147,6 +4159,89 @@ mod tests {
         // Only an object has a model to replace.
         let array = Bytes::from_static(b"[1, 2]");
         assert_eq!(external_upstream_body(&array, Some("remote")), array);
+    }
+
+    /// A server that answers every request with an empty 200 and counts the
+    /// `POST`s it is sent.
+    async fn upstream_counting_posts() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counted = posts.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let posts = counted.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    if request[..read].starts_with(b"POST") {
+                        posts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        (addr, posts)
+    }
+
+    #[tokio::test]
+    async fn a_drain_begun_during_the_body_read_keeps_the_request_from_the_upstream() {
+        let (addr, posts) = upstream_counting_posts().await;
+        let config: crate::config::NodeConfig = serde_json::from_value(json!({
+            "node_id": "draining", "listen_addr": "127.0.0.1:0",
+            "max_vram_mb": 1, "max_sysmem_mb": 1, "default_model": "m",
+            "metrics_path": "/dev/null",
+            "model_defaults": {"max_instances_per_model": 1,
+                "max_concurrent_requests_per_instance": 1, "max_queue_size_per_model": 1},
+            "llama_cpp": {"enabled": false, "repo_url": "", "branch": "master",
+                "auto_update_interval_seconds": 0},
+            "cluster": {"enabled": false, "gossip_interval_seconds": 5},
+            "http": {"request_body_limit_bytes": 1024, "idle_timeout_seconds": 60}
+        }))
+        .unwrap();
+        let cookbook: crate::config::Cookbook = serde_yaml::from_str(&format!(
+            "models: [{{name: m, profiles: [{{id: default, upstream: \
+             {{url: 'http://{addr}', health_check: {{interval_ms: 20}}}}}}]}}]"
+        ))
+        .unwrap();
+        let manager = crate::build_manager::BuildManager::new(config.llama_cpp.clone());
+        let state = Arc::new(NodeState::new(config, cookbook, manager).await.unwrap());
+        let upstream = state.upstreams.get("m", "default").unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !upstream.is_healthy() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the upstream did not become healthy");
+
+        // The request passes the drain check on arrival. Shutdown begins
+        // while its body is still being read.
+        let draining = state.draining.clone();
+        let body = Body::from_stream(futures::stream::once(async move {
+            assert!(!draining.swap(true, Ordering::Relaxed));
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(br#"{"model":"m","messages":[]}"#))
+        }));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .body(body)
+            .unwrap();
+
+        let refused = route_request(State(state.clone()), None, request)
+            .await
+            .err()
+            .expect("a draining node took the request");
+        assert_eq!(refused.error.type_, "draining");
+        assert_eq!(posts.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.current_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.upstreams.active_requests(), 0);
     }
 }
 
