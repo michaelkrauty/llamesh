@@ -161,18 +161,37 @@ fn entry_key(model: &str, profile_id: &str) -> String {
 
 impl Upstreams {
     pub fn new(config: &NodeConfig) -> reqwest::Result<Self> {
-        let client = reqwest::Client::builder()
+        Self::with_keepalive(
+            config,
+            crate::cluster::PEER_TCP_KEEPALIVE_TIME,
+            crate::cluster::PEER_TCP_KEEPALIVE_INTERVAL,
+            crate::cluster::PEER_TCP_KEEPALIVE_RETRIES,
+        )
+    }
+
+    /// [`Upstreams::new`] with the given keepalive, so a test can time out a
+    /// silent connection in seconds.
+    pub(crate) fn with_keepalive(
+        config: &NodeConfig,
+        keepalive_time: Duration,
+        keepalive_interval: Duration,
+        keepalive_retries: u32,
+    ) -> reqwest::Result<Self> {
+        let builder = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-            // A request can wait a long time for its response with nothing
-            // on the wire. Keepalive probes notice an upstream that has
-            // vanished meanwhile.
-            .tcp_keepalive(crate::cluster::PEER_TCP_KEEPALIVE_TIME)
-            .tcp_keepalive_interval(crate::cluster::PEER_TCP_KEEPALIVE_INTERVAL)
-            .tcp_keepalive_retries(crate::cluster::PEER_TCP_KEEPALIVE_RETRIES)
-            // A redirect is the upstream's answer, relayed like any other.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT);
+        // A request can wait a long time for its response with nothing on
+        // the wire. Keepalive probes notice an upstream that has vanished
+        // meanwhile.
+        let client = crate::cluster::with_tcp_keepalive(
+            builder,
+            keepalive_time,
+            keepalive_interval,
+            keepalive_retries,
+        )
+        // A redirect is the upstream's answer, relayed like any other.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
         Ok(Self {
             client,
             node_id: config.node_id.clone(),
@@ -359,6 +378,15 @@ async fn check_health(upstream: Arc<Upstream>, client: reqwest::Client) {
                         error = %error,
                         failed_checks = failures,
                         "External upstream is unhealthy"
+                    );
+                } else if failures < check.failure_threshold {
+                    info!(
+                        event = "upstream_check_failed",
+                        model = %upstream.key,
+                        url = %upstream.config.url,
+                        error = %error,
+                        failed_checks = failures,
+                        "External upstream health check failed"
                     );
                 } else {
                     debug!(
@@ -563,6 +591,52 @@ mod tests {
         )));
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!upstreams.get("Model", "default").unwrap().is_healthy());
+    }
+
+    #[tokio::test]
+    async fn checks_failing_below_the_threshold_are_logged_at_info() {
+        let logs = crate::test_support::capture_logs(tracing::Level::INFO);
+        let healthy = Arc::new(AtomicBool::new(false));
+        let addr = health_endpoint(healthy).await;
+        let upstreams = registry();
+        upstreams.reconcile(&cookbook(&format!(
+            "{{id: default, upstream: {{url: 'http://{addr}', health_check: \
+             {{interval_ms: 10, failure_threshold: 2}}}}}}"
+        )));
+        timeout(SOON, async {
+            while !logs.contents().contains("upstream_unhealthy") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the checks did not reach the threshold");
+        // Checks go on failing past the threshold.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(upstreams);
+
+        let events: Vec<serde_json::Value> = logs
+            .contents()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["fields"]["event"].is_string())
+            .collect();
+        let named = |name: &str| -> Vec<&serde_json::Value> {
+            events
+                .iter()
+                .filter(|event| event["fields"]["event"] == name)
+                .collect()
+        };
+        let failed = named("upstream_check_failed");
+        assert_eq!(failed.len(), 1, "{events:?}");
+        assert_eq!(failed[0]["level"], "INFO");
+        let fields = &failed[0]["fields"];
+        assert_eq!(fields["model"], "Model:default");
+        assert_eq!(fields["url"], format!("http://{addr}"));
+        assert_eq!(fields["error"], "status 503 Service Unavailable");
+        assert_eq!(fields["failed_checks"], 1);
+        let unhealthy = named("upstream_unhealthy");
+        assert_eq!(unhealthy.len(), 1, "{events:?}");
+        assert_eq!(unhealthy[0]["fields"]["failed_checks"], 2);
     }
 
     #[tokio::test]

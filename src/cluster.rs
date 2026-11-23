@@ -36,11 +36,32 @@ pub const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// after 15 seconds of silence, every 15 seconds, and giving up after 3
 /// unanswered probes surfaces the loss within about a minute as a transport
 /// error. A live peer's kernel answers the probes even while a long generation
-/// sends no response bytes, so slow requests are unaffected. These are
-/// reqwest's defaults.
+/// sends no response bytes, so slow requests are unaffected.
 pub const PEER_TCP_KEEPALIVE_TIME: std::time::Duration = std::time::Duration::from_secs(15);
 pub const PEER_TCP_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 pub const PEER_TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Give a reqwest client TCP keepalive that fails a silent connection after
+/// `retries` unanswered probes. reqwest also sets `TCP_USER_TIMEOUT`, by
+/// default to 30 seconds, and with it set the kernel fails a silent
+/// connection once that long has passed with a probe outstanding, whatever
+/// the probe count. So the user timeout is set to when the last probe goes
+/// unanswered. It also bounds unacknowledged data to the same time.
+pub fn with_tcp_keepalive(
+    builder: reqwest::ClientBuilder,
+    time: std::time::Duration,
+    interval: std::time::Duration,
+    retries: u32,
+) -> reqwest::ClientBuilder {
+    let builder = builder
+        .tcp_keepalive(time)
+        .tcp_keepalive_interval(interval)
+        .tcp_keepalive_retries(retries);
+    // reqwest sets the option only where the kernel has it.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(time + interval * retries);
+    builder
+}
 
 /// Apply [`PEER_TCP_KEEPALIVE_TIME`] and its companions to a connected socket.
 pub fn set_peer_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
