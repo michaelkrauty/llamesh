@@ -929,8 +929,9 @@ async fn send_to_external_upstream(
             request.body,
             upstream.config.model.as_deref(),
         ));
-    if request.timeout_ms > 0 {
-        outbound = outbound.timeout(Duration::from_millis(request.timeout_ms));
+    let limit = (request.timeout_ms > 0).then(|| Duration::from_millis(request.timeout_ms));
+    if let Some(limit) = limit {
+        outbound = outbound.timeout(limit);
     }
     let streaming = request.response_streaming;
     let exchange = async {
@@ -947,6 +948,8 @@ async fn send_to_external_upstream(
             body,
         })
     };
+    // Tokio's clock, the one reqwest's timeout runs on.
+    let sent_at = tokio::time::Instant::now();
     // Until the client has been sent something, the request can still be
     // served elsewhere, so it does not wait on an upstream found unhealthy.
     // Dropping the exchange closes its connection, which tells the upstream
@@ -1005,8 +1008,11 @@ async fn send_to_external_upstream(
             return Ok(Some(response));
         }
         // The request ran for its `max_request_duration_ms`. That limit is
-        // the request's own, so it is not started again elsewhere.
-        Some(Err(e)) if e.is_timeout() && !e.is_connect() => {
+        // the request's own, so it is not started again elsewhere. It can
+        // only have fired once that duration has elapsed: any earlier
+        // timeout, such as a connection the kernel timed out, is a failure
+        // of the upstream.
+        Some(Err(e)) if e.is_timeout() && limit.is_some_and(|limit| sent_at.elapsed() >= limit) => {
             let detail = error_chain(&e);
             error!("Upstream error: {}", detail);
             state.metrics.inc_errors();
@@ -4240,6 +4246,257 @@ mod tests {
             .expect("a draining node took the request");
         assert_eq!(refused.error.type_, "draining");
         assert_eq!(posts.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.current_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.upstreams.active_requests(), 0);
+    }
+
+    /// What [`upstream_holding_posts`] does with a `POST` it has read.
+    #[derive(Clone, Copy)]
+    enum Post {
+        /// Never answers it.
+        Unanswered,
+        /// Never answers it, and drops every segment that arrives on its
+        /// connection afterwards, so the client's kernel times the
+        /// connection out.
+        #[cfg(target_os = "linux")]
+        Silenced,
+        /// Drops every segment that arrives on its connection for a while,
+        /// then answers it with `{}`.
+        #[cfg(target_os = "linux")]
+        SilencedFor(Duration),
+    }
+
+    /// A server that answers health checks, and reads each `POST` in full
+    /// before it does with it what `post` says.
+    async fn upstream_holding_posts(post: Post) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    let head_end = loop {
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buf[..read]),
+                        }
+                    };
+                    if !request.starts_with(b"POST") {
+                        // Closed, so a `POST` never reuses the connection.
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .map_or(0, |value| value.trim().parse().unwrap());
+                    while request.len() < head_end + length {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buf[..read]),
+                        }
+                    }
+                    match post {
+                        Post::Unanswered => {}
+                        #[cfg(target_os = "linux")]
+                        Post::Silenced => silence_connection(&stream, true),
+                        #[cfg(target_os = "linux")]
+                        Post::SilencedFor(silence) => {
+                            silence_connection(&stream, true);
+                            tokio::time::sleep(silence).await;
+                            silence_connection(&stream, false);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            let _ = stream
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                      content-length: 2\r\nconnection: close\r\n\r\n{}",
+                                )
+                                .await;
+                            return;
+                        }
+                    }
+                    // Held open, unanswered, until the test ends.
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                });
+            }
+        });
+        addr
+    }
+
+    /// Make the kernel drop every segment that arrives on `stream`,
+    /// keepalive probes included, without closing it, or stop it doing so.
+    /// A TCP MD5 signature key for the peer does that without privileges:
+    /// the peer signs nothing, so nothing it sends is accepted. A key of
+    /// length 0 removes the key.
+    #[cfg(target_os = "linux")]
+    fn silence_connection(stream: &tokio::net::TcpStream, silent: bool) {
+        /// The kernel's `struct tcp_md5sig`.
+        #[repr(C)]
+        struct TcpMd5Sig {
+            addr: libc::sockaddr_storage,
+            flags: u8,
+            prefixlen: u8,
+            keylen: u16,
+            ifindex: libc::c_int,
+            key: [u8; 80],
+        }
+        let std::net::SocketAddr::V4(peer) = stream.peer_addr().unwrap() else {
+            panic!("the test listens on IPv4");
+        };
+        // SAFETY: all-zero is a valid value of these plain C structs, and
+        // `sockaddr_storage` has room and alignment for a `sockaddr_in`.
+        let mut sig: TcpMd5Sig = unsafe { std::mem::zeroed() };
+        let addr = unsafe { &mut *(&mut sig.addr as *mut _ as *mut libc::sockaddr_in) };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from(*peer.ip()).to_be();
+        if silent {
+            sig.keylen = 1;
+            sig.key[0] = b'k';
+        }
+        // SAFETY: `sig` is a valid `tcp_md5sig` for the duration of the call.
+        let set = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_MD5SIG,
+                (&sig as *const TcpMd5Sig).cast(),
+                std::mem::size_of::<TcpMd5Sig>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    /// A lone node whose only profile, `m`, is served by the upstream at
+    /// `addr`, reached with keepalive probes 1 s apart, `retries` of which
+    /// can go unanswered. Returned once the upstream is healthy.
+    async fn upstream_only_node(
+        addr: std::net::SocketAddr,
+        profile: &str,
+        retries: u32,
+    ) -> Arc<NodeState> {
+        let config: crate::config::NodeConfig = serde_json::from_value(json!({
+            "node_id": "lone", "listen_addr": "127.0.0.1:0",
+            "max_vram_mb": 1, "max_sysmem_mb": 1, "default_model": "m",
+            "metrics_path": "/dev/null",
+            "model_defaults": {"max_instances_per_model": 1,
+                "max_concurrent_requests_per_instance": 1, "max_queue_size_per_model": 1},
+            "llama_cpp": {"enabled": false, "repo_url": "", "branch": "master",
+                "auto_update_interval_seconds": 0},
+            "cluster": {"enabled": false, "gossip_interval_seconds": 5},
+            "http": {"request_body_limit_bytes": 1024, "idle_timeout_seconds": 60}
+        }))
+        .unwrap();
+        let cookbook: crate::config::Cookbook = serde_yaml::from_str(&format!(
+            "models: [{{name: m, profiles: [{{id: default, {profile} upstream: \
+             {{url: 'http://{addr}', health_check: {{interval_ms: 20}}}}}}]}}]"
+        ))
+        .unwrap();
+        let manager = crate::build_manager::BuildManager::new(config.llama_cpp.clone());
+        let mut state = NodeState::new(config.clone(), cookbook.clone(), manager)
+            .await
+            .unwrap();
+        let second = Duration::from_secs(1);
+        state.upstreams = Arc::new(
+            crate::upstream::Upstreams::with_keepalive(&config, second, second, retries).unwrap(),
+        );
+        state.upstreams.reconcile(&cookbook);
+        let upstream = state.upstreams.get("m", "default").unwrap();
+        timeout(Duration::from_secs(5), async {
+            while !upstream.is_healthy() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the upstream did not become healthy");
+        Arc::new(state)
+    }
+
+    fn chat_request() -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .body(Body::from(r#"{"model":"m","messages":[]}"#))
+            .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_request_whose_upstream_connection_times_out_is_served_without_the_upstream() {
+        let addr = upstream_holding_posts(Post::Silenced).await;
+        // No limit of its own: only the kernel can end the wait, 3 s after
+        // the request, when its second probe goes unanswered.
+        let state = upstream_only_node(addr, "max_request_duration_ms: 0,", 2).await;
+
+        let sent_at = std::time::Instant::now();
+        let error = timeout(
+            Duration::from_secs(10),
+            route_request(State(state.clone()), None, chat_request()),
+        )
+        .await
+        .expect("the connection did not time out")
+        .err()
+        .expect("a request the upstream never answered was served");
+        // Sooner, the stub closed the connection instead of silencing it.
+        assert!(
+            sent_at.elapsed() >= Duration::from_millis(2500),
+            "{error:?}"
+        );
+        // Nothing else can serve an upstream-only profile on a lone node.
+        assert_eq!(error.error.type_, "upstream_unavailable", "{error:?}");
+        let upstream = state.upstreams.get("m", "default").unwrap();
+        assert_eq!(upstream.failures_total.load(Ordering::Relaxed), 1);
+        assert!(upstream.is_healthy());
+        assert_eq!(state.metrics.current_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.upstreams.active_requests(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_upstream_connection_survives_a_lost_keepalive_probe() {
+        // The probe at 1 s goes unanswered. The connection is reachable again
+        // for the probe at 2 s, and the response follows.
+        let addr = upstream_holding_posts(Post::SilencedFor(Duration::from_millis(1500))).await;
+        let state = upstream_only_node(addr, "", 3).await;
+
+        let response = timeout(
+            Duration::from_secs(10),
+            route_request(State(state.clone()), None, chat_request()),
+        )
+        .await
+        .expect("the upstream's response was not relayed")
+        .expect("the upstream's response was not relayed")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[BACKEND_HEADER], "upstream");
+        let upstream = state.upstreams.get("m", "default").unwrap();
+        assert_eq!(upstream.failures_total.load(Ordering::Relaxed), 0);
+        assert_eq!(upstream.requests_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_runs_for_its_own_limit_at_the_upstream_is_an_upstream_error() {
+        let addr = upstream_holding_posts(Post::Unanswered).await;
+        let state = upstream_only_node(addr, "max_request_duration_ms: 300,", 3).await;
+
+        let error = route_request(State(state.clone()), None, chat_request())
+            .await
+            .err()
+            .expect("a request the upstream never answered was served");
+        assert_eq!(error.error.type_, "upstream_error", "{error:?}");
+        let upstream = state.upstreams.get("m", "default").unwrap();
+        assert_eq!(upstream.failures_total.load(Ordering::Relaxed), 0);
         assert_eq!(state.metrics.current_requests.load(Ordering::Relaxed), 0);
         assert_eq!(state.upstreams.active_requests(), 0);
     }

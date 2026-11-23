@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.1] - 2026-11-23
+
+### Fixed
+
+- Serve a request without its external upstream when the upstream's connection times out. When an upstream's connection went silent while a request waited for its response, the kernel timed the connection out and the client got `502` `upstream_error`, as though the request had run for its own `max_request_duration_ms`, even with no such limit set; nothing was logged as `upstream_request_failed` and `proxy_upstream_failures_total` did not move. The request is now served by the profile's own model or a peer, like any other request the upstream gives no response to, and `upstream_error` is returned only when the request has run for its `max_request_duration_ms`.
+- Fail a silent connection to an external upstream, or to a peer over the HTTP cluster transport, after three unanswered keepalive probes, as documented. The HTTP client library sets `TCP_USER_TIMEOUT` to 30 seconds by default, and with that set the kernel fails a silent connection after 30 seconds whatever the probe count, which with probes 15 seconds apart is after a single unanswered probe. One lost probe, or one lost acknowledgement, could therefore fail a request that waited longer than 30 seconds for its response, although the other end was alive and working on it. The user timeout is now the minute that three probes take. Connections over the Noise transport were not affected.
+
+### Changed
+
+- Log a failed upstream health check that does not reach `failure_threshold` as `upstream_check_failed` at `INFO`, with the check's error and the count of failed checks in a row. Such a check was logged only at `DEBUG`, so a flapping upstream left no trace at the default log level until it was marked unhealthy.
+
 ## [1.23.0] - 2026-11-23
 
 ### Added

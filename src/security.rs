@@ -204,11 +204,12 @@ fn build_cluster_client_with_connect_timeout(
     connect_timeout: std::time::Duration,
 ) -> Result<Client> {
     // reqwest's connect timeout covers TCP connect and the TLS handshake.
-    let mut builder = ClientBuilder::new()
-        .connect_timeout(connect_timeout)
-        .tcp_keepalive(crate::cluster::PEER_TCP_KEEPALIVE_TIME)
-        .tcp_keepalive_interval(crate::cluster::PEER_TCP_KEEPALIVE_INTERVAL)
-        .tcp_keepalive_retries(crate::cluster::PEER_TCP_KEEPALIVE_RETRIES);
+    let mut builder = crate::cluster::with_tcp_keepalive(
+        ClientBuilder::new().connect_timeout(connect_timeout),
+        crate::cluster::PEER_TCP_KEEPALIVE_TIME,
+        crate::cluster::PEER_TCP_KEEPALIVE_INTERVAL,
+        crate::cluster::PEER_TCP_KEEPALIVE_RETRIES,
+    );
 
     if let Some(tls) = config {
         if tls.enabled {
